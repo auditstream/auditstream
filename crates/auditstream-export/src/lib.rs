@@ -11,7 +11,7 @@ use thiserror as _;
 use tokio as _;
 
 pub use crate::csv::CsvSink;
-pub use crate::jsonl::JsonLinesSink;
+pub use crate::jsonl::{JsonLinesSink, OpenedJsonLinesSink};
 
 /// Crate identifier retained for workspace smoke checks.
 pub const CRATE_NAME: &str = "auditstream-export";
@@ -44,7 +44,7 @@ pub enum SinkConfig {
 #[derive(Debug)]
 pub enum AnySink {
     /// JSON Lines sink.
-    Jsonl(JsonLinesSink),
+    Jsonl(OpenedJsonLinesSink),
     /// RFC 4180 CSV sink.
     Csv(CsvSink),
 }
@@ -57,7 +57,9 @@ impl AnySink {
     /// Returns [`SinkError`] if opening the underlying sink fails.
     pub fn open(config: &SinkConfig) -> Result<Self, SinkError> {
         match config {
-            SinkConfig::Jsonl { path } => Ok(Self::Jsonl(JsonLinesSink::open(path.clone())?)),
+            SinkConfig::Jsonl { path } => {
+                Ok(Self::Jsonl(OpenedJsonLinesSink::open(path.as_deref())?))
+            }
             SinkConfig::Csv { path } => Ok(Self::Csv(CsvSink::open(path.clone())?)),
         }
     }
@@ -136,20 +138,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn any_sink_dispatches_to_placeholders_naming_e1_and_e2() {
+    async fn any_sink_dispatches_to_jsonl_and_csv_placeholder() {
         let batch = Batch::default();
 
-        let mut jsonl =
-            AnySink::open(&SinkConfig::Jsonl { path: None }).expect("open jsonl placeholder");
+        let mut jsonl = AnySink::open(&SinkConfig::Jsonl { path: None }).expect("open jsonl");
         let write_fut = jsonl.write(&batch);
         assert_send(&write_fut);
-        let err = write_fut.await.expect_err("placeholder must return error");
-        assert!(
-            matches!(err, SinkError::Unimplemented(msg) if msg.contains("E1")),
-            "expected E1 error, got {err:?}"
-        );
-        let flush_err = jsonl.flush().await.expect_err("placeholder flush error");
-        assert!(matches!(flush_err, SinkError::Unimplemented(msg) if msg.contains("E1")));
+        write_fut.await.expect("empty jsonl batch write succeeds");
+        jsonl.flush().await.expect("jsonl stdout flush succeeds");
 
         let mut csv = AnySink::open(&SinkConfig::Csv {
             path: Some(PathBuf::from("/tmp/out.csv")),
