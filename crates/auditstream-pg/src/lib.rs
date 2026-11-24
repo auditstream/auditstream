@@ -5,6 +5,7 @@ pub mod introspect;
 pub mod migrations;
 pub mod reader;
 pub mod triggers;
+pub mod verify;
 
 use tokio as _;
 

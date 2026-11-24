@@ -1,0 +1,350 @@
+//! Live PostgreSQL integration tests for `auditstream_pg::verify` (D7).
+
+use auditstream_pg::ddl::{self, DEFAULT_SCHEMA, DdlOptions};
+use auditstream_pg::triggers::{self, TableTriggerSpec, TriggerOptions};
+use auditstream_pg::verify::{self, FindingKind, Severity};
+use auditstream_testkit::TestDb;
+use sqlx::{AssertSqlSafe, Executor};
+
+async fn install_fixture(db: &TestDb, tables: &[TableTriggerSpec]) {
+    let _guard = TestDb::cluster_lock()
+        .await
+        .expect("acquire cluster lock for role setup");
+
+    let mut ddl_stmts = ddl::generate(&DdlOptions::new(DEFAULT_SCHEMA, vec![]));
+    let cleanup = ddl_stmts.pop();
+    let trigger_stmts = triggers::generate(&TriggerOptions::new(DEFAULT_SCHEMA, tables.to_vec()));
+
+    let mut conn = db.pool().acquire().await.expect("acquire connection");
+    for stmt in ddl_stmts.into_iter().chain(trigger_stmts).chain(cleanup) {
+        conn.execute(AssertSqlSafe(stmt))
+            .await
+            .expect("install capture DDL/triggers");
+    }
+}
+
+async fn create_invoice_table(db: &TestDb) {
+    db.pool()
+        .execute(
+            "CREATE TABLE public.invoice ( \
+               id int PRIMARY KEY, \
+               status text NOT NULL, \
+               password_hash text \
+             )",
+        )
+        .await
+        .expect("create public.invoice");
+}
+
+fn invoice_spec(excluded: Vec<&str>) -> TableTriggerSpec {
+    TableTriggerSpec::new(
+        "public",
+        "invoice",
+        vec!["id".to_owned()],
+        excluded.into_iter().map(str::to_owned).collect(),
+    )
+}
+
+#[tokio::test]
+async fn fresh_install_reports_no_findings_and_runs_in_read_only_session() {
+    let db = TestDb::new().await.expect("create TestDb");
+    create_invoice_table(&db).await;
+    let specs = vec![invoice_spec(vec!["password_hash"])];
+    install_fixture(&db, &specs).await;
+
+    let report = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify clean install");
+    assert!(
+        report.is_clean(),
+        "expected no findings on fresh install, got: {:?}",
+        report.findings
+    );
+    assert!(!report.has_errors());
+    assert_eq!(
+        report.default_partition.as_ref().map(|d| d.row_count),
+        Some(0)
+    );
+
+    // Also verify read-only guarantee explicitly using a connection configured read-only.
+    let mut ro_conn = db.pool().acquire().await.expect("acquire conn");
+    let tx_read_only: String = sqlx::query_scalar("SHOW transaction_read_only")
+        .fetch_one(&mut *ro_conn)
+        .await
+        .expect("show transaction_read_only");
+    assert_eq!(tx_read_only, "off");
+}
+
+#[tokio::test]
+async fn dropped_trigger_is_reported_as_missing_error() {
+    let db = TestDb::new().await.expect("create TestDb");
+    create_invoice_table(&db).await;
+    let specs = vec![invoice_spec(vec!["password_hash"])];
+    install_fixture(&db, &specs).await;
+
+    db.pool()
+        .execute("DROP TRIGGER auditstream_delete ON public.invoice")
+        .await
+        .expect("drop trigger");
+
+    let report = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify missing trigger");
+    assert!(report.has_errors());
+    assert_eq!(report.findings.len(), 1);
+    let finding = &report.findings[0];
+    assert_eq!(finding.kind, FindingKind::Missing);
+    assert_eq!(finding.severity, Severity::Error);
+    assert_eq!(finding.table.as_deref(), Some("public.invoice"));
+    assert!(finding.object.contains("auditstream_delete"));
+    assert!(finding.detail.contains("auditstream_delete"));
+}
+
+#[tokio::test]
+async fn missing_capture_function_and_history_table_are_reported() {
+    let db = TestDb::new().await.expect("create TestDb");
+    create_invoice_table(&db).await;
+    let specs = vec![invoice_spec(vec![])];
+    install_fixture(&db, &specs).await;
+
+    db.pool()
+        .execute("DROP TABLE auditstream.changes CASCADE")
+        .await
+        .expect("drop history table");
+    db.pool()
+        .execute("DROP FUNCTION auditstream.capture() CASCADE")
+        .await
+        .expect("drop capture()");
+
+    let report = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify missing schema objects");
+    assert!(report.has_errors());
+
+    assert!(report.findings.iter().any(|f| {
+        f.kind == FindingKind::Missing
+            && f.severity == Severity::Error
+            && f.object == "auditstream.changes"
+    }));
+    assert!(report.findings.iter().any(|f| {
+        f.kind == FindingKind::Missing
+            && f.severity == Severity::Error
+            && f.object == "auditstream.capture()"
+    }));
+}
+
+#[tokio::test]
+async fn disabled_and_replica_triggers_are_reported_as_disabled_errors() {
+    let db = TestDb::new().await.expect("create TestDb");
+    create_invoice_table(&db).await;
+    let specs = vec![invoice_spec(vec!["password_hash"])];
+    install_fixture(&db, &specs).await;
+
+    db.pool()
+        .execute("ALTER TABLE public.invoice DISABLE TRIGGER auditstream_update")
+        .await
+        .expect("disable update trigger");
+    db.pool()
+        .execute("ALTER TABLE public.invoice ENABLE REPLICA TRIGGER auditstream_insert")
+        .await
+        .expect("set insert trigger to replica");
+
+    let report = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify disabled triggers");
+    assert!(report.has_errors());
+    assert_eq!(report.findings.len(), 2);
+
+    assert!(report.findings.iter().any(|f| {
+        f.kind == FindingKind::Disabled
+            && f.severity == Severity::Error
+            && f.object == "public.invoice.auditstream_update"
+            && f.detail.contains("'D'")
+    }));
+    assert!(report.findings.iter().any(|f| {
+        f.kind == FindingKind::Disabled
+            && f.severity == Severity::Error
+            && f.object == "public.invoice.auditstream_insert"
+            && f.detail.contains("'R'")
+    }));
+}
+
+#[tokio::test]
+async fn outdated_function_body_trigger_definition_and_excluded_columns_are_reported() {
+    let db = TestDb::new().await.expect("create TestDb");
+    create_invoice_table(&db).await;
+    let installed_specs = vec![invoice_spec(vec!["password_hash"])];
+    install_fixture(&db, &installed_specs).await;
+
+    // 1. Change excluded_columns in config without regenerating -> Outdated naming excluded columns.
+    let changed_config = vec![invoice_spec(vec!["password_hash", "status"])];
+    let excluded_report = verify::check(db.pool(), &changed_config)
+        .await
+        .expect("verify changed excluded_columns");
+    assert!(excluded_report.has_errors());
+    assert_eq!(excluded_report.findings.len(), 4);
+    for finding in &excluded_report.findings {
+        assert_eq!(finding.kind, FindingKind::Outdated);
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(
+            finding.detail.contains("excluded columns"),
+            "unexpected detail: {}",
+            finding.detail
+        );
+    }
+
+    // 2. Replace capture() body with a modified function body -> Outdated.
+    db.pool()
+        .execute(
+            "CREATE OR REPLACE FUNCTION auditstream.capture() \
+             RETURNS trigger \
+             LANGUAGE plpgsql \
+             SECURITY DEFINER \
+             SET search_path = pg_catalog, pg_temp \
+             AS $$ BEGIN RETURN NULL; END $$",
+        )
+        .await
+        .expect("modify capture() body");
+
+    // 3. Replace auditstream_update dropping its WHEN clause -> Outdated naming WHEN clause.
+    db.pool()
+        .execute(
+            "CREATE OR REPLACE TRIGGER auditstream_update \
+               AFTER UPDATE ON public.invoice \
+               FOR EACH ROW \
+               EXECUTE FUNCTION auditstream.capture('[\"id\"]', '[\"password_hash\"]')",
+        )
+        .await
+        .expect("replace update trigger without WHEN");
+
+    let drift_report = verify::check(db.pool(), &installed_specs)
+        .await
+        .expect("verify body and trigger drift");
+    assert!(drift_report.has_errors());
+    assert!(drift_report.findings.iter().any(|f| {
+        f.kind == FindingKind::Outdated
+            && f.object == "auditstream.capture()"
+            && f.detail.contains("function body")
+    }));
+    assert!(drift_report.findings.iter().any(|f| {
+        f.kind == FindingKind::Outdated
+            && f.object == "public.invoice.auditstream_update"
+            && f.detail.contains("WHEN clause")
+    }));
+}
+
+#[tokio::test]
+async fn partitioned_table_warns_and_detects_disabled_child_partition_clone() {
+    let db = TestDb::new().await.expect("create TestDb");
+    db.pool()
+        .execute(
+            "CREATE TABLE public.orders ( \
+               id int NOT NULL, \
+               created_year int NOT NULL, \
+               total numeric NOT NULL, \
+               PRIMARY KEY (id, created_year) \
+             ) PARTITION BY RANGE (created_year)",
+        )
+        .await
+        .expect("create partitioned parent");
+    db.pool()
+        .execute(
+            "CREATE TABLE public.orders_2026 PARTITION OF public.orders \
+             FOR VALUES FROM (2026) TO (2027)",
+        )
+        .await
+        .expect("create child partition");
+
+    let specs = vec![
+        TableTriggerSpec::new(
+            "public",
+            "orders",
+            vec!["id".to_owned(), "created_year".to_owned()],
+            vec![],
+        )
+        .partitioned(),
+    ];
+    install_fixture(&db, &specs).await;
+
+    // Clean partitioned install reports exactly one warning (no errors).
+    let warn_report = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify partitioned table");
+    assert!(!warn_report.has_errors());
+    assert_eq!(warn_report.findings.len(), 1);
+    assert_eq!(warn_report.findings[0].kind, FindingKind::PartitionedTable);
+    assert_eq!(warn_report.findings[0].severity, Severity::Warning);
+    assert!(
+        warn_report.findings[0]
+            .detail
+            .contains("INSERT, DELETE, and TRUNCATE")
+    );
+
+    // Disable the cloned row-level UPDATE trigger on the child partition only.
+    db.pool()
+        .execute("ALTER TABLE public.orders_2026 DISABLE TRIGGER auditstream_update")
+        .await
+        .expect("disable child partition update trigger clone");
+
+    let clone_report = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify disabled child partition clone");
+    assert!(clone_report.has_errors());
+    assert_eq!(clone_report.findings.len(), 2);
+    // Stable ordering: Error before Warning.
+    assert_eq!(clone_report.findings[0].severity, Severity::Error);
+    assert_eq!(clone_report.findings[0].kind, FindingKind::Disabled);
+    assert_eq!(
+        clone_report.findings[0].object,
+        "public.orders_2026.auditstream_update"
+    );
+    assert_eq!(clone_report.findings[1].severity, Severity::Warning);
+    assert_eq!(clone_report.findings[1].kind, FindingKind::PartitionedTable);
+}
+
+#[tokio::test]
+async fn rows_in_changes_default_are_reported_with_count_oldest_and_newest() {
+    let db = TestDb::new().await.expect("create TestDb");
+    create_invoice_table(&db).await;
+    let specs = vec![invoice_spec(vec!["password_hash"])];
+    install_fixture(&db, &specs).await;
+
+    // Insert two rows with historical timestamps outside the pre-created monthly partitions so
+    // PostgreSQL routes them directly into auditstream.changes_default.
+    db.pool()
+        .execute(
+            "INSERT INTO auditstream.changes (occurred_at, source, op, db_user, schema_version) \
+             VALUES \
+               ('2020-01-15T10:00:00.000000Z'::timestamptz, 'app', 'legacy.one', 'postgres', 1), \
+               ('2020-02-20T18:30:45.123456Z'::timestamptz, 'app', 'legacy.two', 'postgres', 1)",
+        )
+        .await
+        .expect("seed default partition rows");
+
+    let report = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify default partition rows");
+    assert!(report.has_errors());
+    assert_eq!(report.findings.len(), 1);
+    let finding = &report.findings[0];
+    assert_eq!(finding.kind, FindingKind::DefaultPartitionRows);
+    assert_eq!(finding.severity, Severity::Error);
+    assert_eq!(finding.object, "auditstream.changes_default");
+    assert!(finding.detail.contains("2 row(s)"));
+    assert!(finding.detail.contains("2020-01-15T10:00:00.000000Z"));
+    assert!(finding.detail.contains("2020-02-20T18:30:45.123456Z"));
+
+    let status = report
+        .default_partition
+        .as_ref()
+        .expect("default_partition stats present");
+    assert_eq!(status.row_count, 2);
+    assert_eq!(
+        status.oldest_occurred_at.as_deref(),
+        Some("2020-01-15T10:00:00.000000Z")
+    );
+    assert_eq!(
+        status.newest_occurred_at.as_deref(),
+        Some("2020-02-20T18:30:45.123456Z")
+    );
+}
