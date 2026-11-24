@@ -1,5 +1,7 @@
 //! Workspace automation task runner (`cargo xtask`).
 
+mod bench;
+
 use std::env;
 use std::process::{Command, ExitCode};
 
@@ -62,7 +64,8 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("ci") => run_ci(&args[1..]),
-        Some("codegen" | "bench") => {
+        Some("bench") => bench::run(&args[1..]),
+        Some("codegen") => {
             eprintln!("xtask: subcommand `{}` is not implemented yet", args[0]);
             ExitCode::FAILURE
         }
