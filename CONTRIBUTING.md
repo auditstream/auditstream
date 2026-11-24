@@ -47,7 +47,7 @@ See [Workflow: Definition of done](docs/handbook/workflow.md#definition-of-done)
 - [ ] Every acceptance criterion in the issue is met
 - [ ] New tests cover the change and pass in CI
 - [ ] Docs, changelog entry or changeset, and the spec are updated where the change touches them
-- [ ] No new warnings from clippy or Biome
+- [ ] No new warnings from clippy
 - [ ] Reviewed, squash-merged, and the issue closed by the merge
 
 ## Licensing and community

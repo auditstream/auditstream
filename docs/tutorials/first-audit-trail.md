@@ -6,7 +6,29 @@ No Node.js setup is required.
 
 ## Install the CLI
 
-Until the first binary release ships, install `auditstream` from this repository with Cargo:
+Install the prebuilt `auditstream` v0.1.0 CLI through your preferred channel:
+
+```sh
+# Shell (macOS / Linux)
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/auditstream/auditstream/releases/latest/download/auditstream-installer.sh | sh
+
+# Homebrew
+brew install auditstream/tap/auditstream
+
+# npm
+npm i -g auditstream
+
+# Docker
+docker run --rm ghcr.io/auditstream/auditstream:0.1.0 --help
+```
+
+On Windows (PowerShell):
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/auditstream/auditstream/releases/latest/download/auditstream-installer.ps1 | iex"
+```
+
+Or build from source with Cargo as a fallback:
 
 ```sh
 cargo install --path crates/auditstream --locked

@@ -12,3 +12,5 @@ CLI binary package for Auditstream.
 - Business logic of its own
 
 May depend on `auditstream-core`, `auditstream-pg`, `auditstream-export`, `clap`, `anyhow` and `tokio`.
+
+See the [repository README](../../README.md) and [auditstream.dev/docs](https://auditstream.dev/docs) for full documentation.

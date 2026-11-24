@@ -1,5 +1,7 @@
 # v0.1 backlog
 
+> **Status:** v0.1.0 shipped 2026-11-24 — preserved as historical planning record.
+
 v0.1 is 59 issues in 12 epics, delivered in five waves; the contract is the one item that blocks both repositories.
 
 **Five waves to v0.1; the contract gates both repositories.** Boxes are epics with their issue count. The critical path has a thick border.

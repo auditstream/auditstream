@@ -1,5 +1,7 @@
 # Auditstream Documentation
 
+> Read the hosted documentation at **[auditstream.dev/docs](https://auditstream.dev/docs)**, or browse the source pages in this directory.
+
 Welcome to the Auditstream v0.1 user guide.
 These pages follow the Diátaxis structure: tutorials, how-to guides, reference, and explanation.
 
@@ -40,5 +42,5 @@ Architecture, trade-offs, security model, and performance characteristics.
 ## Project documentation
 
 - [Engineering handbook](handbook/README.md)
-- [Normative specification (0.1.0)](../spec/README.md)
+- [Normative specification (0.1.1)](../spec/README.md)
 - [Architecture Decision Records (ADRs)](decisions/README.md)

@@ -2,11 +2,11 @@
 
 ## Supported versions
 
-During v0.x development, security fixes apply to the latest v0.1 release and `main`, supporting PostgreSQL 15 through 19 (see [Releases: Supported versions](docs/handbook/releases.md#supported-versions)).
+During v0.x development, security fixes apply to the latest 0.x release (currently 0.1.x) and `main`, supporting PostgreSQL 15 through 19 (see [Releases: Supported versions](docs/handbook/releases.md#supported-versions)).
 
 | Version | Supported |
 | --- | --- |
-| `0.1.x` / `main` | Yes |
+| Latest `0.x` release (currently `0.1.x`) / `main` | Yes |
 | Earlier versions | No |
 
 ## Reporting a vulnerability
