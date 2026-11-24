@@ -1,0 +1,35 @@
+---
+source: crates/auditstream/tests/it/export.rs
+info:
+  program: auditstream
+  args:
+    - export
+    - "--help"
+  env:
+    DATABASE_URL: ""
+---
+success: true
+exit_code: 0
+----- stdout -----
+Export recorded audit events to a sink
+
+Usage: auditstream export [OPTIONS]
+
+Options:
+      --config <PATH>       Path to the configuration file (defaults to ./auditstream.toml if present) [env: AUDITSTREAM_CONFIG=]
+      --format <FORMAT>     Destination encoding (default: jsonl) [possible values: jsonl, csv]
+      --database-url <URL>  Postgres connection URL (also reads `DATABASE_URL` as fallback) [env: AUDITSTREAM_DATABASE_URL]
+      --output <PATH>       Append to this file (default: stdout)
+      --cursor-file <PATH>  Persist the last acknowledged position and resume on the next run
+      --schema <SCHEMA>     Audit schema name (defaults to `auditstream`) [env: AUDITSTREAM_SCHEMA=]
+      --batch-size <N>      Maximum events per batch (default: 1000)
+  -v, --verbose...          Increase log verbosity (`-v` info, `-vv` debug)
+      --from-start          Replay from the beginning and replace the stored cursor
+  -q, --quiet               Silence warnings and info logs (errors only)
+      --since <TIME>        Include events at or after this RFC 3339 timestamp or UTC date
+      --until <TIME>        Include events strictly before this RFC 3339 timestamp or UTC date
+      --actor <ID>          Match an actor ID directly or through onBehalfOf
+      --source <db|app>     Select database changes or application events
+  -h, --help                Print help
+
+----- stderr -----
