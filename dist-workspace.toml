@@ -13,9 +13,11 @@ installers = ["shell", "powershell", "npm", "homebrew"]
 tap = "auditstream/homebrew-tap"
 # Publish Homebrew formula via dist and npm tarball via custom OIDC trusted-publishing workflow
 publish-jobs = ["homebrew", "./publish-npm"]
-# Publish the multi-arch container image after announce so pre-releases also publish :<version>
-# without enabling pre-release publishes for Homebrew or npm
-post-announce-jobs = ["./publish-image"]
+# Publish the multi-arch container image in host-jobs (alongside host) so pre-releases
+# also publish :<version> without enabling pre-release publishes for Homebrew or npm
+# (post-announce-jobs lacks an `if: always()` guard in cargo-dist 0.34.0 and gets
+# transitively skipped by GitHub Actions whenever publish jobs skip on pre-releases)
+host-jobs = ["./publish-image"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = [
   "aarch64-apple-darwin",
