@@ -276,9 +276,12 @@ async fn stdout_is_stateless_and_quiet_hides_only_the_summary() {
     };
     let summary = String::from_utf8_lossy(&output.stderr);
     assert_eq!(summary.lines().count(), 1);
-    assert!(summary.contains("3") && summary.contains("batch") && summary.contains("cursor"));
+    assert!(
+        summary.starts_with("events=3 batches=1 cursor=("),
+        "{summary}"
+    );
     let quiet = run_export(&db, dir.path(), &["-q", "--format", "jsonl"]);
-    assert!(quiet.stderr.is_empty());
+    assert_eq!(quiet.stderr.as_slice(), b"");
     assert_eq!(json_events(&quiet.stdout), json_events(&output.stdout));
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
 
@@ -341,7 +344,7 @@ async fn full_destination_exits_io_without_advancing_cursor() {
     let dir = tempdir().expect("tempdir");
     let args = ["--cursor-file", "cursor.json", "--output", "/dev/full"];
     run_export(&db, dir.path(), &args);
-    let cursor = fs::read(dir.path().join("cursor.json")).ok();
+    let cursor = fs::read(dir.path().join("cursor.json")).expect("initial checkpoint");
     seed_events(&db).await;
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -363,11 +366,11 @@ async fn full_destination_exits_io_without_advancing_cursor() {
         assert!(Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert_eq!(fs::read(dir.path().join("cursor.json")).ok(), cursor);
+    assert_eq!(fs::read(dir.path().join("cursor.json")).unwrap(), cursor);
 }
 
 #[tokio::test]
-async fn foreign_database_rejects_saved_cursor_without_modifying_files() {
+async fn foreign_database_and_failed_replay_preserve_cursor_and_output() {
     let db = export_db().await;
     seed_events(&db).await;
     let dir = tempdir().expect("tempdir");
@@ -377,20 +380,31 @@ async fn foreign_database_rejects_saved_cursor_without_modifying_files() {
     let saved_output = fs::read(dir.path().join("events.jsonl")).unwrap();
     let other_db = export_db().await;
     seed_events(&other_db).await;
-    auditstream_cmd()
-        .current_dir(dir.path())
-        .env("AUDITSTREAM_DATABASE_URL", other_db.url())
-        .arg("export")
-        .args(args)
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("database"));
-    assert_eq!(
-        fs::read(dir.path().join("cursor.json")).unwrap(),
-        saved_cursor
-    );
-    assert_eq!(
-        fs::read(dir.path().join("events.jsonl")).unwrap(),
-        saved_output
-    );
+    for (url, extra, code, error) in [
+        (other_db.url(), &[][..], 2, "database"),
+        (
+            db.url(),
+            &["--schema", "missing_schema", "--from-start"][..],
+            3,
+            "failed to query history batch",
+        ),
+    ] {
+        auditstream_cmd()
+            .current_dir(dir.path())
+            .env("AUDITSTREAM_DATABASE_URL", url)
+            .arg("export")
+            .args(args)
+            .args(extra)
+            .assert()
+            .code(code)
+            .stderr(predicate::str::contains(error));
+        assert_eq!(
+            fs::read(dir.path().join("cursor.json")).unwrap(),
+            saved_cursor
+        );
+        assert_eq!(
+            fs::read(dir.path().join("events.jsonl")).unwrap(),
+            saved_output
+        );
+    }
 }
