@@ -348,3 +348,83 @@ async fn rows_in_changes_default_are_reported_with_count_oldest_and_newest() {
         Some("2020-02-20T18:30:45.123456Z")
     );
 }
+
+#[tokio::test]
+async fn installed_captures_discovers_top_level_tables_args_and_trigger_states() {
+    let db = TestDb::new().await.expect("create TestDb");
+    let empty = verify::installed_captures(db.pool(), DEFAULT_SCHEMA)
+        .await
+        .expect("installed_captures before install");
+    assert_eq!(empty, Vec::new());
+
+    create_invoice_table(&db).await;
+    db.execute(
+        "CREATE TABLE public.orders ( \
+           id int NOT NULL, \
+           created_year int NOT NULL, \
+           total numeric NOT NULL, \
+           PRIMARY KEY (id, created_year) \
+         ) PARTITION BY RANGE (created_year)",
+    )
+    .await
+    .expect("create partitioned orders");
+    db.execute(
+        "CREATE TABLE public.orders_2026 PARTITION OF public.orders \
+         FOR VALUES FROM (2026) TO (2027)",
+    )
+    .await
+    .expect("create child orders_2026");
+
+    let specs = vec![
+        invoice_spec(vec!["password_hash"]),
+        TableTriggerSpec::new(
+            "public",
+            "orders",
+            vec!["id".to_owned(), "created_year".to_owned()],
+            vec![],
+        )
+        .partitioned(),
+    ];
+    install_fixture(&db, &specs).await;
+
+    db.execute("ALTER TABLE public.invoice DISABLE TRIGGER auditstream_delete")
+        .await
+        .expect("disable invoice delete trigger");
+
+    let installed = verify::installed_captures(db.pool(), DEFAULT_SCHEMA)
+        .await
+        .expect("installed_captures");
+    assert_eq!(
+        installed.len(),
+        2,
+        "child partition orders_2026 must not appear as a separate top-level entry"
+    );
+
+    let inv = &installed[0];
+    assert_eq!(inv.schema, "public");
+    assert_eq!(inv.table, "invoice");
+    assert!(!inv.is_partitioned);
+    assert_eq!(inv.primary_key, vec!["id".to_owned()]);
+    assert_eq!(inv.excluded_columns, vec!["password_hash".to_owned()]);
+    assert_eq!(
+        inv.triggers,
+        vec![
+            ("auditstream_delete".to_owned(), "D".to_owned()),
+            ("auditstream_insert".to_owned(), "O".to_owned()),
+            ("auditstream_truncate".to_owned(), "O".to_owned()),
+            ("auditstream_update".to_owned(), "O".to_owned()),
+        ]
+    );
+
+    let ord = &installed[1];
+    assert_eq!(ord.schema, "public");
+    assert_eq!(ord.table, "orders");
+    assert!(ord.is_partitioned);
+    assert_eq!(
+        ord.primary_key,
+        vec!["id".to_owned(), "created_year".to_owned()]
+    );
+    assert_eq!(ord.excluded_columns, Vec::<String>::new());
+    assert_eq!(ord.triggers.len(), 4);
+    assert!(ord.triggers.iter().all(|(_, state)| state == "O"));
+}

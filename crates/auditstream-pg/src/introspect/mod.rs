@@ -131,6 +131,34 @@ pub struct TableInfo {
     pub partitions: Vec<PartitionInfo>,
 }
 
+/// Lists all non-system user schema names in deterministic alphabetical order, excluding
+/// `options.audit_schema`, `pg_catalog`, `information_schema`, `pg_toast*`, and `pg_temp_*`.
+///
+/// # Errors
+///
+/// Returns [`IntrospectError::Database`] if the catalog query fails.
+pub async fn user_schemas(
+    pool: &PgPool,
+    options: &IntrospectOptions,
+) -> Result<Vec<String>, IntrospectError> {
+    let mut schemas: Vec<String> = sqlx::query_scalar(
+        "SELECT n.nspname \
+           FROM pg_catalog.pg_namespace n \
+          WHERE n.nspname <> $1 \
+            AND n.nspname <> 'pg_catalog' \
+            AND n.nspname <> 'information_schema' \
+            AND n.nspname NOT LIKE 'pg_toast%' \
+            AND n.nspname NOT LIKE 'pg_temp_%' \
+          ORDER BY n.nspname ASC",
+    )
+    .bind(&options.audit_schema)
+    .fetch_all(pool)
+    .await?;
+
+    schemas.sort();
+    Ok(schemas)
+}
+
 /// Introspects ordinary and partitioned user tables across `schemas` using the default
 /// `"auditstream"` audit schema exclusion.
 ///

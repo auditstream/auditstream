@@ -11,10 +11,77 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use super::{
-    DrizzleLayout, Manifest, MigrationError, MigrationOptions, WriteOutcome, build_manifest,
-    compose_statements, compute_dropped_tables, header_comment, next_unique_timestamp,
-    parse_manifest_from_file,
+    DrizzleLayout, Manifest, MigrationError, MigrationOptions, PreviewOutcome, WriteOutcome,
+    build_manifest, compose_statements, compute_dropped_tables, header_comment,
+    next_unique_timestamp, parse_manifest_from_file,
 };
+
+pub(crate) fn preview(options: &MigrationOptions) -> Result<PreviewOutcome, MigrationError> {
+    let layout = options
+        .drizzle_layout
+        .unwrap_or_else(|| detect_layout(&options.out_dir));
+    let current = build_manifest(options);
+    let newest = match layout {
+        DrizzleLayout::V045 => find_newest_v045_migration(&options.out_dir)?,
+        DrizzleLayout::V1 => find_newest_v1_migration(&options.out_dir)?,
+    };
+
+    if let Some((ref existing_path, ref prev_manifest)) = newest
+        && prev_manifest.canonical_json == current.canonical_json
+        && options.removed_tables.is_empty()
+    {
+        return Ok(PreviewOutcome::UpToDate {
+            existing: existing_path.clone(),
+        });
+    }
+
+    let dropped_tables = compute_dropped_tables(
+        newest.as_ref().map(|(_, m)| m),
+        &current,
+        &options.removed_tables,
+    );
+    let statements = compose_statements(options, &dropped_tables);
+    Ok(PreviewOutcome::Sql {
+        sql: render_drizzle_sql(&current, &statements),
+        dropped_tables,
+    })
+}
+
+fn find_newest_v045_migration(
+    out_dir: &Path,
+) -> Result<Option<(PathBuf, Manifest)>, MigrationError> {
+    let journal_path = out_dir.join("meta").join("_journal.json");
+    if !journal_path.is_file() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&journal_path)?;
+    let journal: Value = serde_json::from_str(&raw).map_err(|err| {
+        MigrationError::InvalidMetadata(format!(
+            "invalid Drizzle journal {}: {err}",
+            journal_path.display()
+        ))
+    })?;
+    let entries = journal
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            MigrationError::InvalidMetadata(format!(
+                "Drizzle journal {} is missing an `entries` array",
+                journal_path.display()
+            ))
+        })?;
+    for entry in entries.iter().rev() {
+        if let Some(tag) = entry.get("tag").and_then(Value::as_str) {
+            let sql_path = out_dir.join(format!("{tag}.sql"));
+            if sql_path.is_file()
+                && let Some(manifest) = parse_manifest_from_file(&sql_path)?
+            {
+                return Ok(Some((sql_path, manifest)));
+            }
+        }
+    }
+    Ok(None)
+}
 
 /// Statement separator recognized by both Drizzle 0.45 and Drizzle 1.x migrators.
 pub const STATEMENT_BREAKPOINT: &str = "--> statement-breakpoint";

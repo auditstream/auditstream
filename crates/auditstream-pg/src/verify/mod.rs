@@ -156,6 +156,113 @@ impl VerifyOptions {
     }
 }
 
+/// Live Auditstream trigger installation metadata discovered on a single user table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledTableCapture {
+    /// Table schema name.
+    pub schema: String,
+    /// Table name.
+    pub table: String,
+    /// Whether the table is a partitioned parent (`relkind = 'p'`).
+    pub is_partitioned: bool,
+    /// Primary key column names decoded from the trigger's first `TG_ARGV` JSON array.
+    pub primary_key: Vec<String>,
+    /// Excluded column names decoded from the trigger's second `TG_ARGV` JSON array.
+    pub excluded_columns: Vec<String>,
+    /// Installed `auditstream_*` triggers on this table as sorted `(trigger_name, tgenabled)` pairs.
+    pub triggers: Vec<(String, String)>,
+}
+
+/// Discovers every top-level user table that currently has at least one non-internal
+/// `auditstream_*` trigger pointing at `{audit_schema}.capture()`, inside a `READ ONLY`
+/// transaction.
+///
+/// Used by `auditstream status` to report trigger state and excluded columns and by
+/// `auditstream verify` when no `capture.tables` selection is configured.
+///
+/// # Errors
+///
+/// Returns [`VerifyError::Database`] if querying PostgreSQL catalogs fails.
+pub async fn installed_captures(
+    pool: &PgPool,
+    audit_schema: &str,
+) -> Result<Vec<InstalledTableCapture>, VerifyError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+
+    let rows: Vec<InstalledTriggerRow> = sqlx::query_as(
+        "SELECT \
+           n.nspname AS schema_name, \
+           c.relname AS table_name, \
+           c.relkind::text AS relkind, \
+           t.tgname, \
+           t.tgenabled::text AS tgenabled, \
+           t.tgnargs, \
+           t.tgargs \
+         FROM pg_catalog.pg_trigger t \
+         JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid \
+         JOIN pg_catalog.pg_namespace pn ON pn.oid = p.pronamespace \
+        WHERE NOT t.tgisinternal \
+          AND NOT c.relispartition \
+          AND c.relkind IN ('r', 'p') \
+          AND t.tgname LIKE 'auditstream\\_%' ESCAPE '\\' \
+          AND pn.nspname = $1 \
+          AND p.proname = 'capture' \
+        ORDER BY n.nspname ASC, c.relname ASC, t.tgname ASC",
+    )
+    .bind(audit_schema)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    let mut grouped: HashMap<(String, String), InstalledTableCapture> = HashMap::new();
+    for row in rows {
+        let key = (row.schema_name.clone(), row.table_name.clone());
+        let args = decode_tgargs(&row.tgargs, row.tgnargs);
+        let pk: Vec<String> = args
+            .first()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let excluded: Vec<String> = args
+            .get(1)
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+
+        let entry = grouped.entry(key).or_insert_with(|| InstalledTableCapture {
+            schema: row.schema_name,
+            table: row.table_name,
+            is_partitioned: row.relkind == "p",
+            primary_key: pk,
+            excluded_columns: excluded,
+            triggers: Vec::new(),
+        });
+        entry.triggers.push((row.tgname, row.tgenabled));
+    }
+
+    let mut result: Vec<InstalledTableCapture> = grouped.into_values().collect();
+    for item in &mut result {
+        item.triggers.sort();
+    }
+    result.sort_by(|a, b| a.schema.cmp(&b.schema).then_with(|| a.table.cmp(&b.table)));
+    Ok(result)
+}
+
+#[derive(Debug, FromRow)]
+struct InstalledTriggerRow {
+    schema_name: String,
+    table_name: String,
+    relkind: String,
+    tgname: String,
+    tgenabled: String,
+    tgnargs: i16,
+    tgargs: Vec<u8>,
+}
+
 /// Verifies capture installation against `tables` in the default `"auditstream"` schema.
 ///
 /// Runs inside a `READ ONLY` PostgreSQL transaction and returns findings in a deterministic

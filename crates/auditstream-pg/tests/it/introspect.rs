@@ -348,3 +348,91 @@ async fn reports_virtual_generated_columns_on_postgres_18_and_newer() {
     pool.close().await;
     drop(db);
 }
+
+#[tokio::test]
+async fn connect_and_user_schemas_exclude_system_and_configured_audit_schemas() {
+    let err = auditstream_pg::connect("not-a-valid-postgres-url")
+        .await
+        .expect_err("invalid URL must fail");
+    assert!(err.to_string().contains("failed to connect to PostgreSQL"));
+
+    let db = TestDb::new().await.expect("create TestDb");
+    let pool = auditstream_pg::connect(db.url())
+        .await
+        .expect("connect via auditstream_pg::connect");
+
+    db.execute("CREATE SCHEMA alpha").await.expect("alpha");
+    db.execute("CREATE SCHEMA billing").await.expect("billing");
+    db.execute("CREATE SCHEMA auditstream")
+        .await
+        .expect("auditstream");
+    db.execute("CREATE SCHEMA custom_audit")
+        .await
+        .expect("custom_audit");
+
+    // Create a temp table on a pinned connection so a pg_temp_* schema exists.
+    let mut conn = pool.acquire().await.expect("acquire conn");
+    conn.execute("CREATE TEMP TABLE tmp_scratch (id int)")
+        .await
+        .expect("create temp table");
+    drop(conn);
+
+    let default_schemas = introspect::user_schemas(&pool, &IntrospectOptions::default())
+        .await
+        .expect("user_schemas default");
+    assert_eq!(
+        default_schemas,
+        vec![
+            "alpha".to_owned(),
+            "billing".to_owned(),
+            "custom_audit".to_owned(),
+            "public".to_owned(),
+        ]
+    );
+
+    let custom_schemas =
+        introspect::user_schemas(&pool, &IntrospectOptions::with_audit_schema("custom_audit"))
+            .await
+            .expect("user_schemas custom");
+    assert_eq!(
+        custom_schemas,
+        vec![
+            "alpha".to_owned(),
+            "auditstream".to_owned(),
+            "billing".to_owned(),
+            "public".to_owned(),
+        ]
+    );
+
+    // Exercise TestDb convenience SQL helpers (execute_batch, execute_statements, query_*).
+    db.execute_batch(
+        "CREATE TABLE alpha.items (id int PRIMARY KEY, label text NOT NULL); \
+         INSERT INTO alpha.items VALUES (1, 'one'), (2, 'two');",
+    )
+    .await
+    .expect("execute_batch");
+    db.execute_statements(&["INSERT INTO alpha.items VALUES (3, 'three')".to_owned()])
+        .await
+        .expect("execute_statements");
+    assert_eq!(
+        db.query_scalar_i64("SELECT count(*) FROM alpha.items")
+            .await
+            .expect("query_scalar_i64"),
+        3
+    );
+    assert_eq!(
+        db.query_scalar_string("SELECT label FROM alpha.items WHERE id = 2")
+            .await
+            .expect("query_scalar_string"),
+        "two"
+    );
+    assert_eq!(
+        db.query_strings("SELECT label FROM alpha.items ORDER BY id ASC")
+            .await
+            .expect("query_strings"),
+        vec!["one".to_owned(), "two".to_owned(), "three".to_owned()]
+    );
+
+    pool.close().await;
+    drop(db);
+}

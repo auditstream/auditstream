@@ -7,9 +7,35 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::{
-    Manifest, MigrationError, MigrationOptions, WriteOutcome, build_manifest, compose_statements,
-    compute_dropped_tables, header_comment, next_unique_timestamp, parse_manifest_from_file,
+    Manifest, MigrationError, MigrationOptions, PreviewOutcome, WriteOutcome, build_manifest,
+    compose_statements, compute_dropped_tables, header_comment, next_unique_timestamp,
+    parse_manifest_from_file,
 };
+
+pub(crate) fn preview(options: &MigrationOptions) -> Result<PreviewOutcome, MigrationError> {
+    let current = build_manifest(options);
+    let newest = find_newest_sql_migration(&options.out_dir)?;
+
+    if let Some((ref existing_path, ref prev_manifest)) = newest
+        && prev_manifest.canonical_json == current.canonical_json
+        && options.removed_tables.is_empty()
+    {
+        return Ok(PreviewOutcome::UpToDate {
+            existing: existing_path.clone(),
+        });
+    }
+
+    let dropped_tables = compute_dropped_tables(
+        newest.as_ref().map(|(_, m)| m),
+        &current,
+        &options.removed_tables,
+    );
+    let statements = compose_statements(options, &dropped_tables);
+    Ok(PreviewOutcome::Sql {
+        sql: render_plain_sql(&current, &statements),
+        dropped_tables,
+    })
+}
 
 pub(crate) fn write(options: &MigrationOptions) -> Result<WriteOutcome, MigrationError> {
     let current = build_manifest(options);

@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use auditstream_core::{ActorSource, Cursor, Event, EventSource, Op, Source};
 use auditstream_pg::ddl::{self, DEFAULT_SCHEMA, DdlOptions, quote_ident};
-use auditstream_pg::reader::{ExportFilter, HistoryQuery, PgEventSource, lookup};
+use auditstream_pg::reader::{ExportFilter, HistoryQuery, PgEventSource, RecordIdFilter, lookup};
 use auditstream_pg::triggers::{self, TableTriggerSpec, TriggerOptions};
 use auditstream_testkit::TestDb;
 use sqlx::postgres::{PgConnection, PgPoolOptions};
@@ -450,6 +450,7 @@ async fn pagination_ack_monotonicity_precision_filters_and_lookup_work_as_select
             to: Some(t_after),
             actor_id: Some("usr_nobody".to_owned()),
             source: Some(Source::Db),
+            ..ExportFilter::default()
         },
     );
     let filtered_batch = filtered_source
@@ -561,6 +562,233 @@ async fn pagination_ack_monotonicity_precision_filters_and_lookup_work_as_select
             .await
             .is_err(),
         "SELECT-only reader role must have no privileges on application tables"
+    );
+
+    app_pool.close().await;
+    reader_pool.close().await;
+    drop(db);
+    cleanup_role(&admin_url, &app_role).await;
+    cleanup_role(&admin_url, &reader_role).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn cli_filters_support_exclusive_until_on_behalf_of_actor_and_record_id_modes() {
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let (db, app_role, reader_role, app_pool, reader_pool, admin_url) = setup_reader_db().await;
+
+    // Add a string-PK table and a composite-PK table to verify RecordIdFilter::Scalar vs Contains.
+    db.execute(
+        "CREATE TABLE public.doc (code text PRIMARY KEY, body text); \
+         CREATE TABLE public.line_item (tenant_id text NOT NULL, seq_no int NOT NULL, PRIMARY KEY (tenant_id, seq_no));",
+    )
+    .await
+    .expect("create doc and line_item");
+    db.execute(&format!(
+        "GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON public.doc, public.line_item TO {}",
+        quote_ident(&app_role)
+    ))
+    .await
+    .expect("grant doc and line_item DML");
+    let extra_triggers = triggers::generate(&TriggerOptions::new(
+        DEFAULT_SCHEMA,
+        vec![
+            TableTriggerSpec::new("public", "doc", vec!["code".to_owned()], vec![]),
+            TableTriggerSpec::new(
+                "public",
+                "line_item",
+                vec!["tenant_id".to_owned(), "seq_no".to_owned()],
+                vec![],
+            ),
+        ],
+    ));
+    db.execute_statements(&extra_triggers)
+        .await
+        .expect("install extra triggers");
+
+    // 1. Direct actor `usr_alice` on invoice id=10 (integer scalar).
+    // {"type":"user","id":"usr_alice"}
+    app_pool
+        .execute(
+            "INSERT INTO public.invoice VALUES (10, 'open', 100) \
+             /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyX2FsaWNlIn0'*/",
+        )
+        .await
+        .expect("insert invoice 10");
+
+    // Small delay so the next event has a strictly greater occurred_at for `--until` boundary testing.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // 2. Support user acting onBehalfOf `usr_alice` on doc code='10' (string scalar).
+    // {"type":"user","id":"usr_support","onBehalfOf":{"type":"user","id":"usr_alice"}}
+    app_pool
+        .execute(
+            "INSERT INTO public.doc VALUES ('10', 'hello') \
+             /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyX3N1cHBvcnQiLCJvbkJlaGFsZk9mIjp7InR5cGUiOiJ1c2VyIiwiaWQiOiJ1c3JfYWxpY2UifX0'*/",
+        )
+        .await
+        .expect("insert doc '10'");
+
+    // 3. Composite-PK rows by usr_bob.
+    // {"type":"user","id":"usr_bob"}
+    app_pool
+        .execute(
+            "INSERT INTO public.line_item VALUES ('t1', 1), ('t1', 2) \
+             /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyX2JvYiJ9'*/",
+        )
+        .await
+        .expect("insert line_items");
+
+    // Load all 4 events in chronological order to read exact `occurred_at` of event #2.
+    let mut all_source = PgEventSource::with_default_schema(reader_pool.clone(), Cursor::new(0, 0));
+    let all = drain_until(&mut all_source, 10, 4, Duration::from_secs(5)).await;
+    assert_eq!(all.len(), 4);
+    let second_ts = all[1].occurred_at;
+
+    // `until` is strictly exclusive (<) whereas `to` is inclusive (<=).
+    let with_until = lookup(
+        &reader_pool,
+        DEFAULT_SCHEMA,
+        &HistoryQuery {
+            until: Some(second_ts),
+            ..HistoryQuery::default()
+        },
+    )
+    .await
+    .expect("lookup until");
+    assert_eq!(with_until.len(), 1);
+    assert_eq!(with_until[0].table_name.as_deref(), Some("invoice"));
+
+    let with_to = lookup(
+        &reader_pool,
+        DEFAULT_SCHEMA,
+        &HistoryQuery {
+            to: Some(second_ts),
+            ..HistoryQuery::default()
+        },
+    )
+    .await
+    .expect("lookup to");
+    assert_eq!(with_to.len(), 2);
+
+    // ExportFilter.until is also strictly exclusive.
+    let mut export_until = PgEventSource::new(
+        reader_pool.clone(),
+        DEFAULT_SCHEMA,
+        Cursor::new(0, 0),
+        ExportFilter {
+            until: Some(second_ts),
+            ..ExportFilter::default()
+        },
+    );
+    let exported_until = drain_until(&mut export_until, 10, 1, Duration::from_secs(5)).await;
+    assert_eq!(exported_until.len(), 1);
+    assert_eq!(exported_until[0].table_name.as_deref(), Some("invoice"));
+    assert!(
+        export_until
+            .next_batch(10)
+            .await
+            .expect("no more events after until")
+            .is_none()
+    );
+
+    // `actor_or_on_behalf_of` matches both direct actor and `onBehalfOf.id` (lookup + export).
+    let direct_only = lookup(
+        &reader_pool,
+        DEFAULT_SCHEMA,
+        &HistoryQuery {
+            actor_id: Some("usr_alice".to_owned()),
+            ..HistoryQuery::default()
+        },
+    )
+    .await
+    .expect("lookup actor_id");
+    assert_eq!(direct_only.len(), 1);
+
+    let direct_or_obo = lookup(
+        &reader_pool,
+        DEFAULT_SCHEMA,
+        &HistoryQuery {
+            actor_or_on_behalf_of: Some("usr_alice".to_owned()),
+            ..HistoryQuery::default()
+        },
+    )
+    .await
+    .expect("lookup actor_or_on_behalf_of");
+    assert_eq!(direct_or_obo.len(), 2);
+
+    let mut export_obo = PgEventSource::new(
+        reader_pool.clone(),
+        DEFAULT_SCHEMA,
+        Cursor::new(0, 0),
+        ExportFilter {
+            actor_or_on_behalf_of: Some("usr_alice".to_owned()),
+            ..ExportFilter::default()
+        },
+    );
+    let exported_obo = drain_until(&mut export_obo, 10, 2, Duration::from_secs(5)).await;
+    assert_eq!(exported_obo.len(), 2);
+
+    // RecordIdFilter::Scalar preserves JSONB type distinction (10 vs "10") and skips composite PKs.
+    let scalar_num = lookup(
+        &reader_pool,
+        DEFAULT_SCHEMA,
+        &HistoryQuery {
+            record_id_filter: Some(RecordIdFilter::Scalar("10".to_owned())),
+            ..HistoryQuery::default()
+        },
+    )
+    .await
+    .expect("lookup scalar 10");
+    assert_eq!(scalar_num.len(), 1);
+    assert_eq!(scalar_num[0].table_name.as_deref(), Some("invoice"));
+
+    let scalar_str = lookup(
+        &reader_pool,
+        DEFAULT_SCHEMA,
+        &HistoryQuery {
+            record_id_filter: Some(RecordIdFilter::Scalar(r#""10""#.to_owned())),
+            ..HistoryQuery::default()
+        },
+    )
+    .await
+    .expect("lookup scalar \"10\"");
+    assert_eq!(scalar_str.len(), 1);
+    assert_eq!(scalar_str[0].table_name.as_deref(), Some("doc"));
+
+    // RecordIdFilter::Contains matches partial composite keys; Exact matches one full key.
+    let composite_partial = lookup(
+        &reader_pool,
+        DEFAULT_SCHEMA,
+        &HistoryQuery {
+            record_id_filter: Some(RecordIdFilter::Contains(r#"{"tenant_id":"t1"}"#.to_owned())),
+            ..HistoryQuery::default()
+        },
+    )
+    .await
+    .expect("lookup contains composite");
+    assert_eq!(composite_partial.len(), 2);
+
+    let composite_exact = lookup(
+        &reader_pool,
+        DEFAULT_SCHEMA,
+        &HistoryQuery {
+            record_id_filter: Some(RecordIdFilter::Exact(
+                r#"{"tenant_id":"t1","seq_no":2}"#.to_owned(),
+            )),
+            ..HistoryQuery::default()
+        },
+    )
+    .await
+    .expect("lookup exact composite");
+    assert_eq!(composite_exact.len(), 1);
+    assert_eq!(
+        composite_exact[0]
+            .record_id
+            .as_deref()
+            .expect("record_id")
+            .get(),
+        r#"{"seq_no":2,"tenant_id":"t1"}"#
     );
 
     app_pool.close().await;

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use auditstream_pg::ddl::{DEFAULT_SCHEMA, DdlOptions, quote_ident};
 use auditstream_pg::migrations::drizzle::STATEMENT_BREAKPOINT;
 use auditstream_pg::migrations::{
-    self, DrizzleLayout, MigrationFormat, MigrationOptions, WriteOutcome,
+    self, DrizzleLayout, MigrationFormat, MigrationOptions, PreviewOutcome, WriteOutcome,
 };
 use auditstream_pg::triggers::TableTriggerSpec;
 use auditstream_testkit::TestDb;
@@ -309,6 +309,115 @@ fn rerunning_same_selection_is_up_to_date_and_changed_selection_adds_and_drops_w
         assert!(
             second_sql.contains(r#"ON "public"."customer""#),
             "{label}: expected trigger creation for added table"
+        );
+    }
+}
+
+#[test]
+fn preview_renders_identical_sql_without_modifying_filesystem_and_detects_up_to_date_and_drops() {
+    let now = fixed_time();
+    let ddl = DdlOptions::new(DEFAULT_SCHEMA, vec!["app_user".to_owned()]);
+    let initial_tables = fixture_tables();
+
+    for (label, format, layout) in [
+        ("prisma", MigrationFormat::Prisma, None),
+        (
+            "drizzle045",
+            MigrationFormat::Drizzle,
+            Some(DrizzleLayout::V045),
+        ),
+        (
+            "drizzle1x",
+            MigrationFormat::Drizzle,
+            Some(DrizzleLayout::V1),
+        ),
+        ("sql", MigrationFormat::Sql, None),
+    ] {
+        let scratch = ScratchDir::new(&format!("preview_{label}"));
+        let target_dir = scratch.path().join("migrations_not_yet_created");
+        assert!(!target_dir.exists());
+
+        let mut opts = MigrationOptions::new(
+            format,
+            &target_dir,
+            now,
+            ddl.clone(),
+            initial_tables.clone(),
+        );
+        if let Some(l) = layout {
+            opts = opts.with_drizzle_layout(l);
+        }
+
+        // 1. Preview on non-existent directory produces SQL and creates NOTHING on disk.
+        let PreviewOutcome::Sql {
+            sql: preview_sql,
+            dropped_tables,
+        } = migrations::preview(&opts).expect("initial preview")
+        else {
+            panic!("{label}: expected PreviewOutcome::Sql");
+        };
+        assert_eq!(dropped_tables, Vec::<(String, String)>::new());
+        assert!(
+            !target_dir.exists(),
+            "{label}: preview must not create target directory"
+        );
+
+        // 2. Real write emits byte-identical SQL.
+        let WriteOutcome::Written { files, .. } = migrations::write(&opts).expect("write") else {
+            panic!("{label}: expected Written");
+        };
+        let written_sql = fs::read_to_string(&files[0]).expect("read written sql");
+        assert_eq!(
+            preview_sql, written_sql,
+            "{label}: preview SQL must match write SQL"
+        );
+
+        // 3. Re-running preview on identical selection returns UpToDate.
+        let up_to_date = migrations::preview(&opts).expect("second preview");
+        assert!(
+            matches!(up_to_date, PreviewOutcome::UpToDate { ref existing } if existing == &files[0]),
+            "{label}: expected PreviewOutcome::UpToDate, got {up_to_date:?}"
+        );
+
+        // 4. Previewing a changed selection reports dropped_tables without writing any new files.
+        let entries_before: Vec<PathBuf> = fs::read_dir(&target_dir)
+            .expect("read dir before")
+            .map(|e| e.expect("dir entry").path())
+            .collect();
+        let updated_tables = vec![
+            initial_tables[0].clone(),
+            TableTriggerSpec::new("public", "customer", vec!["id".to_owned()], Vec::new()),
+        ];
+        let mut changed_opts =
+            MigrationOptions::new(format, &target_dir, now, ddl.clone(), updated_tables);
+        if let Some(l) = layout {
+            changed_opts = changed_opts.with_drizzle_layout(l);
+        }
+
+        let PreviewOutcome::Sql {
+            sql: changed_sql,
+            dropped_tables: changed_drops,
+        } = migrations::preview(&changed_opts).expect("changed preview")
+        else {
+            panic!("{label}: expected PreviewOutcome::Sql for changed selection");
+        };
+        assert_eq!(
+            changed_drops,
+            vec![("public".to_owned(), "line_item".to_owned())]
+        );
+        assert!(
+            changed_sql
+                .contains(r#"DROP TRIGGER IF EXISTS auditstream_insert ON "public"."line_item""#)
+        );
+        assert!(changed_sql.contains(r#"ON "public"."customer""#));
+
+        let entries_after: Vec<PathBuf> = fs::read_dir(&target_dir)
+            .expect("read dir after")
+            .map(|e| e.expect("dir entry").path())
+            .collect();
+        assert_eq!(
+            entries_after, entries_before,
+            "{label}: preview must leave target directory untouched"
         );
     }
 }
