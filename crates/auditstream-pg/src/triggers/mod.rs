@@ -15,7 +15,8 @@
 //! - Per-table `CREATE OR REPLACE TRIGGER` definitions (`auditstream_insert`,
 //!   `auditstream_update`, `auditstream_delete`, `auditstream_truncate`).
 //!
-//! All regexes avoid repetition counts above 255 (length bounds are checked in SQL).
+//! Actor comment extraction uses pure SQL string builtins (no POSIX regexes),
+//! keeping length bounds explicit in SQL without hitting PostgreSQL's 255 quantifier cap.
 
 use crate::ddl::{DEFAULT_SCHEMA, OWNER_ROLE, quote_ident, quote_literal};
 
@@ -253,114 +254,162 @@ $$"
 #[allow(clippy::too_many_lines)]
 fn resolve_actor_sql(schema_q: &str) -> String {
     format!(
-        "CREATE OR REPLACE FUNCTION {schema_q}.resolve_actor(\n  \
-  OUT actor jsonb,\n  \
-  OUT context jsonb,\n  \
-  OUT actor_source text\n\
-)\n\
-LANGUAGE plpgsql\n\
-STABLE\n\
-SECURITY DEFINER\n\
-SET search_path = pg_catalog, pg_temp\n\
-AS $fn$\n\
-DECLARE\n  \
-  raw_setting text;\n  \
-  body text[];\n  \
-  matched text[];\n  \
-  raw_b64 text;\n  \
-  decoded_bytes bytea;\n  \
-  payload jsonb;\n  \
-  claims jsonb;\n  \
-  sub_val text;\n\
-BEGIN\n  \
-  raw_setting := NULLIF(pg_catalog.current_setting('auditstream.actor', true), '');\n  \
-  IF raw_setting IS NOT NULL THEN\n    \
-    IF pg_catalog.octet_length(raw_setting) > 512 THEN\n      \
-      actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;\n    \
-    END IF;\n    \
-    BEGIN\n      \
-      payload := raw_setting::jsonb;\n    \
-    EXCEPTION WHEN others THEN\n      \
-      actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;\n    \
-    END;\n    \
-    IF pg_catalog.jsonb_typeof(payload) IS DISTINCT FROM 'object'\n       \
-       OR pg_catalog.jsonb_typeof(payload->'type') IS DISTINCT FROM 'string'\n       \
-       OR pg_catalog.jsonb_typeof(payload->'id') IS DISTINCT FROM 'string'\n       \
-       OR pg_catalog.length(payload->>'type') = 0\n       \
-       OR pg_catalog.length(payload->>'id') = 0 THEN\n      \
-      actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;\n    \
-    END IF;\n    \
-    IF pg_catalog.jsonb_typeof(payload->'context') = 'object' THEN\n      \
-      context := payload->'context';\n    \
-    END IF;\n    \
-    actor := payload - 'context';\n    \
-    actor_source := 'set_config';\n    \
-    RETURN;\n  \
-  END IF;\n\n  \
-  body := pg_catalog.regexp_match(\n    \
-    pg_catalog.right(pg_catalog.current_query(), 4096),\n    \
-    '/\\*([^/]*)\\*/[\\s;]*$'\n  \
-  );\n  \
-  IF body IS NOT NULL THEN\n    \
-    matched := pg_catalog.regexp_match(body[1], '(?:^|,)auditstream=''([^'']*)''');\n    \
-    IF matched IS NOT NULL THEN\n      \
-      raw_b64 := matched[1];\n      \
-      IF pg_catalog.length(raw_b64) < 1\n         \
-         OR pg_catalog.length(raw_b64) > 683\n         \
-         OR pg_catalog.length(raw_b64) % 4 = 1\n         \
-         OR raw_b64 !~ '^[A-Za-z0-9_-]+$' THEN\n        \
-        actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;\n      \
-      END IF;\n      \
-      BEGIN\n        \
-        decoded_bytes := pg_catalog.decode(\n          \
-          pg_catalog.translate(raw_b64, '-_', '+/')\n            \
-            || pg_catalog.repeat('=', (4 - pg_catalog.length(raw_b64) % 4) % 4),\n          \
-          'base64'\n        \
-        );\n        \
-        IF pg_catalog.octet_length(decoded_bytes) > 512 THEN\n          \
-          actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;\n        \
-        END IF;\n        \
-        payload := pg_catalog.convert_from(decoded_bytes, 'UTF8')::jsonb;\n      \
-      EXCEPTION WHEN others THEN\n        \
-        actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;\n      \
-      END;\n      \
-      IF pg_catalog.jsonb_typeof(payload) IS DISTINCT FROM 'object'\n         \
-         OR pg_catalog.jsonb_typeof(payload->'type') IS DISTINCT FROM 'string'\n         \
-         OR pg_catalog.jsonb_typeof(payload->'id') IS DISTINCT FROM 'string'\n         \
-         OR pg_catalog.length(payload->>'type') = 0\n         \
-         OR pg_catalog.length(payload->>'id') = 0 THEN\n        \
-        actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;\n      \
-      END IF;\n      \
-      IF pg_catalog.jsonb_typeof(payload->'context') = 'object' THEN\n        \
-        context := payload->'context';\n      \
-      END IF;\n      \
-      actor := payload - 'context';\n      \
-      actor_source := 'comment';\n      \
-      RETURN;\n    \
-    END IF;\n  \
-  END IF;\n\n  \
-  raw_setting := NULLIF(pg_catalog.current_setting('request.jwt.claims', true), '');\n  \
-  IF raw_setting IS NOT NULL THEN\n    \
-    BEGIN\n      \
-      claims := raw_setting::jsonb;\n    \
-    EXCEPTION WHEN others THEN\n      \
-      actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;\n    \
-    END;\n    \
-    IF pg_catalog.jsonb_typeof(claims) = 'object'\n       \
-       AND pg_catalog.jsonb_typeof(claims->'sub') = 'string' THEN\n      \
-      sub_val := claims->>'sub';\n      \
-      IF pg_catalog.length(sub_val) > 0 THEN\n        \
-        actor := pg_catalog.jsonb_build_object('type', 'user', 'id', sub_val);\n        \
-        context := NULL;\n        \
-        actor_source := 'jwt';\n        \
-        RETURN;\n      \
-      END IF;\n    \
-    END IF;\n  \
-  END IF;\n\n  \
-  actor := NULL;\n  \
-  context := NULL;\n  \
-  actor_source := NULL;\n\
-END\n\
+        r"CREATE OR REPLACE FUNCTION {schema_q}.resolve_actor(
+  OUT actor jsonb,
+  OUT context jsonb,
+  OUT actor_source text
+)
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+  raw_setting text;
+  q_tail text;
+  q_len integer;
+  prefix text;
+  slash_rev integer;
+  open_pos integer;
+  comment_body text;
+  key_pos integer;
+  quote_pos integer;
+  has_tag boolean := false;
+  raw_b64 text;
+  b64_len integer;
+  decoded_bytes bytea;
+  payload jsonb;
+  claims jsonb;
+  sub_val text;
+BEGIN
+  raw_setting := NULLIF(pg_catalog.current_setting('auditstream.actor', true), '');
+  IF raw_setting IS NOT NULL THEN
+    IF pg_catalog.octet_length(raw_setting) > 512 THEN
+      actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;
+    END IF;
+    BEGIN
+      payload := raw_setting::jsonb;
+    EXCEPTION WHEN others THEN
+      actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;
+    END;
+    IF pg_catalog.jsonb_typeof(payload) IS DISTINCT FROM 'object'
+       OR pg_catalog.jsonb_typeof(payload->'type') IS DISTINCT FROM 'string'
+       OR pg_catalog.jsonb_typeof(payload->'id') IS DISTINCT FROM 'string'
+       OR pg_catalog.length(payload->>'type') = 0
+       OR pg_catalog.length(payload->>'id') = 0 THEN
+      actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;
+    END IF;
+    IF pg_catalog.jsonb_exists(payload, 'context') THEN
+      IF pg_catalog.jsonb_typeof(payload->'context') = 'object' THEN
+        context := payload->'context';
+      END IF;
+      actor := payload - 'context';
+    ELSE
+      actor := payload;
+    END IF;
+    actor_source := 'set_config';
+    RETURN;
+  END IF;
+
+  q_tail := pg_catalog.rtrim(
+    pg_catalog.right(pg_catalog.current_query(), 4096),
+    E' \t\n\r\f\v;'
+  );
+  q_len := pg_catalog.length(q_tail);
+  IF q_len >= 4
+     AND pg_catalog.right(q_tail, 2) = '*/'
+     AND pg_catalog.strpos(q_tail, 'auditstream=''') > 0 THEN
+    prefix := pg_catalog.left(q_tail, q_len - 2);
+    slash_rev := pg_catalog.strpos(pg_catalog.reverse(prefix), '/');
+    IF slash_rev > 0 THEN
+      open_pos := q_len - 1 - slash_rev;
+      IF pg_catalog.substr(prefix, open_pos, 2) = '/*' THEN
+        comment_body := pg_catalog.substr(prefix, open_pos + 2);
+        IF pg_catalog.left(comment_body, 13) = 'auditstream=''' THEN
+          quote_pos := pg_catalog.strpos(pg_catalog.substr(comment_body, 14), '''');
+          IF quote_pos > 0 THEN
+            raw_b64 := pg_catalog.substr(comment_body, 14, quote_pos - 1);
+            has_tag := true;
+          END IF;
+        ELSE
+          key_pos := pg_catalog.strpos(comment_body, ',auditstream=''');
+          IF key_pos > 0 THEN
+            quote_pos := pg_catalog.strpos(pg_catalog.substr(comment_body, key_pos + 14), '''');
+            IF quote_pos > 0 THEN
+              raw_b64 := pg_catalog.substr(comment_body, key_pos + 14, quote_pos - 1);
+              has_tag := true;
+            END IF;
+          END IF;
+        END IF;
+      END IF;
+    END IF;
+  END IF;
+  IF has_tag THEN
+    b64_len := pg_catalog.length(raw_b64);
+    IF b64_len < 1
+       OR b64_len > 683
+       OR b64_len % 4 = 1
+       OR pg_catalog.ltrim(
+            raw_b64,
+            'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-'
+          ) <> '' THEN
+      actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;
+    END IF;
+    BEGIN
+      decoded_bytes := pg_catalog.decode(
+        pg_catalog.translate(raw_b64, '-_', '+/')
+          || pg_catalog.repeat('=', (4 - b64_len % 4) % 4),
+        'base64'
+      );
+      IF pg_catalog.octet_length(decoded_bytes) > 512 THEN
+        actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;
+      END IF;
+      payload := pg_catalog.convert_from(decoded_bytes, 'UTF8')::jsonb;
+    EXCEPTION WHEN others THEN
+      actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;
+    END;
+    IF pg_catalog.jsonb_typeof(payload) IS DISTINCT FROM 'object'
+       OR pg_catalog.jsonb_typeof(payload->'type') IS DISTINCT FROM 'string'
+       OR pg_catalog.jsonb_typeof(payload->'id') IS DISTINCT FROM 'string'
+       OR pg_catalog.length(payload->>'type') = 0
+       OR pg_catalog.length(payload->>'id') = 0 THEN
+      actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;
+    END IF;
+    IF pg_catalog.jsonb_exists(payload, 'context') THEN
+      IF pg_catalog.jsonb_typeof(payload->'context') = 'object' THEN
+        context := payload->'context';
+      END IF;
+      actor := payload - 'context';
+    ELSE
+      actor := payload;
+    END IF;
+    actor_source := 'comment';
+    RETURN;
+  END IF;
+
+  raw_setting := NULLIF(pg_catalog.current_setting('request.jwt.claims', true), '');
+  IF raw_setting IS NOT NULL THEN
+    BEGIN
+      claims := raw_setting::jsonb;
+    EXCEPTION WHEN others THEN
+      actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;
+    END;
+    IF pg_catalog.jsonb_typeof(claims) = 'object'
+       AND pg_catalog.jsonb_typeof(claims->'sub') = 'string' THEN
+      sub_val := claims->>'sub';
+      IF pg_catalog.length(sub_val) > 0 THEN
+        actor := pg_catalog.jsonb_build_object('type', 'user', 'id', sub_val);
+        context := NULL;
+        actor_source := 'jwt';
+        RETURN;
+      END IF;
+    END IF;
+  END IF;
+
+  actor := NULL;
+  context := NULL;
+  actor_source := NULL;
+END
 $fn$"
     )
 }
@@ -376,8 +425,14 @@ SET search_path = pg_catalog, pg_temp\n\
 AS $fn$\n\
 DECLARE\n  \
   resolved record;\n  \
+  pk_json jsonb;\n  \
+  pk_len integer;\n  \
+  pk_single text;\n  \
   pk_cols text[] := '{{}}';\n  \
+  ex_json jsonb;\n  \
+  ex_len integer;\n  \
   ex_cols text[] := '{{}}';\n  \
+  has_ex boolean := false;\n  \
   v_schema text;\n  \
   v_table text;\n  \
   v_relid oid;\n  \
@@ -386,18 +441,6 @@ DECLARE\n  \
   v_record_id jsonb;\n  \
   v_changed text[];\n\
 BEGIN\n  \
-  IF TG_NARGS >= 1 THEN\n    \
-    pk_cols := COALESCE(\n      \
-      ARRAY(SELECT pg_catalog.jsonb_array_elements_text(TG_ARGV[0]::jsonb)),\n      \
-      '{{}}'::text[]\n    \
-    );\n  \
-  END IF;\n  \
-  IF TG_NARGS >= 2 THEN\n    \
-    ex_cols := COALESCE(\n      \
-      ARRAY(SELECT pg_catalog.jsonb_array_elements_text(TG_ARGV[1]::jsonb)),\n      \
-      '{{}}'::text[]\n    \
-    );\n  \
-  END IF;\n  \
   IF TG_NARGS >= 4 THEN\n    \
     v_schema := TG_ARGV[2];\n    \
     v_table := TG_ARGV[3];\n    \
@@ -407,10 +450,8 @@ BEGIN\n  \
     v_table := TG_TABLE_NAME;\n    \
     v_relid := TG_RELID;\n  \
   END IF;\n\n  \
-  SELECT r.actor, r.context, r.actor_source\n    \
-    INTO resolved\n    \
-    FROM {schema_q}.resolve_actor() AS r;\n\n  \
   IF TG_OP = 'TRUNCATE' THEN\n    \
+    resolved := {schema_q}.resolve_actor();\n    \
     INSERT INTO {schema_q}.changes (\n      \
       source, schema_name, table_name, table_oid, op,\n      \
       actor, context, actor_source, db_user, schema_version\n    \
@@ -422,82 +463,53 @@ BEGIN\n  \
     );\n    \
     RETURN NULL;\n  \
   END IF;\n\n  \
-  IF TG_OP = 'INSERT' THEN\n    \
-    INSERT INTO {schema_q}.changes (\n      \
-      source, schema_name, table_name, table_oid, op,\n      \
-      record_id, before, after, changed,\n      \
-      actor, context, actor_source, db_user, schema_version\n    \
-    )\n    \
-    SELECT\n      \
-      'db',\n      \
-      v_schema,\n      \
-      v_table,\n      \
-      v_relid,\n      \
-      'INSERT',\n      \
-      CASE WHEN pg_catalog.cardinality(pk_cols) > 0 THEN (\n        \
-        SELECT pg_catalog.jsonb_object_agg(k, s.row_after->k)\n          \
-          FROM pg_catalog.unnest(pk_cols) AS k\n      \
-      ) END,\n      \
-      NULL,\n      \
-      s.row_after,\n      \
-      NULL,\n      \
-      resolved.actor,\n      \
-      resolved.context,\n      \
-      resolved.actor_source,\n      \
-      session_user,\n      \
-      1\n    \
-    FROM (\n      \
-      SELECT pg_catalog.to_jsonb(r) - ex_cols AS row_after\n        \
-        FROM new_rows AS r\n    \
-    ) AS s;\n    \
-    RETURN NULL;\n  \
-  END IF;\n\n  \
-  IF TG_OP = 'DELETE' THEN\n    \
-    INSERT INTO {schema_q}.changes (\n      \
-      source, schema_name, table_name, table_oid, op,\n      \
-      record_id, before, after, changed,\n      \
-      actor, context, actor_source, db_user, schema_version\n    \
-    )\n    \
-    SELECT\n      \
-      'db',\n      \
-      v_schema,\n      \
-      v_table,\n      \
-      v_relid,\n      \
-      'DELETE',\n      \
-      CASE WHEN pg_catalog.cardinality(pk_cols) > 0 THEN (\n        \
-        SELECT pg_catalog.jsonb_object_agg(k, s.row_before->k)\n          \
-          FROM pg_catalog.unnest(pk_cols) AS k\n      \
-      ) END,\n      \
-      s.row_before,\n      \
-      NULL,\n      \
-      NULL,\n      \
-      resolved.actor,\n      \
-      resolved.context,\n      \
-      resolved.actor_source,\n      \
-      session_user,\n      \
-      1\n    \
-    FROM (\n      \
-      SELECT pg_catalog.to_jsonb(r) - ex_cols AS row_before\n        \
-        FROM old_rows AS r\n    \
-    ) AS s;\n    \
-    RETURN NULL;\n  \
+  IF TG_NARGS >= 1 AND TG_ARGV[0] <> '[]' THEN\n    \
+    pk_json := TG_ARGV[0]::jsonb;\n    \
+    pk_len := pg_catalog.jsonb_array_length(pk_json);\n    \
+    IF pk_len = 1 THEN\n      \
+      pk_single := pk_json->>0;\n    \
+    ELSIF pk_len > 1 THEN\n      \
+      pk_cols := ARRAY(SELECT pg_catalog.jsonb_array_elements_text(pk_json));\n    \
+    END IF;\n  \
+  END IF;\n  \
+  IF TG_NARGS >= 2 AND TG_ARGV[1] <> '[]' THEN\n    \
+    ex_json := TG_ARGV[1]::jsonb;\n    \
+    ex_len := pg_catalog.jsonb_array_length(ex_json);\n    \
+    IF ex_len = 1 THEN\n      \
+      ex_cols := ARRAY[ex_json->>0];\n      \
+      has_ex := true;\n    \
+    ELSIF ex_len > 1 THEN\n      \
+      ex_cols := ARRAY(SELECT pg_catalog.jsonb_array_elements_text(ex_json));\n      \
+      has_ex := true;\n    \
+    END IF;\n  \
   END IF;\n\n  \
   IF TG_OP = 'UPDATE' THEN\n    \
-    v_before := pg_catalog.to_jsonb(OLD) - ex_cols;\n    \
-    v_after := pg_catalog.to_jsonb(NEW) - ex_cols;\n    \
-    IF v_after = v_before THEN\n      \
-      RETURN NULL;\n    \
-    END IF;\n    \
-    IF pg_catalog.cardinality(pk_cols) > 0 THEN\n      \
-      SELECT pg_catalog.jsonb_object_agg(k, v_after->k)\n        \
-        INTO v_record_id\n        \
-        FROM pg_catalog.unnest(pk_cols) AS k;\n    \
+    IF has_ex THEN\n      \
+      v_before := pg_catalog.to_jsonb(OLD) - ex_cols;\n      \
+      v_after := pg_catalog.to_jsonb(NEW) - ex_cols;\n      \
+      IF v_after = v_before THEN\n        \
+        RETURN NULL;\n      \
+      END IF;\n    \
+    ELSE\n      \
+      v_before := pg_catalog.to_jsonb(OLD);\n      \
+      v_after := pg_catalog.to_jsonb(NEW);\n    \
     END IF;\n    \
     v_changed := ARRAY(\n      \
       SELECT e.k\n        \
         FROM pg_catalog.jsonb_each(v_after) AS e(k, v)\n       \
        WHERE v_before->e.k IS DISTINCT FROM e.v\n    \
     );\n    \
+    IF NOT has_ex AND pg_catalog.cardinality(v_changed) = 0 THEN\n      \
+      RETURN NULL;\n    \
+    END IF;\n    \
+    IF pk_single IS NOT NULL THEN\n      \
+      v_record_id := pg_catalog.jsonb_build_object(pk_single, v_after->pk_single);\n    \
+    ELSIF pg_catalog.cardinality(pk_cols) > 0 THEN\n      \
+      SELECT pg_catalog.jsonb_object_agg(k, v_after->k)\n        \
+        INTO v_record_id\n        \
+        FROM pg_catalog.unnest(pk_cols) AS k;\n    \
+    END IF;\n    \
+    resolved := {schema_q}.resolve_actor();\n    \
     INSERT INTO {schema_q}.changes (\n      \
       source, schema_name, table_name, table_oid, op,\n      \
       record_id, before, after, changed,\n      \
@@ -519,6 +531,132 @@ BEGIN\n  \
       session_user,\n      \
       1\n    \
     );\n    \
+    RETURN NULL;\n  \
+  END IF;\n\n  \
+  IF TG_OP = 'INSERT' THEN\n    \
+    resolved := {schema_q}.resolve_actor();\n    \
+    IF pk_single IS NOT NULL AND NOT has_ex THEN\n      \
+      INSERT INTO {schema_q}.changes (\n        \
+        source, schema_name, table_name, table_oid, op,\n        \
+        record_id, before, after, changed,\n        \
+        actor, context, actor_source, db_user, schema_version\n      \
+      )\n      \
+      SELECT\n        \
+        'db',\n        \
+        v_schema,\n        \
+        v_table,\n        \
+        v_relid,\n        \
+        'INSERT',\n        \
+        pg_catalog.jsonb_build_object(pk_single, s.row_after->pk_single),\n        \
+        NULL,\n        \
+        s.row_after,\n        \
+        NULL,\n        \
+        resolved.actor,\n        \
+        resolved.context,\n        \
+        resolved.actor_source,\n        \
+        session_user,\n        \
+        1\n      \
+      FROM (\n        \
+        SELECT pg_catalog.to_jsonb(r) AS row_after\n          \
+          FROM new_rows AS r\n        \
+        OFFSET 0\n      \
+      ) AS s;\n    \
+    ELSE\n      \
+      INSERT INTO {schema_q}.changes (\n        \
+        source, schema_name, table_name, table_oid, op,\n        \
+        record_id, before, after, changed,\n        \
+        actor, context, actor_source, db_user, schema_version\n      \
+      )\n      \
+      SELECT\n        \
+        'db',\n        \
+        v_schema,\n        \
+        v_table,\n        \
+        v_relid,\n        \
+        'INSERT',\n        \
+        CASE\n          \
+          WHEN pk_single IS NOT NULL THEN pg_catalog.jsonb_build_object(pk_single, s.row_after->pk_single)\n          \
+          WHEN pg_catalog.cardinality(pk_cols) > 0 THEN (\n            \
+            SELECT pg_catalog.jsonb_object_agg(k, s.row_after->k)\n              \
+              FROM pg_catalog.unnest(pk_cols) AS k\n          \
+          )\n        \
+        END,\n        \
+        NULL,\n        \
+        s.row_after,\n        \
+        NULL,\n        \
+        resolved.actor,\n        \
+        resolved.context,\n        \
+        resolved.actor_source,\n        \
+        session_user,\n        \
+        1\n      \
+      FROM (\n        \
+        SELECT CASE WHEN has_ex THEN pg_catalog.to_jsonb(r) - ex_cols ELSE pg_catalog.to_jsonb(r) END AS row_after\n          \
+          FROM new_rows AS r\n        \
+        OFFSET 0\n      \
+      ) AS s;\n    \
+    END IF;\n    \
+    RETURN NULL;\n  \
+  END IF;\n\n  \
+  IF TG_OP = 'DELETE' THEN\n    \
+    resolved := {schema_q}.resolve_actor();\n    \
+    IF pk_single IS NOT NULL AND NOT has_ex THEN\n      \
+      INSERT INTO {schema_q}.changes (\n        \
+        source, schema_name, table_name, table_oid, op,\n        \
+        record_id, before, after, changed,\n        \
+        actor, context, actor_source, db_user, schema_version\n      \
+      )\n      \
+      SELECT\n        \
+        'db',\n        \
+        v_schema,\n        \
+        v_table,\n        \
+        v_relid,\n        \
+        'DELETE',\n        \
+        pg_catalog.jsonb_build_object(pk_single, s.row_before->pk_single),\n        \
+        s.row_before,\n        \
+        NULL,\n        \
+        NULL,\n        \
+        resolved.actor,\n        \
+        resolved.context,\n        \
+        resolved.actor_source,\n        \
+        session_user,\n        \
+        1\n      \
+      FROM (\n        \
+        SELECT pg_catalog.to_jsonb(r) AS row_before\n          \
+          FROM old_rows AS r\n        \
+        OFFSET 0\n      \
+      ) AS s;\n    \
+    ELSE\n      \
+      INSERT INTO {schema_q}.changes (\n        \
+        source, schema_name, table_name, table_oid, op,\n        \
+        record_id, before, after, changed,\n        \
+        actor, context, actor_source, db_user, schema_version\n      \
+      )\n      \
+      SELECT\n        \
+        'db',\n        \
+        v_schema,\n        \
+        v_table,\n        \
+        v_relid,\n        \
+        'DELETE',\n        \
+        CASE\n          \
+          WHEN pk_single IS NOT NULL THEN pg_catalog.jsonb_build_object(pk_single, s.row_before->pk_single)\n          \
+          WHEN pg_catalog.cardinality(pk_cols) > 0 THEN (\n            \
+            SELECT pg_catalog.jsonb_object_agg(k, s.row_before->k)\n              \
+              FROM pg_catalog.unnest(pk_cols) AS k\n          \
+          )\n        \
+        END,\n        \
+        s.row_before,\n        \
+        NULL,\n        \
+        NULL,\n        \
+        resolved.actor,\n        \
+        resolved.context,\n        \
+        resolved.actor_source,\n        \
+        session_user,\n        \
+        1\n      \
+      FROM (\n        \
+        SELECT CASE WHEN has_ex THEN pg_catalog.to_jsonb(r) - ex_cols ELSE pg_catalog.to_jsonb(r) END AS row_before\n          \
+          FROM old_rows AS r\n        \
+        OFFSET 0\n      \
+      ) AS s;\n    \
+    END IF;\n    \
     RETURN NULL;\n  \
   END IF;\n\n  \
   RETURN NULL;\n\
