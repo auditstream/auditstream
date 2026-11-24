@@ -1,0 +1,24 @@
+---
+source: crates/auditstream-pg/tests/it/migrations.rs
+expression: d45_journal
+---
+{
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "breakpoints": true,
+      "idx": 0,
+      "tag": "0000_init_tables",
+      "version": "7",
+      "when": 1763900000000
+    },
+    {
+      "breakpoints": true,
+      "idx": 1,
+      "tag": "0001_auditstream",
+      "version": "7",
+      "when": 1795523400000
+    }
+  ],
+  "version": "7"
+}

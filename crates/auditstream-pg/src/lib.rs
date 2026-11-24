@@ -2,6 +2,7 @@
 
 pub mod ddl;
 pub mod introspect;
+pub mod migrations;
 pub mod reader;
 pub mod triggers;
 
