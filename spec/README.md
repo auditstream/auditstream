@@ -1,6 +1,6 @@
 # Auditstream Specification
 
-**Version:** 0.1.0 (tag: `spec-v0.1.0`)
+**Version:** 0.1.1 (tag: `spec-v0.1.1`)
 
 This folder defines the normative Auditstream contract. Every engine and language adapter implementation MUST conform to the requirements here for the version it declares.
 
@@ -47,7 +47,7 @@ All prose outside normative requirements — including sections labeled *(Inform
 
 ## Versioning
 
-The specification follows Semantic Versioning 2.0.0 starting at `0.1.0`, versioned independently from the engine and from every adapter repository. Spec `0.1.0` is released at tag `spec-v0.1.0` with the conformance fixture archive `auditstream-spec-0.1.0.tar.gz`.
+The specification follows Semantic Versioning 2.0.0 starting at `0.1.0`, versioned independently from the engine and from every adapter repository. The current specification (`0.1.1`) is released at tag `spec-v0.1.1` with the conformance fixture archive `auditstream-spec-0.1.1.tar.gz`.
 
 - **Patch (`0.x.Y` / `X.Y.Z`):** editorial clarifications, typo fixes, or informative examples that do not alter required behavior.
 - **Minor (`0.X.0` / `X.Y.0`):** additive fields or backwards-compatible extensions that existing conforming implementations continue to accept.
