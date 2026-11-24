@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use thiserror as _;
 use tokio as _;
 
-pub use crate::csv::CsvSink;
+pub use crate::csv::{CSV_HEADERS, CsvSink, OpenedCsvSink};
 pub use crate::jsonl::{JsonLinesSink, OpenedJsonLinesSink};
 
 /// Crate identifier retained for workspace smoke checks.
@@ -46,7 +46,7 @@ pub enum AnySink {
     /// JSON Lines sink.
     Jsonl(OpenedJsonLinesSink),
     /// RFC 4180 CSV sink.
-    Csv(CsvSink),
+    Csv(OpenedCsvSink),
 }
 
 impl AnySink {
@@ -60,7 +60,7 @@ impl AnySink {
             SinkConfig::Jsonl { path } => {
                 Ok(Self::Jsonl(OpenedJsonLinesSink::open(path.as_deref())?))
             }
-            SinkConfig::Csv { path } => Ok(Self::Csv(CsvSink::open(path.clone())?)),
+            SinkConfig::Csv { path } => Ok(Self::Csv(OpenedCsvSink::open(path.as_deref())?)),
         }
     }
 }
@@ -86,7 +86,7 @@ mod tests {
     use std::future::Future;
     use std::path::PathBuf;
 
-    use auditstream_core::{Batch, Sink, SinkError};
+    use auditstream_core::{Batch, Sink};
 
     use super::{AnySink, SinkConfig};
 
@@ -138,7 +138,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn any_sink_dispatches_to_jsonl_and_csv_placeholder() {
+    async fn any_sink_dispatches_to_jsonl_and_csv() {
         let batch = Batch::default();
 
         let mut jsonl = AnySink::open(&SinkConfig::Jsonl { path: None }).expect("open jsonl");
@@ -147,18 +147,10 @@ mod tests {
         write_fut.await.expect("empty jsonl batch write succeeds");
         jsonl.flush().await.expect("jsonl stdout flush succeeds");
 
-        let mut csv = AnySink::open(&SinkConfig::Csv {
-            path: Some(PathBuf::from("/tmp/out.csv")),
-        })
-        .expect("open csv placeholder");
+        let mut csv = AnySink::open(&SinkConfig::Csv { path: None }).expect("open csv");
         let write_fut = csv.write(&batch);
         assert_send(&write_fut);
-        let err = write_fut.await.expect_err("placeholder must return error");
-        assert!(
-            matches!(err, SinkError::Unimplemented(msg) if msg.contains("E2")),
-            "expected E2 error, got {err:?}"
-        );
-        let flush_err = csv.flush().await.expect_err("placeholder flush error");
-        assert!(matches!(flush_err, SinkError::Unimplemented(msg) if msg.contains("E2")));
+        write_fut.await.expect("empty csv batch write succeeds");
+        csv.flush().await.expect("csv stdout flush succeeds");
     }
 }
