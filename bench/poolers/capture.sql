@@ -1,0 +1,1 @@
+SELECT string_agg(concat_ws('|', table_name, op, record_id->>'id', changed::text, actor->>'type', actor->>'id', actor->'onBehalfOf'->>'id', actor_source, (after ? 'password_hash')::text), E'\n' ORDER BY id) FROM auditstream.changes WHERE table_name IN ('invoice', 'line_item');
