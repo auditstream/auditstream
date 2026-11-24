@@ -13,6 +13,7 @@ This index lists the architecture decisions recorded for Auditstream, starting w
 | 0005 | [Export with an xid8 snapshot window cursor](0005-export-with-an-xid8-snapshot-window-cursor.md) | accepted | 2026-11-24 |
 | 0006 | [ESM-only TypeScript packages sharing one context](0006-esm-only-typescript-packages-sharing-one-context.md) | accepted | 2026-11-24 |
 | 0007 | [Normative spec versioned separately](0007-normative-spec-versioned-separately.md) | accepted | 2026-11-24 |
+| 0008 | [History table lookup index shape](0008-history-lookup-index.md) | proposed | 2026-11-24 |
 
 ## How to add a decision
 
