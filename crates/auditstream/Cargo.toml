@@ -1,0 +1,20 @@
+[package]
+name = "auditstream"
+description = "CLI binary for the Auditstream Postgres audit trail engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+auditstream-core.workspace = true
+auditstream-export.workspace = true
+auditstream-pg.workspace = true
+clap.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
