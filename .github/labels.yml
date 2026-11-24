@@ -1,0 +1,63 @@
+# Repository labels for auditstream/auditstream (15 handbook labels).
+# Synced by .github/workflows/labels.yml without deleting any other label.
+# Adapter areas (area:node, area:prisma, area:drizzle) live in auditstream/auditstream-js.
+
+- name: "area:core"
+  color: "1d76db"
+  description: "auditstream-core: domain types, ports, codec"
+
+- name: "area:pg"
+  color: "1d76db"
+  description: "auditstream-pg: everything that speaks to Postgres"
+
+- name: "area:export"
+  color: "1d76db"
+  description: "auditstream-export: sinks"
+
+- name: "area:cli"
+  color: "1d76db"
+  description: "The auditstream binary"
+
+- name: "area:spec"
+  color: "1d76db"
+  description: "The contract in spec/"
+
+- name: "area:ci"
+  color: "c5def5"
+  description: "CI, build and release tooling"
+
+- name: "area:docs"
+  color: "c5def5"
+  description: "Documentation, guides and examples"
+
+- name: "status:needs-triage"
+  color: "fbca04"
+  description: "New, not yet reviewed by a maintainer"
+
+- name: "status:needs-design"
+  color: "d4c5f9"
+  description: "Needs an ADR, an RFC or a spec change before code"
+
+- name: "status:ready"
+  color: "0e8a16"
+  description: "Fully specified and every blocker is closed"
+
+- name: "status:blocked"
+  color: "b60205"
+  description: "Waiting on another issue or an outside decision"
+
+- name: "agent-ready"
+  color: "5319e7"
+  description: "Small and precise enough to hand to a coding agent"
+
+- name: "good first issue"
+  color: "7057ff"
+  description: "Reserved for human newcomers"
+
+- name: "help wanted"
+  color: "008672"
+  description: "Maintainers welcome outside help"
+
+- name: "breaking-change"
+  color: "d93f0b"
+  description: "Changes public behavior or the contract"

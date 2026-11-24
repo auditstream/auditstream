@@ -1,0 +1,42 @@
+name: Spec change
+description: Propose a normative change to the Auditstream contract in spec/
+type: Spec
+labels:
+  - "area:spec"
+  - "status:needs-design"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Spec changes are led by maintainers and require both maintainers' review. Breaking changes require an RFC in `rfcs/` with 3 business days of final comments.
+  - type: dropdown
+    id: change_kind
+    attributes:
+      label: Change kind
+      options:
+        - Additive (minor spec bump)
+        - Breaking (requires an RFC)
+        - Editorial clarification (patch spec bump)
+    validations:
+      required: true
+  - type: input
+    id: spec_target
+    attributes:
+      label: Affected spec files and current version
+      placeholder: spec/transport.md (0.1.0)
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Problem and proposal
+      description: Explain what needs to change using RFC 2119 wording (MUST, SHOULD, MAY).
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Engine, adapter and conformance impact
+      description: List required changes to JSON schemas, spec/conformance/ fixtures, auditstream and auditstream-js.
+    validations:
+      required: true
