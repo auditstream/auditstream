@@ -1,6 +1,6 @@
 # Actor and Context Schema
 
-**Spec version:** 0.1.0 (unreleased)
+**Spec version:** 0.1.0 (tag: `spec-v0.1.0`)
 
 This document defines the normative JSON structure for Auditstream actor and context payloads. The key words "MUST", "MUST NOT", "SHOULD", "SHOULD NOT", and "MAY" are interpreted as described in [spec/README.md](README.md#normative-wording).
 

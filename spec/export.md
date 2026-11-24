@@ -1,6 +1,6 @@
 # Export Record Format
 
-**Spec version:** 0.1.0 (unreleased)
+**Spec version:** 0.1.0 (tag: `spec-v0.1.0`)
 
 This document defines the normative record format written by `auditstream export` in JSON Lines and CSV encodings. The key words "MUST", "MUST NOT", "SHOULD", "SHOULD NOT", and "MAY" are interpreted as described in [spec/README.md](README.md#normative-wording).
 

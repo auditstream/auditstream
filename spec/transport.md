@@ -1,6 +1,6 @@
 # Actor Transport and Precedence
 
-**Spec version:** 0.1.0 (unreleased)
+**Spec version:** 0.1.0 (tag: `spec-v0.1.0`)
 
 This document defines how adapters send an actor payload to PostgreSQL, how the engine resolves it, and how malformed inputs are handled. The key words "MUST", "MUST NOT", "SHOULD", "SHOULD NOT", and "MAY" are interpreted as described in [spec/README.md](README.md#normative-wording).
 
