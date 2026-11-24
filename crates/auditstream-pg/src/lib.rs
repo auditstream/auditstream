@@ -1,10 +1,12 @@
 //! Postgres introspection, DDL and trigger generation, migration writers and history reader.
 
+pub mod ddl;
+
 use sqlx as _;
 use thiserror as _;
 use tokio as _;
 
-/// Placeholder marker for workspace bootstrap verification.
+/// Crate identifier retained for workspace smoke checks.
 pub const CRATE_NAME: &str = "auditstream-pg";
 
 /// Re-verify dependency wiring to `auditstream-core`.

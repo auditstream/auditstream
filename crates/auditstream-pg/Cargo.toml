@@ -14,5 +14,10 @@ sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+auditstream-testkit = { path = "../auditstream-testkit" }
+insta.workspace = true
+time.workspace = true
+
 [lints]
 workspace = true
