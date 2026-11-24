@@ -357,6 +357,8 @@ impl LazySink {
             {
                 sync_parent(path)?;
             }
+            #[cfg(not(unix))]
+            let _ = sync_dir;
             *self = Self::Open(sink);
         }
         match self {
