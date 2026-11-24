@@ -1,0 +1,28 @@
+{
+  "event_id": "019ab123-4567-7000-8000-000000000002",
+  "occurred_at": "2026-11-24T10:15:31.234567Z",
+  "source": "db",
+  "schema_name": "public",
+  "table_name": "invoice",
+  "op": "UPDATE",
+  "record_id": { "id": 101 },
+  "before": {
+    "id": 101,
+    "status": "draft",
+    "total": 123456789012345678901234.567891
+  },
+  "after": {
+    "id": 101,
+    "status": "paid",
+    "total": 123456789012345678901235.000000
+  },
+  "changed": ["status", "total"],
+  "actor": {
+    "type": "user",
+    "id": "usr_42"
+  },
+  "context": null,
+  "actor_source": "set_config",
+  "db_user": "app_user",
+  "schema_version": 1
+}

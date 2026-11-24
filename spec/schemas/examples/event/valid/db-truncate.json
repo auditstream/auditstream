@@ -1,0 +1,17 @@
+{
+  "event_id": "019ab123-4567-7000-8000-000000000003",
+  "occurred_at": "2026-11-24T10:15:32.345678Z",
+  "source": "db",
+  "schema_name": "public",
+  "table_name": "invoice",
+  "op": "TRUNCATE",
+  "record_id": null,
+  "before": null,
+  "after": null,
+  "changed": null,
+  "actor": null,
+  "context": null,
+  "actor_source": null,
+  "db_user": "app_user",
+  "schema_version": 1
+}
