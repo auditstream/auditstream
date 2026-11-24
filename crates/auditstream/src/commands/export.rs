@@ -48,11 +48,11 @@ pub(crate) struct Args {
 struct Filters {
     /// Include events at or after this RFC 3339 timestamp or UTC date.
     #[arg(long, value_name = "TIME", value_parser = parse_time)]
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(default, with = "time::serde::rfc3339::option")]
     since: Option<OffsetDateTime>,
     /// Include events strictly before this RFC 3339 timestamp or UTC date.
     #[arg(long, value_name = "TIME", value_parser = parse_time)]
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(default, with = "time::serde::rfc3339::option")]
     until: Option<OffsetDateTime>,
     /// Match an actor ID directly or through onBehalfOf.
     #[arg(long, value_name = "ID")]
@@ -469,4 +469,15 @@ async fn export(args: &Args, config: &Config) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExportFilter, Filters};
+
+    #[test]
+    fn missing_checkpoint_filters_mean_no_restrictions() {
+        let filters: Filters = serde_json::from_str("{}").expect("omitted filters are optional");
+        assert_eq!(filters.reader_filter(), ExportFilter::default());
+    }
 }
