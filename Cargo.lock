@@ -214,10 +214,16 @@ name = "auditstream-export"
 version = "0.1.0"
 dependencies = [
  "auditstream-core",
+ "jsonschema",
+ "proptest",
  "serde",
+ "serde_json",
+ "tempfile",
  "thiserror",
+ "time",
  "tokio",
  "toml",
+ "uuid",
 ]
 
 [[package]]
