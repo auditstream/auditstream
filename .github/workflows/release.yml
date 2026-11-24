@@ -361,7 +361,6 @@ jobs:
     # publish jobs get escalated permissions
     permissions:
       "id-token": "write"
-      "packages": "write"
 
   announce:
     needs:
