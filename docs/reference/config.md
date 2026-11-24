@@ -30,6 +30,21 @@ Values resolve in strict order (first non-empty source wins):
 | `export.cursor_file` | path | none | `export --cursor-file` | none |
 | `export.batch_size` | integer | `1000` | `export --batch-size` | none |
 | `export.sink` | table with `type` (`jsonl` or `csv`) and optional `path` | JSON Lines on stdout | `export --format` overrides `type` and `--output` overrides `path` | none |
+| `export.redaction.rules` | list of redaction rule tables (`table` or `action`, `columns`, `mode`) | `[]` | none | none |
+
+## Export redaction (`[[export.redaction.rules]]`)
+
+Each rule masks (`mode = "mask"`, the default) or removes (`mode = "remove"`) top-level keys inside `before` and `after` before events reach any export sink:
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `table` | string | exactly one of `table` or `action` | `"table"`, `"schema.table"`, or `"*"` (all `db` and `app` events) |
+| `action` | string | exactly one of `table` or `action` | Application action (`op`) for `source = "app"`, or `"*"` (all `app` events) |
+| `columns` | non-empty list of strings | yes | Top-level keys in `before` and `after` to redact (dot-paths such as `metadata.ssn` are rejected with exit code `2`) |
+| `mode` | `mask` or `remove` | no (`mask`) | `mask` replaces values with `"[redacted]"` and keeps column names in `changed`; `remove` drops keys from `before`, `after`, and `changed`. `remove` overrides `mask` when both match |
+
+- **When to use `capture.exclude` vs. `export.redaction`:** Always put secrets, credentials, password hashes, payment card numbers (PAN/CVV), and API tokens in **`capture.exclude`** so capture triggers never write them into `auditstream.changes`. Use **`export.redaction`** for application events (`auditstream.log_event()`, which has no capture-time column exclusion), retroactive minimization of historical rows, and two-tier exports (keeping full operational rows in PostgreSQL while sending minimized JSONL/CSV feeds to external SIEMs or customers).
+- **Top-level keys only & fail-closed:** Rules match top-level JSON object keys only (leaving `record_id`, untouched key order, and arbitrary-precision PostgreSQL `numeric` values intact). If a matching rule encounters a non-object or malformed JSON payload (for example, an `app` event whose `data` is a JSON array), export fails closed with exit code `5` before writing to the sink or advancing the cursor.
 
 ## Example
 
@@ -51,4 +66,14 @@ batch_size = 1000
 [export.sink]
 type = "jsonl"
 path = "events.jsonl"
+
+[[export.redaction.rules]]
+table = "public.invoice"
+columns = ["ssn", "tax_id"]
+mode = "mask"
+
+[[export.redaction.rules]]
+action = "invoice.exported"
+columns = ["recipient_email"]
+mode = "remove"
 ```

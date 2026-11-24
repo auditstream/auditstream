@@ -760,3 +760,213 @@ async fn date_only_filters_use_utc_midnight_bounds() {
         BTreeSet::from(["invoice.paid".to_owned(), "invoice.late".to_owned()])
     );
 }
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn export_redaction_applies_to_jsonl_and_csv_detects_drift_and_fails_closed() {
+    let db = export_db().await;
+    db.execute(
+        "INSERT INTO auditstream.changes \
+         (occurred_at, source, schema_name, table_name, op, record_id, before, after, changed) VALUES \
+         ('2020-01-01T00:00:00Z', 'db', 'public', 'invoice', 'UPDATE', \
+          '{\"id\":1}'::jsonb, \
+          '{\"id\":1,\"ssn\":\"111-11-1111\",\"secret_token\":\"tok_old\",\"total\":12345678901234567890.123456789}'::jsonb, \
+          '{\"id\":1,\"ssn\":\"222-22-2222\",\"secret_token\":\"tok_new\",\"total\":12345678901234567890.123456789}'::jsonb, \
+          ARRAY['ssn','secret_token','total']), \
+         ('2020-01-02T00:00:00Z', 'app', NULL, NULL, 'invoice.exported', \
+          '{\"id\":1}'::jsonb, NULL, \
+          '{\"recipient_email\":\"alice@example.com\",\"format\":\"csv\"}'::jsonb, NULL)",
+    )
+    .await
+    .expect("seed db and app events");
+
+    let dir = tempdir().expect("tempdir");
+    let config_path = dir.path().join("auditstream.toml");
+    fs::write(
+        &config_path,
+        r#"
+[[export.redaction.rules]]
+table = "public.invoice"
+columns = ["ssn"]
+mode = "mask"
+
+[[export.redaction.rules]]
+table = "invoice"
+columns = ["secret_token"]
+mode = "remove"
+
+[[export.redaction.rules]]
+action = "invoice.exported"
+columns = ["recipient_email"]
+mode = "mask"
+"#,
+    )
+    .expect("write auditstream.toml");
+
+    // 1. JSONL export redacts both db and app events and preserves numeric precision.
+    let jsonl_args = ["--cursor-file", "cursor.json", "--output", "events.jsonl"];
+    let events = export_file_until(&db, dir.path(), &jsonl_args, 2).await;
+    let raw_jsonl = fs::read_to_string(dir.path().join("events.jsonl")).expect("read jsonl");
+    assert!(!raw_jsonl.contains("111-11-1111"));
+    assert!(!raw_jsonl.contains("222-22-2222"));
+    assert!(!raw_jsonl.contains("tok_old"));
+    assert!(!raw_jsonl.contains("tok_new"));
+    assert!(!raw_jsonl.contains("alice@example.com"));
+    assert!(raw_jsonl.contains("12345678901234567890.123456789"));
+
+    let db_ev = events
+        .iter()
+        .find(|e| e["source"] == "db")
+        .expect("db event");
+    assert_eq!(db_ev["before"]["ssn"], "[redacted]");
+    assert_eq!(db_ev["after"]["ssn"], "[redacted]");
+    assert!(db_ev["after"].get("secret_token").is_none());
+    assert_eq!(db_ev["changed"], serde_json::json!(["ssn", "total"]));
+
+    let app_ev = events
+        .iter()
+        .find(|e| e["source"] == "app")
+        .expect("app event");
+    assert_eq!(app_ev["after"]["recipient_email"], "[redacted]");
+
+    // 2. CSV export applies the exact same redaction rules.
+    let csv_out = run_export(&db, dir.path(), &["--format", "csv"]);
+    let csv_text = String::from_utf8(csv_out.stdout).expect("utf8 csv");
+    assert!(!csv_text.contains("222-22-2222"));
+    assert!(!csv_text.contains("tok_new"));
+    assert!(!csv_text.contains("alice@example.com"));
+    assert!(csv_text.contains("[redacted]"));
+
+    // 3. Changing redaction policy invalidates the saved checkpoint with exit code 2.
+    fs::write(
+        &config_path,
+        r#"
+[[export.redaction.rules]]
+table = "public.invoice"
+columns = ["ssn"]
+mode = "remove"
+"#,
+    )
+    .expect("change redaction policy");
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .arg("export")
+        .args(jsonl_args)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("export.redaction"))
+        .stderr(predicate::str::contains("--from-start"));
+
+    // 4. Fail-closed: non-object app event array aborts non-zero without emitting unredacted PII
+    // or advancing the cursor.
+    let saved_cursor = fs::read(dir.path().join("cursor.json")).expect("saved cursor");
+    let saved_output = fs::read(dir.path().join("events.jsonl")).expect("saved output");
+    fs::write(
+        &config_path,
+        r#"
+[[export.redaction.rules]]
+table = "public.invoice"
+columns = ["ssn"]
+mode = "mask"
+
+[[export.redaction.rules]]
+table = "invoice"
+columns = ["secret_token"]
+mode = "remove"
+
+[[export.redaction.rules]]
+action = "invoice.exported"
+columns = ["recipient_email"]
+mode = "mask"
+"#,
+    )
+    .expect("restore original policy");
+    db.execute(
+        "INSERT INTO auditstream.changes (occurred_at, source, op, after) VALUES \
+         ('2020-01-03T00:00:00Z', 'app', 'invoice.exported', \
+          '[{\"recipient_email\":\"leak@example.com\"}]'::jsonb)",
+    )
+    .await
+    .expect("seed non-object app payload");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let out = auditstream_cmd()
+            .current_dir(dir.path())
+            .env("AUDITSTREAM_DATABASE_URL", db.url())
+            .arg("export")
+            .args(jsonl_args)
+            .output()
+            .expect("run fail-closed export");
+        if !out.status.success() {
+            assert_eq!(out.status.code(), Some(5));
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains("expected a JSON object"),
+                "stderr: {stderr}"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "fail-closed test timed out");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        fs::read(dir.path().join("cursor.json")).expect("cursor unchanged"),
+        saved_cursor
+    );
+    assert_eq!(
+        fs::read(dir.path().join("events.jsonl")).expect("output unchanged"),
+        saved_output
+    );
+}
+
+#[tokio::test]
+async fn init_preserves_export_redaction_rules_in_auditstream_toml() {
+    let db = TestDb::new().await.expect("create TestDb");
+    db.execute("CREATE TABLE public.invoice (id bigint PRIMARY KEY, total numeric)")
+        .await
+        .expect("create table");
+
+    let dir = tempdir().expect("tempdir");
+    let config_path = dir.path().join("auditstream.toml");
+    fs::write(
+        &config_path,
+        r#"# keep comments and export redaction intact
+[export]
+batch_size = 500
+
+[[export.redaction.rules]]
+table = "public.invoice"
+columns = ["ssn"]
+mode = "mask"
+
+[[export.redaction.rules]]
+action = "invoice.exported"
+columns = ["recipient_email"]
+mode = "remove"
+"#,
+    )
+    .expect("seed auditstream.toml");
+
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args([
+            "init",
+            "--table",
+            "public.invoice",
+            "--migrations",
+            "sql",
+            "--out",
+            "migrations",
+        ])
+        .assert()
+        .success();
+
+    let updated = fs::read_to_string(&config_path).expect("read updated auditstream.toml");
+    assert!(updated.contains("# keep comments and export redaction intact"));
+    assert!(updated.contains("[[export.redaction.rules]]"));
+    assert!(updated.contains("recipient_email"));
+    assert!(updated.contains("tables = [\"public.invoice\"]"));
+}

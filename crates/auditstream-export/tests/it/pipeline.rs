@@ -603,3 +603,125 @@ async fn pipeline_streams_into_real_jsonl_sink_one_line_per_event_in_source_orde
         assert_eq!(parsed, records[idx].1);
     }
 }
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn pipeline_applies_redaction_before_sink_write_and_fails_closed_before_ack() {
+    use auditstream_core::{
+        CompiledRedaction, RedactError, Redaction, RedactionMode, RedactionRule,
+    };
+    use auditstream_export::csv::CsvSink;
+
+    let mut db_event = make_event(0);
+    db_event.op = Op::Update;
+    db_event.before = Some(
+        RawValue::from_string(
+            r#"{"id":1,"ssn":"111-11-1111","token":"tok_old","total":123456789012345678901234.567890}"#
+                .to_owned(),
+        )
+        .expect("before"),
+    );
+    db_event.after = Some(
+        RawValue::from_string(
+            r#"{"id":1,"ssn":"222-22-2222","token":"tok_new","total":123456789012345678901234.567890}"#
+                .to_owned(),
+        )
+        .expect("after"),
+    );
+    db_event.changed = Some(vec![
+        "ssn".to_owned(),
+        "token".to_owned(),
+        "total".to_owned(),
+    ]);
+
+    let mut app_event = make_event(1);
+    app_event.source = Source::App;
+    app_event.schema_name = None;
+    app_event.table_name = None;
+    app_event.op = Op::app("invoice.exported").expect("app op");
+    app_event.after = Some(
+        RawValue::from_string(r#"{"recipient":"alice@example.com","format":"csv"}"#.to_owned())
+            .expect("app after"),
+    );
+
+    let compiled = CompiledRedaction::compile(&Redaction::new(vec![
+        RedactionRule::for_table("public.invoice", ["ssn"], RedactionMode::Mask),
+        RedactionRule::for_table("invoice", ["token"], RedactionMode::Remove),
+        RedactionRule::for_app_action("invoice.exported", ["recipient"], RedactionMode::Mask),
+    ]))
+    .expect("compile redaction");
+
+    let records = vec![
+        (Cursor::new(100, 1), db_event.clone()),
+        (Cursor::new(101, 2), app_event.clone()),
+    ];
+
+    // 1. JSONL sink receives redacted events with arbitrary-precision numeric preserved.
+    let acked = Arc::new(Mutex::new(Cursor::new(0, 0)));
+    let mut source = MemorySource::from_store(records.clone(), Arc::clone(&acked), None);
+    let mut jsonl_sink = JsonLinesSink::new(Vec::<u8>::new());
+    let opts = Options::with_batch_size(10).with_redaction(compiled.clone());
+    let report = run(&mut source, &mut jsonl_sink, &opts)
+        .await
+        .expect("redacted jsonl run");
+    assert_eq!(report.events, 2);
+
+    let jsonl = String::from_utf8(jsonl_sink.into_inner()).expect("utf8");
+    assert!(!jsonl.contains("111-11-1111"));
+    assert!(!jsonl.contains("222-22-2222"));
+    assert!(!jsonl.contains("tok_old"));
+    assert!(!jsonl.contains("tok_new"));
+    assert!(!jsonl.contains("alice@example.com"));
+    assert!(jsonl.contains("123456789012345678901234.567890"));
+    assert!(jsonl.contains(r#""ssn":"[redacted]""#));
+    assert!(jsonl.contains(r#""recipient":"[redacted]""#));
+    assert!(jsonl.contains(r#""changed":["ssn","total"]"#));
+
+    // 2. CSV sink also receives redacted events through the same pipeline choke point.
+    let acked_csv = Arc::new(Mutex::new(Cursor::new(0, 0)));
+    let mut source_csv = MemorySource::from_store(records, Arc::clone(&acked_csv), None);
+    let mut csv_sink = CsvSink::new(Vec::<u8>::new());
+    run(&mut source_csv, &mut csv_sink, &opts)
+        .await
+        .expect("redacted csv run");
+    let csv_out = String::from_utf8(csv_sink.into_inner()).expect("utf8 csv");
+    assert!(!csv_out.contains("222-22-2222"));
+    assert!(!csv_out.contains("tok_new"));
+    assert!(!csv_out.contains("alice@example.com"));
+    assert!(csv_out.contains("[redacted]"));
+
+    // 3. Fail-closed: non-object app payload aborts BEFORE sink.write, flush, or ack.
+    let mut bad_app = app_event;
+    bad_app.after = Some(
+        RawValue::from_string(r#"[{"recipient":"leak@example.com"}]"#.to_owned()).expect("arr"),
+    );
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut bad_source = RecordingSource {
+        batches: vec![Batch::new(vec![bad_app], Some(Cursor::new(200, 1)))],
+        idx: 0,
+        fail_next_batch: false,
+        fail_ack: false,
+        log: Arc::clone(&log),
+    };
+    let mut rec_sink = RecordingSink {
+        fail_write: false,
+        fail_flush: false,
+        log: Arc::clone(&log),
+    };
+    let err = run(&mut bad_source, &mut rec_sink, &opts)
+        .await
+        .expect_err("non-object app event must fail closed");
+    assert!(matches!(
+        err,
+        ExportError::Redact(RedactError::NonObjectPayload {
+            field: "after",
+            actual_kind: "array",
+            ..
+        })
+    ));
+    assert_eq!(
+        *log.lock().expect("log"),
+        vec![Call::NextBatch(10)],
+        "failed redaction must abort before sink.write, sink.flush, and source.ack"
+    );
+}

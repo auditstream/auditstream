@@ -1,6 +1,6 @@
 //! Error types returned by the `auditstream-export` batch pipeline.
 
-use auditstream_core::{SinkError, SourceError};
+use auditstream_core::{RedactError, SinkError, SourceError};
 use thiserror::Error;
 
 /// Errors returned by [`crate::pipeline::run`].
@@ -10,6 +10,10 @@ pub enum ExportError {
     /// Reading the next batch from the [`EventSource`](auditstream_core::EventSource) failed.
     #[error("export source read failed: {0}")]
     Source(#[source] SourceError),
+
+    /// Applying export redaction rules to an event failed (fail-closed).
+    #[error("export redaction failed: {0}")]
+    Redact(#[from] RedactError),
 
     /// Writing a batch to or flushing the [`Sink`](auditstream_core::Sink) failed.
     #[error("export sink failed: {0}")]
