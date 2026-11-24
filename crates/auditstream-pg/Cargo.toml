@@ -17,6 +17,8 @@ tokio.workspace = true
 [dev-dependencies]
 auditstream-testkit = { path = "../auditstream-testkit" }
 insta.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 time.workspace = true
 
 [lints]
