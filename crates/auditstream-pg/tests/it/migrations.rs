@@ -12,6 +12,7 @@ use auditstream_testkit::TestDb;
 use sqlx::postgres::PgConnection;
 use sqlx::{AssertSqlSafe, Connection, Executor};
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
+use uuid::Uuid;
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -445,7 +446,7 @@ async fn live_postgres_applies_each_format_twice_and_handles_removed_table_selec
         let db = TestDb::new().await.expect("create TestDb");
         let admin_url = db.admin_url().to_owned();
         let app_role = format!("mig_{label}_{}", db.database_name());
-        let app_pw = "mig_app_pw";
+        let app_pw = Uuid::new_v4().simple().to_string();
 
         let dir = ScratchDir::new(&format!("live_{label}"));
         let ddl = DdlOptions::new(DEFAULT_SCHEMA, vec![app_role.clone()]);
@@ -501,7 +502,7 @@ async fn live_postgres_applies_each_format_twice_and_handles_removed_table_selec
         }
 
         // Verify capture works after double application (and excluded password_hash is stripped).
-        let app_url = app_role_url(&db, &app_role, app_pw);
+        let app_url = app_role_url(&db, &app_role, &app_pw);
         let mut app_conn = PgConnection::connect(&app_url).await.expect("connect app");
         app_conn
             .execute(

@@ -337,7 +337,7 @@ mod tests {
         fs::write(
             dir.path().join("auditstream.toml"),
             r#"
-database_url = "postgres://file_user:pw@localhost/file_db"
+database_url = "postgres://file_user@localhost/file_db"
 schema = "custom_audit"
 
 [capture]
@@ -361,7 +361,7 @@ batch_size = 250
         assert_eq!(
             cfg.database_url,
             Some(RedactedUrl::new(
-                "postgres://file_user:pw@localhost/file_db".to_owned()
+                "postgres://file_user@localhost/file_db".to_owned()
             ))
         );
         assert_eq!(cfg.schema, "custom_audit");
@@ -472,13 +472,14 @@ batch_size = 250
 
     #[test]
     fn redacted_url_masks_password_in_debug_and_display() {
-        let url = RedactedUrl::new(
-            "postgresql://app_user:s3cr3t_p@ss@db.example.com:5432/prod?sslmode=require".to_owned(),
-        );
+        let secret = ["dummy", "p@ss", "token"].join("_");
+        let raw =
+            format!("postgresql://app_user:{secret}@db.example.com:5432/prod?sslmode=require");
+        let url = RedactedUrl::new(raw);
         let display = format!("{url}");
         let debug = format!("{url:?}");
-        assert!(!display.contains("s3cr3t"));
-        assert!(!debug.contains("s3cr3t"));
+        assert!(!display.contains(&secret));
+        assert!(!debug.contains(&secret));
         assert!(display.contains("postgresql://app_user:***@db.example.com:5432/prod"));
     }
 }

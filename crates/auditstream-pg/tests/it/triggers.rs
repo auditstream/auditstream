@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use sqlx::postgres::PgConnection;
 use sqlx::{AssertSqlSafe, Connection, Executor, Row};
+use uuid::Uuid;
 
 async fn run_statements(conn: &mut PgConnection, stmts: &[String]) -> Result<(), sqlx::Error> {
     for stmt in stmts {
@@ -232,7 +233,7 @@ async fn every_capture_conformance_case_passes_and_rerunning_triggers_is_idempot
                 .expect("create non-superuser db");
             let admin_url = db.admin_url().to_owned();
             let app_role = format!("app_{}", db.database_name());
-            let app_pw = "app_pw_triggers";
+            let app_pw = Uuid::new_v4().simple().to_string();
 
             {
                 let mut admin = PgConnection::connect(&admin_url)
@@ -370,7 +371,7 @@ async fn every_capture_conformance_case_passes_and_rerunning_triggers_is_idempot
             }
 
             // 4. Execute each step as admin or app_role.
-            let app_url = app_role_url(&db, &app_role, app_pw);
+            let app_url = app_role_url(&db, &app_role, &app_pw);
             let mut app_conn = PgConnection::connect(&app_url)
                 .await
                 .expect("connect app_role");

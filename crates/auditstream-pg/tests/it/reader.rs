@@ -8,6 +8,7 @@ use auditstream_testkit::TestDb;
 use sqlx::postgres::{PgConnection, PgPoolOptions};
 use sqlx::{AssertSqlSafe, Connection, Executor, PgPool};
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 async fn run_statements(conn: &mut PgConnection, stmts: &[String]) -> Result<(), sqlx::Error> {
     for stmt in stmts {
@@ -23,16 +24,26 @@ fn app_role_url(db: &TestDb, role: &str, password: &str) -> String {
     format!("{scheme}://{role}:{password}@{host_and_db}")
 }
 
+struct ReaderFixture {
+    db: TestDb,
+    app_role: String,
+    reader_role: String,
+    app_url: String,
+    app_pool: PgPool,
+    reader_pool: PgPool,
+    admin_url: String,
+}
+
 /// Sets up an isolated database with D2 history DDL, D3 triggers on `invoice`, an `app_role`
 /// for writing to `public.invoice` / `auditstream.log_event`, and a strictly least-privilege
 /// `reader_role` that holds ONLY `USAGE` on `auditstream` and `SELECT` on `auditstream.changes`.
-async fn setup_reader_db() -> (TestDb, String, String, PgPool, PgPool, String) {
+async fn setup_reader_db() -> ReaderFixture {
     let db = TestDb::new().await.expect("create TestDb");
     let admin_url = db.admin_url().to_owned();
     let app_role = format!("app_{}", db.database_name());
     let reader_role = format!("rdr_{}", db.database_name());
-    let app_pw = "reader_app_pw";
-    let reader_pw = "reader_only_pw";
+    let app_pw = Uuid::new_v4().simple().to_string();
+    let reader_pw = Uuid::new_v4().simple().to_string();
 
     {
         let mut conn = PgConnection::connect(db.url()).await.expect("connect db");
@@ -95,21 +106,29 @@ async fn setup_reader_db() -> (TestDb, String, String, PgPool, PgPool, String) {
         conn.close().await.expect("close setup conn");
     }
 
-    let app_url = app_role_url(&db, &app_role, app_pw);
+    let app_url = app_role_url(&db, &app_role, &app_pw);
     let app_pool = PgPoolOptions::new()
         .max_connections(4)
         .connect(&app_url)
         .await
         .expect("connect app_pool");
 
-    let reader_url = app_role_url(&db, &reader_role, reader_pw);
+    let reader_url = app_role_url(&db, &reader_role, &reader_pw);
     let reader_pool = PgPoolOptions::new()
         .max_connections(4)
         .connect(&reader_url)
         .await
         .expect("connect reader_pool");
 
-    (db, app_role, reader_role, app_pool, reader_pool, admin_url)
+    ReaderFixture {
+        db,
+        app_role,
+        reader_role,
+        app_url,
+        app_pool,
+        reader_pool,
+        admin_url,
+    }
 }
 
 async fn cleanup_role(admin_url: &str, role: &str) {
@@ -157,8 +176,15 @@ async fn drain_until(
 async fn deterministic_out_of_order_commits_lose_a_row_with_id_cursor_but_xid8_window_delivers_both()
  {
     let _lock = TestDb::cluster_lock().await.expect("cluster lock");
-    let (db, app_role, reader_role, app_pool, reader_pool, admin_url) = setup_reader_db().await;
-    let app_url = app_role_url(&db, &app_role, "reader_app_pw");
+    let ReaderFixture {
+        db,
+        app_role,
+        reader_role,
+        app_url,
+        app_pool,
+        reader_pool,
+        admin_url,
+    } = setup_reader_db().await;
 
     let mut conn_a = PgConnection::connect(&app_url).await.expect("conn A");
     let mut conn_b = PgConnection::connect(&app_url).await.expect("conn B");
@@ -256,8 +282,15 @@ async fn deterministic_out_of_order_commits_lose_a_row_with_id_cursor_but_xid8_w
 #[tokio::test]
 async fn open_transaction_holds_window_until_closed_then_delivers_all_later_rows_once() {
     let _lock = TestDb::cluster_lock().await.expect("cluster lock");
-    let (db, app_role, reader_role, app_pool, reader_pool, admin_url) = setup_reader_db().await;
-    let app_url = app_role_url(&db, &app_role, "reader_app_pw");
+    let ReaderFixture {
+        db,
+        app_role,
+        reader_role,
+        app_url,
+        app_pool,
+        reader_pool,
+        admin_url,
+    } = setup_reader_db().await;
 
     let mut holder_conn = PgConnection::connect(&app_url).await.expect("holder conn");
     let mut source = PgEventSource::with_default_schema(reader_pool.clone(), Cursor::new(0, 0));
@@ -329,7 +362,15 @@ async fn open_transaction_holds_window_until_closed_then_delivers_all_later_rows
 #[allow(clippy::too_many_lines)]
 async fn pagination_ack_monotonicity_precision_filters_and_lookup_work_as_select_only_role() {
     let _lock = TestDb::cluster_lock().await.expect("cluster lock");
-    let (db, app_role, reader_role, app_pool, reader_pool, admin_url) = setup_reader_db().await;
+    let ReaderFixture {
+        db,
+        app_role,
+        reader_role,
+        app_pool,
+        reader_pool,
+        admin_url,
+        ..
+    } = setup_reader_db().await;
 
     let precise_numeric = "12345678901234567890.123456789";
 
@@ -575,7 +616,15 @@ async fn pagination_ack_monotonicity_precision_filters_and_lookup_work_as_select
 #[allow(clippy::too_many_lines)]
 async fn cli_filters_support_exclusive_until_on_behalf_of_actor_and_record_id_modes() {
     let _lock = TestDb::cluster_lock().await.expect("cluster lock");
-    let (db, app_role, reader_role, app_pool, reader_pool, admin_url) = setup_reader_db().await;
+    let ReaderFixture {
+        db,
+        app_role,
+        reader_role,
+        app_pool,
+        reader_pool,
+        admin_url,
+        ..
+    } = setup_reader_db().await;
 
     // Add a string-PK table and a composite-PK table to verify RecordIdFilter::Scalar vs Contains.
     db.execute(

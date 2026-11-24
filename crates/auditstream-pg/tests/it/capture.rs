@@ -14,6 +14,7 @@ use auditstream_testkit::{ClusterLock, TestDb};
 use serde_json::{Value, json};
 use sqlx::postgres::PgConnection;
 use sqlx::{AssertSqlSafe, Connection, Executor, Row};
+use uuid::Uuid;
 
 const COMMENT_USER_42: &str = "/*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzQyIn0'*/";
 const COMMENT_USER_42_AND_TRACEPARENT: &str = "/*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzQyIn0',traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01'*/";
@@ -108,7 +109,7 @@ impl CaptureFixture {
 
         let db = TestDb::new().await.expect("create TestDb");
         let app_role = format!("app_{}", db.database_name());
-        let app_pw = "capture_app_pw";
+        let app_pw = Uuid::new_v4().simple().to_string();
         let admin_url = db.admin_url().to_owned();
 
         {
@@ -173,7 +174,7 @@ impl CaptureFixture {
             setup.close().await.expect("close setup");
         }
 
-        let app_url = role_url(&db, &app_role, app_pw);
+        let app_url = role_url(&db, &app_role, &app_pw);
         let app_conn = PgConnection::connect(&app_url)
             .await
             .expect("connect as application role");
