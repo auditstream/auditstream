@@ -20,7 +20,7 @@ flowchart LR
 
 ## Install
 
-Prebuilt binaries, package channels, and the container image publish with the `v0.1.0` release:
+Install the prebuilt `auditstream` CLI through any supported channel:
 
 - **Shell (macOS and Linux):**
   ```sh
@@ -43,7 +43,7 @@ Prebuilt binaries, package channels, and the container image publish with the `v
   docker run --rm ghcr.io/auditstream/auditstream:latest --help
   ```
 
-Until the first binary release publishes, install from source with Cargo:
+Or build from source with Cargo:
 
 ```sh
 cargo install --path crates/auditstream --locked
