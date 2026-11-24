@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-24
+
+Tag: `spec-v0.1.1` (`auditstream-spec-0.1.1.tar.gz`).
+
 ### Changed
 
 - Aligned database trigger readers (`resolve_actor()`) and `spec/schemas/event.schema.json` with encoder validation: `actor.type` and `onBehalfOf.type` MUST be one of the 5 enum values (`user`, `api_key`, `ai_agent`, `service`, `system`), `tenant` MUST be a non-empty string, `onBehalfOf` MUST be an object at max depth 1, and `context` MUST be an object whose known fields (`requestId`, `source`, `ip`, `userAgent`) are non-empty strings.
