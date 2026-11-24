@@ -28,6 +28,7 @@ assert_cmd.workspace = true
 auditstream-testkit = { path = "../auditstream-testkit" }
 insta.workspace = true
 insta-cmd.workspace = true
+jsonschema.workspace = true
 predicates.workspace = true
 tempfile.workspace = true
 

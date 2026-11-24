@@ -1,0 +1,70 @@
+---
+source: crates/auditstream/tests/it/history.rs
+info:
+  program: auditstream
+  args:
+    - history
+    - "--help"
+---
+success: true
+exit_code: 0
+----- stdout -----
+Inspect recorded audit history and diffs
+
+Usage: auditstream history [OPTIONS]
+
+Options:
+      --config <PATH>
+          Path to the configuration file (defaults to ./auditstream.toml if present)
+          
+          [env: AUDITSTREAM_CONFIG=]
+
+      --table <SCHEMA.TABLE>
+          Filter by audited table (`<schema>.<table>`)
+
+      --database-url <URL>
+          Postgres connection URL (also reads `DATABASE_URL` as fallback)
+          
+          [env: AUDITSTREAM_DATABASE_URL]
+
+      --record-id <VALUE>
+          Filter by primary key value (requires `--table`; parsed as JSON first, else string)
+
+      --actor <ID>
+          Filter by actor identifier (matches `actor.id` or `actor.onBehalfOf.id`)
+
+      --schema <SCHEMA>
+          Audit schema name (defaults to `auditstream`)
+          
+          [env: AUDITSTREAM_SCHEMA=]
+
+      --since <TIME>
+          Inclusive lower bound on `occurred_at` (RFC 3339 timestamp or `YYYY-MM-DD` UTC)
+
+  -v, --verbose...
+          Increase log verbosity (`-v` info, `-vv` debug)
+
+  -q, --quiet
+          Silence warnings and info logs (errors only)
+
+      --until <TIME>
+          Exclusive upper bound on `occurred_at` (RFC 3339 timestamp or `YYYY-MM-DD` UTC)
+
+      --limit <N>
+          Maximum number of events to return (`1..=1000`)
+          
+          [default: 100]
+
+      --format <FORMAT>
+          Output format (`table` or `json`)
+
+          Possible values:
+          - table: Human-readable column table (omits `before` and `after`)
+          - json:  One compact JSON event per line matching `spec/schemas/event.schema.json`
+          
+          [default: table]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+----- stderr -----

@@ -188,6 +188,7 @@ dependencies = [
  "clap",
  "insta",
  "insta-cmd",
+ "jsonschema",
  "predicates",
  "serde",
  "serde_json",
