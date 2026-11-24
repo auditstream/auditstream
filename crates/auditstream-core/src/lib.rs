@@ -7,10 +7,12 @@ pub mod actor;
 pub mod batch;
 pub mod context;
 pub mod cursor;
+pub mod diff;
 pub mod error;
 pub mod event;
 pub mod op;
 pub mod ports;
+pub mod redact;
 pub mod transport;
 
 pub use crate::actor::{
@@ -23,6 +25,7 @@ pub use crate::error::{BoxError, CoreError, SinkError, SourceError};
 pub use crate::event::{CURRENT_SCHEMA_VERSION, Event};
 pub use crate::op::{ActorSource, MAX_ACTION_CHARS, Op, Source};
 pub use crate::ports::{EventSource, Sink};
+pub use crate::redact::{MASK_PLACEHOLDER, Redaction, RedactionMode, RedactionRule};
 pub use crate::transport::{
     DecodedActor, MAX_ENCODED_COMMENT_CHARS, ResolvedActor, SET_CONFIG_SQL, SetConfigStatement,
     decode, encode, encode_with_context, resolve_precedence, set_config, set_config_with_context,
