@@ -13,6 +13,9 @@ installers = ["shell", "powershell", "npm", "homebrew"]
 tap = "auditstream/homebrew-tap"
 # Publish Homebrew formula via dist and npm tarball via custom OIDC trusted-publishing workflow
 publish-jobs = ["homebrew", "./publish-npm"]
+# Publish the multi-arch container image after announce so pre-releases also publish :<version>
+# without enabling pre-release publishes for Homebrew or npm
+post-announce-jobs = ["./publish-image"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = [
   "aarch64-apple-darwin",
@@ -36,3 +39,9 @@ github-attestations = true
 "actions/upload-artifact" = "cf430e030ddbb5b0abf93d22962f4752f3646cd9"
 "actions/download-artifact" = "9000827ccba6bdab643e8b6fd33ac0654aef8333"
 "actions/attest" = "1e69f48acb82d1966a394da916b4c1698aa569d6"
+
+# Grant publish-image minimal permissions to check out Dockerfile and push to ghcr.io
+[dist.github-custom-job-permissions.publish-image]
+contents = "read"
+id-token = "write"
+packages = "write"

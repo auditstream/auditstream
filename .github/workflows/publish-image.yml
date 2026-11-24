@@ -1,0 +1,104 @@
+name: Publish container image
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: Serialized JSON dist plan manifest
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  publish:
+    name: Publish ghcr.io/auditstream/auditstream
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fetch release archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: artifacts-*
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Unpack musl binaries and compute image metadata
+        id: meta
+        env:
+          PLAN: ${{ inputs.plan }}
+        run: |
+          set -euo pipefail
+
+          version=$(printf '%s' "$PLAN" | jq -er '.releases[] | select(.app_name == "auditstream") | .app_version')
+          is_prerelease=$(printf '%s' "$PLAN" | jq -r '.announcement_is_prerelease')
+
+          amd64_archive=$(printf '%s' "$PLAN" | jq -er '.releases[] | select(.app_name == "auditstream") | .artifacts[] | select(endswith("x86_64-unknown-linux-musl.tar.xz"))')
+          arm64_archive=$(printf '%s' "$PLAN" | jq -er '.releases[] | select(.app_name == "auditstream") | .artifacts[] | select(endswith("aarch64-unknown-linux-musl.tar.xz"))')
+
+          mkdir -p dist-bin/amd64 dist-bin/arm64 unpack/amd64 unpack/arm64
+          tar -xJf "artifacts/${amd64_archive}" -C unpack/amd64
+          tar -xJf "artifacts/${arm64_archive}" -C unpack/arm64
+
+          amd64_bin=$(find unpack/amd64 -type f -name auditstream | head -n 1)
+          arm64_bin=$(find unpack/arm64 -type f -name auditstream | head -n 1)
+          if [ -z "$amd64_bin" ] || [ -z "$arm64_bin" ]; then
+            echo "Failed to locate unpacked musl auditstream binaries." >&2
+            exit 1
+          fi
+
+          cp "$amd64_bin" dist-bin/amd64/auditstream
+          cp "$arm64_bin" dist-bin/arm64/auditstream
+          chmod 0755 dist-bin/amd64/auditstream dist-bin/arm64/auditstream
+
+          image="ghcr.io/auditstream/auditstream"
+          created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          {
+            echo "version=${version}"
+            echo "created=${created}"
+            echo "tags<<EOF"
+            echo "${image}:${version}"
+            if [ "$is_prerelease" != "true" ] && [[ "$version" != *-* ]]; then
+              major_minor="${version%.*}"
+              echo "${image}:${major_minor}"
+              echo "${image}:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push multi-architecture image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=auditstream
+            org.opencontainers.image.description=PostgreSQL audit trail engine CLI
+            org.opencontainers.image.url=https://auditstream.dev
+            org.opencontainers.image.source=https://github.com/auditstream/auditstream
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.created }}
+            org.opencontainers.image.licenses=MIT
