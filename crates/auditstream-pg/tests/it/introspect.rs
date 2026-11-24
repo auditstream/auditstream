@@ -1,11 +1,11 @@
-use auditstream_pg::ddl::{self, DEFAULT_SCHEMA, DdlOptions};
+use auditstream_pg::ddl::DEFAULT_SCHEMA;
 use auditstream_pg::introspect::{
     self, GeneratedKind, IdentityKind, IntrospectError, IntrospectOptions, PartitionInfo,
     TableInfo, TableKind,
 };
 use auditstream_testkit::TestDb;
+use sqlx::Executor;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{AssertSqlSafe, Executor, PgPool};
 
 fn normalize_oids(mut tables: Vec<TableInfo>) -> Vec<TableInfo> {
     fn clear_partition_oids(parts: &mut [PartitionInfo]) {
@@ -24,14 +24,6 @@ fn normalize_oids(mut tables: Vec<TableInfo>) -> Vec<TableInfo> {
     tables
 }
 
-async fn apply_statements(pool: &PgPool, stmts: &[String]) {
-    for stmt in stmts {
-        pool.execute(AssertSqlSafe(stmt.clone()))
-            .await
-            .expect("execute DDL statement");
-    }
-}
-
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn introspect_fixture_schema_matches_snapshot_and_skips_non_capturable_relations() {
@@ -42,9 +34,14 @@ async fn introspect_fixture_schema_matches_snapshot_and_skips_non_capturable_rel
         .await
         .expect("connect test db");
 
-    // Create the auditstream schema so we confirm it is skipped even when passed explicitly.
-    let ddl_stmts = ddl::generate(&DdlOptions::new(DEFAULT_SCHEMA, Vec::<String>::new()));
-    apply_statements(&pool, &ddl_stmts).await;
+    // Create the auditstream schema and a table inside it without creating cluster-wide roles,
+    // confirming introspection skips the audit schema even when passed explicitly.
+    pool.execute("CREATE SCHEMA auditstream")
+        .await
+        .expect("create auditstream schema");
+    pool.execute("CREATE TABLE auditstream.changes (id bigint PRIMARY KEY)")
+        .await
+        .expect("create auditstream.changes");
 
     // Create fixture schema with every edge case from the specification.
     pool.execute("CREATE SCHEMA fixture")
