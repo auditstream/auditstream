@@ -846,3 +846,109 @@ async fn cli_filters_support_exclusive_until_on_behalf_of_actor_and_record_id_mo
     cleanup_role(&admin_url, &app_role).await;
     cleanup_role(&admin_url, &reader_role).await;
 }
+
+#[tokio::test]
+async fn tenant_filters_match_direct_delegated_and_advance_cursor() {
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let ReaderFixture {
+        db,
+        app_role,
+        reader_role,
+        app_pool,
+        reader_pool,
+        admin_url,
+        ..
+    } = setup_reader_db().await;
+
+    // 1. Direct tenant `org_acme`
+    // {"type":"user","id":"u_1","tenant":"org_acme"}
+    app_pool
+        .execute(
+            "INSERT INTO public.invoice VALUES (1, 'open', 100) \
+             /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidV8xIiwidGVuYW50Ijoib3JnX2FjbWUifQ'*/",
+        )
+        .await
+        .expect("insert direct acme");
+
+    // 2. Delegated tenant via onBehalfOf `org_acme`
+    // {"type":"ai_agent","id":"bot_1","onBehalfOf":{"type":"user","id":"u_1","tenant":"org_acme"}}
+    app_pool
+        .execute(
+            "INSERT INTO public.invoice VALUES (2, 'open', 200) \
+             /*auditstream='eyJ0eXBlIjoiYWlfYWdlbnQiLCJpZCI6ImJvdF8xIiwib25CZWhhbGZPZiI6eyJ0eXBlIjoidXNlciIsImlkIjoidV8xIiwidGVuYW50Ijoib3JnX2FjbWUifX0'*/",
+        )
+        .await
+        .expect("insert delegated acme");
+
+    // 3. Different tenant `org_beta`
+    // {"type":"user","id":"u_2","tenant":"org_beta"}
+    app_pool
+        .execute(
+            "INSERT INTO public.invoice VALUES (3, 'open', 300) \
+             /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidV8yIiwidGVuYW50Ijoib3JnX2JldGEifQ'*/",
+        )
+        .await
+        .expect("insert beta");
+
+    // Direct-only `tenant` matches only row #1.
+    let direct_only = lookup(
+        &reader_pool,
+        DEFAULT_SCHEMA,
+        &HistoryQuery {
+            tenant: Some("org_acme".to_owned()),
+            ..HistoryQuery::default()
+        },
+    )
+    .await
+    .expect("lookup direct tenant");
+    assert_eq!(direct_only.len(), 1);
+
+    // `tenant_or_on_behalf_of` matches rows #1 and #2 in lookup and export.
+    let direct_or_obo = lookup(
+        &reader_pool,
+        DEFAULT_SCHEMA,
+        &HistoryQuery {
+            tenant_or_on_behalf_of: Some("org_acme".to_owned()),
+            ..HistoryQuery::default()
+        },
+    )
+    .await
+    .expect("lookup tenant_or_on_behalf_of");
+    assert_eq!(direct_or_obo.len(), 2);
+
+    let mut export_acme = PgEventSource::new(
+        reader_pool.clone(),
+        DEFAULT_SCHEMA,
+        Cursor::new(0, 0),
+        ExportFilter {
+            tenant_or_on_behalf_of: Some("org_acme".to_owned()),
+            ..ExportFilter::default()
+        },
+    );
+    let exported = drain_until(&mut export_acme, 10, 2, Duration::from_secs(5)).await;
+    assert_eq!(exported.len(), 2);
+
+    // Filtered-out tenant advances cursor past rows that don't match.
+    let mut export_none = PgEventSource::new(
+        reader_pool.clone(),
+        DEFAULT_SCHEMA,
+        Cursor::new(0, 0),
+        ExportFilter {
+            tenant_or_on_behalf_of: Some("org_unknown".to_owned()),
+            ..ExportFilter::default()
+        },
+    );
+    let batch = export_none
+        .next_batch(10)
+        .await
+        .expect("next_batch")
+        .expect("filtered tenant window must advance cursor");
+    assert_eq!(batch.events, Vec::new());
+    assert!(batch.cursor.expect("cursor").xact_id > 0);
+
+    app_pool.close().await;
+    reader_pool.close().await;
+    drop(db);
+    cleanup_role(&admin_url, &app_role).await;
+    cleanup_role(&admin_url, &reader_role).await;
+}

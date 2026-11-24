@@ -5,8 +5,6 @@ info:
   args:
     - export
     - "--help"
-  env:
-    DATABASE_URL: ""
 ---
 success: true
 exit_code: 0
@@ -29,6 +27,7 @@ Options:
       --since <TIME>        Include events at or after this RFC 3339 timestamp or UTC date
       --until <TIME>        Include events strictly before this RFC 3339 timestamp or UTC date
       --actor <ID>          Match an actor ID directly or through onBehalfOf
+      --tenant <ID>         Match a tenant ID directly or through onBehalfOf
       --source <db|app>     Select database changes or application events
   -h, --help                Print help
 
