@@ -1,6 +1,3 @@
-//! Integration test binary for `auditstream-core`.
+//! Integration test entrypoint for `auditstream-core`.
 
-#[test]
-fn crate_loads() {
-    assert_eq!(auditstream_core::CRATE_NAME, "auditstream-core");
-}
+mod types;
