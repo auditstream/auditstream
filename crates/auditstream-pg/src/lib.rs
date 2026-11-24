@@ -3,6 +3,7 @@
 pub mod ddl;
 pub mod introspect;
 pub mod migrations;
+pub mod partitions;
 pub mod reader;
 pub mod triggers;
 pub mod verify;
