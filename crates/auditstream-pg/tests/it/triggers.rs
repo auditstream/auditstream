@@ -100,6 +100,63 @@ fn generated_sql_snapshots_match_three_fixture_schemas_and_have_no_large_regex_q
     );
 }
 
+#[test]
+fn generated_capture_and_resolve_actor_use_hot_path_optimizations() {
+    let stmts = triggers::generate(&TriggerOptions::new(
+        DEFAULT_SCHEMA,
+        vec![TableTriggerSpec::new(
+            "public",
+            "invoice",
+            vec!["id".to_owned()],
+            vec![],
+        )],
+    ));
+
+    let resolve_actor = stmts
+        .iter()
+        .find(|s| s.starts_with("CREATE OR REPLACE FUNCTION \"auditstream\".resolve_actor("))
+        .expect("resolve_actor statement");
+    let capture = stmts
+        .iter()
+        .find(|s| s.starts_with("CREATE OR REPLACE FUNCTION \"auditstream\".capture()"))
+        .expect("capture statement");
+
+    // resolve_actor() avoids POSIX regexes on the hot path and caches base64url length.
+    assert!(
+        !resolve_actor.contains("regexp_match") && !resolve_actor.contains("!~"),
+        "resolve_actor() should use pure string builtins instead of POSIX regexes:\n{resolve_actor}"
+    );
+    assert!(
+        resolve_actor.contains("pg_catalog.rtrim(") && resolve_actor.contains("pg_catalog.ltrim("),
+        "resolve_actor() should trim trailing whitespace and validate base64url via ltrim:\n{resolve_actor}"
+    );
+
+    // capture() uses single-column PK fast path and avoids empty TG_ARGV JSON array subqueries.
+    assert!(
+        capture.contains("pg_catalog.jsonb_build_object(pk_single"),
+        "capture() should build single-column PK record_id via jsonb_build_object:\n{capture}"
+    );
+    assert!(
+        capture.contains("TG_ARGV[0] <> '[]'") && capture.contains("TG_ARGV[1] <> '[]'"),
+        "capture() should short-circuit empty TG_ARGV JSON arrays:\n{capture}"
+    );
+    // UPDATE checks excluded-column no-op before calling resolve_actor().
+    let update_branch = capture
+        .split("IF TG_OP = 'UPDATE' THEN")
+        .nth(1)
+        .expect("UPDATE branch");
+    let noop_pos = update_branch
+        .find("IF v_after = v_before THEN")
+        .expect("excluded-column no-op guard in UPDATE branch");
+    let resolve_pos = update_branch
+        .find("resolve_actor()")
+        .expect("resolve_actor call in UPDATE branch");
+    assert!(
+        noop_pos < resolve_pos,
+        "UPDATE branch must check excluded-column no-op before invoking resolve_actor()"
+    );
+}
+
 #[derive(Debug, Deserialize)]
 struct CaptureSuite {
     cases: Vec<CaptureCase>,
@@ -821,6 +878,198 @@ async fn every_transport_conformance_comment_and_precedence_case_resolves_in_sql
             case.name
         );
     }
+
+    conn.close().await.expect("close conn");
+}
+
+type CapturedRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn hot_path_fast_paths_handle_single_pk_composite_no_pk_special_names_and_excluded_noops() {
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let db = TestDb::new().await.expect("create TestDb");
+    let mut conn = PgConnection::connect(db.url()).await.expect("connect");
+
+    let ddl_stmts = ddl::generate(&DdlOptions::new(DEFAULT_SCHEMA, vec![]));
+    run_statements(&mut conn, &ddl_stmts)
+        .await
+        .expect("apply ddl");
+
+    conn.execute(
+        "CREATE TABLE public.single_pk (id int PRIMARY KEY, status text, secret text);\n\
+         CREATE TABLE public.quoted_cols (\"row id\" text PRIMARY KEY, \"note \"\"x\"\"\" text, \"secret col\" text);\n\
+         CREATE TABLE public.comp_pk (tenant_id text, item_id int, val text, PRIMARY KEY (tenant_id, item_id));\n\
+         CREATE TABLE public.no_pk (label text);",
+    )
+    .await
+    .expect("create test tables");
+
+    let trigger_stmts = triggers::generate(&TriggerOptions::new(
+        DEFAULT_SCHEMA,
+        vec![
+            TableTriggerSpec::new(
+                "public",
+                "single_pk",
+                vec!["id".to_owned()],
+                vec!["secret".to_owned()],
+            ),
+            TableTriggerSpec::new(
+                "public",
+                "quoted_cols",
+                vec!["row id".to_owned()],
+                vec!["secret col".to_owned()],
+            ),
+            TableTriggerSpec::new(
+                "public",
+                "comp_pk",
+                vec!["tenant_id".to_owned(), "item_id".to_owned()],
+                vec![],
+            ),
+            TableTriggerSpec::new("public", "no_pk", vec![], vec![]),
+        ],
+    ));
+    run_statements(&mut conn, &trigger_stmts)
+        .await
+        .expect("apply triggers");
+
+    // 1. Multi-row INSERT + UPDATE + DELETE on single-PK and quoted-column tables.
+    conn.execute(
+        "INSERT INTO public.single_pk VALUES (1, 'open', 's1'), (2, 'open', 's2') \
+         /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzEifQ'*/",
+    )
+    .await
+    .expect("insert single_pk");
+
+    // Excluded-column-only UPDATE (even with a malformed comment) must write zero rows.
+    conn.execute(
+        "UPDATE public.single_pk SET secret = 's1_new' WHERE id = 1 /*auditstream='!!!bad'*/",
+    )
+    .await
+    .expect("excluded-only update single_pk");
+
+    // Real UPDATE with actor-less query (exercises no-'*/' short-circuit in resolve_actor).
+    conn.execute("UPDATE public.single_pk SET status = 'paid' WHERE id = 1")
+        .await
+        .expect("actorless update single_pk");
+
+    conn.execute("DELETE FROM public.single_pk WHERE id = 2")
+        .await
+        .expect("delete single_pk");
+
+    // Special-character single PK and excluded column.
+    conn.execute(
+        "INSERT INTO public.quoted_cols VALUES ('k-1', 'hello', 'topsecret') \
+         /*traceparent='00-abc',auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzIifQ'*/",
+    )
+    .await
+    .expect("insert quoted_cols");
+    conn.execute(
+        "UPDATE public.quoted_cols SET \"secret col\" = 'rotated' WHERE \"row id\" = 'k-1'",
+    )
+    .await
+    .expect("excluded-only update quoted_cols");
+    conn.execute(
+        "UPDATE public.quoted_cols SET \"note \"\"x\"\"\" = 'world' WHERE \"row id\" = 'k-1'",
+    )
+    .await
+    .expect("real update quoted_cols");
+
+    // Composite PK and PK-less tables.
+    conn.execute("INSERT INTO public.comp_pk VALUES ('t1', 7, 'a')")
+        .await
+        .expect("insert comp_pk");
+    conn.execute("UPDATE public.comp_pk SET val = 'b' WHERE tenant_id = 't1' AND item_id = 7")
+        .await
+        .expect("update comp_pk");
+    conn.execute("DELETE FROM public.comp_pk WHERE tenant_id = 't1' AND item_id = 7")
+        .await
+        .expect("delete comp_pk");
+    conn.execute("INSERT INTO public.no_pk VALUES ('x')")
+        .await
+        .expect("insert no_pk");
+    conn.execute("UPDATE public.no_pk SET label = 'y'")
+        .await
+        .expect("update no_pk");
+    conn.execute("DELETE FROM public.no_pk")
+        .await
+        .expect("delete no_pk");
+
+    // Malformed / edge comment shapes: slash inside comment body & empty auditstream=''.
+    conn.execute(
+        "INSERT INTO public.no_pk VALUES ('slash') /*a/auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzEifQ'*/",
+    )
+    .await
+    .expect("slash in comment body");
+    conn.execute("INSERT INTO public.no_pk VALUES ('empty') /*auditstream=''*/")
+        .await
+        .expect("empty auditstream tag");
+
+    let rows: Vec<CapturedRow> = sqlx::query_as(
+        "SELECT table_name, op, record_id::text, before::text, after::text, actor_source \
+             FROM auditstream.changes ORDER BY id ASC",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .expect("fetch captured rows");
+
+    // single_pk: 2 INSERT + 0 excluded-only UPDATE + 1 UPDATE + 1 DELETE = 4
+    // quoted_cols: 1 INSERT + 0 excluded-only UPDATE + 1 UPDATE = 2
+    // comp_pk: 1 INSERT + 1 UPDATE + 1 DELETE = 3
+    // no_pk: 1 INSERT + 1 UPDATE + 1 DELETE + 2 edge comments = 5
+    assert_eq!(rows.len(), 14, "unexpected captured row count: {rows:#?}");
+
+    // single_pk assertions (secret excluded everywhere)
+    assert_eq!(rows[0].0, "single_pk");
+    assert_eq!(rows[0].1, "INSERT");
+    assert_eq!(rows[0].2.as_deref(), Some(r#"{"id": 1}"#));
+    assert!(!rows[0].4.as_deref().unwrap_or("").contains("secret"));
+    assert_eq!(rows[0].5.as_deref(), Some("comment"));
+
+    assert_eq!(rows[2].0, "single_pk");
+    assert_eq!(rows[2].1, "UPDATE");
+    assert_eq!(rows[2].2.as_deref(), Some(r#"{"id": 1}"#));
+    assert_eq!(rows[2].5, None);
+
+    assert_eq!(rows[3].0, "single_pk");
+    assert_eq!(rows[3].1, "DELETE");
+    assert_eq!(rows[3].2.as_deref(), Some(r#"{"id": 2}"#));
+
+    // quoted_cols assertions
+    assert_eq!(rows[4].0, "quoted_cols");
+    assert_eq!(rows[4].1, "INSERT");
+    assert_eq!(rows[4].2.as_deref(), Some(r#"{"row id": "k-1"}"#));
+    assert!(!rows[4].4.as_deref().unwrap_or("").contains("secret col"));
+    assert_eq!(rows[4].5.as_deref(), Some("comment"));
+
+    assert_eq!(rows[5].0, "quoted_cols");
+    assert_eq!(rows[5].1, "UPDATE");
+    assert_eq!(rows[5].2.as_deref(), Some(r#"{"row id": "k-1"}"#));
+
+    // comp_pk assertions
+    for idx in [6, 7, 8] {
+        assert_eq!(rows[idx].0, "comp_pk");
+        let rec: Value =
+            serde_json::from_str(rows[idx].2.as_deref().expect("comp_pk record_id")).expect("json");
+        assert_eq!(rec, serde_json::json!({"tenant_id": "t1", "item_id": 7}));
+    }
+
+    // no_pk assertions
+    for idx in [9, 10, 11] {
+        assert_eq!(rows[idx].0, "no_pk");
+        assert_eq!(rows[idx].2, None);
+    }
+
+    // Slash inside comment body is ignored (actor_source = NULL); empty tag is invalid.
+    assert_eq!(rows[12].5, None);
+    assert_eq!(rows[13].5.as_deref(), Some("invalid"));
 
     conn.close().await.expect("close conn");
 }
