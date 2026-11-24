@@ -2,5 +2,6 @@
 
 mod ddl;
 mod introspect;
+mod migrations;
 mod reader;
 mod triggers;
