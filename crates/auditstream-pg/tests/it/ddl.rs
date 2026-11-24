@@ -3,6 +3,7 @@ use auditstream_testkit::TestDb;
 use sqlx::postgres::PgConnection;
 use sqlx::{AssertSqlSafe, Connection, Executor, Row};
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 async fn run_statements(conn: &mut PgConnection, stmts: &[String]) -> Result<(), sqlx::Error> {
     for stmt in stmts {
@@ -57,7 +58,7 @@ async fn setup_runs_as_non_superuser_revokes_self_grant_and_fails_without_self_g
     // Ensure auditstream_owner does not pre-exist from another role in the shared cluster,
     // and create a dedicated application role for this test database.
     let app_role = format!("app_{}", db.database_name());
-    let app_pw = "app_test_pw";
+    let app_pw = Uuid::new_v4().simple().to_string();
     {
         let mut admin = PgConnection::connect(&admin_url)
             .await
@@ -203,7 +204,7 @@ async fn setup_runs_as_non_superuser_revokes_self_grant_and_fails_without_self_g
 
     // 2. Verify app_role permissions (SELECT + EXECUTE log_event only; INSERT/UPDATE/DELETE/TRUNCATE denied on changes AND on a partition).
     // Also keep app_conn open across a second idempotent setup run to verify session continuity!
-    let app_url = app_role_url(&db, &app_role, app_pw);
+    let app_url = app_role_url(&db, &app_role, &app_pw);
     let mut app_conn = PgConnection::connect(&app_url)
         .await
         .expect("app_role connect");
