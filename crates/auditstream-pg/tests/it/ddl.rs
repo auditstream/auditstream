@@ -287,18 +287,37 @@ async fn setup_runs_as_non_superuser_revokes_self_grant_and_fails_without_self_g
         Some("comment")
     );
 
-    // Verify invalid action raises SQLSTATE 22023.
-    let bad_action = sqlx::query("SELECT auditstream.log_event('INSERT', NULL, NULL)")
-        .execute(&mut app_conn)
-        .await
-        .expect_err("reserved action INSERT must fail");
-    assert_eq!(
-        bad_action
-            .as_database_error()
-            .and_then(sqlx::error::DatabaseError::code)
-            .as_deref(),
-        Some("22023")
-    );
+    // Verify invalid action (including whitespace-padded reserved DML) and non-object target/data raise SQLSTATE 22023.
+    for (label, sql) in [
+        (
+            "reserved action INSERT",
+            "SELECT auditstream.log_event('INSERT', NULL, NULL)",
+        ),
+        (
+            "padded reserved action",
+            "SELECT auditstream.log_event(' INSERT ', NULL, NULL)",
+        ),
+        (
+            "non-object target array",
+            "SELECT auditstream.log_event('invoice.exported', '[1,2]'::jsonb, NULL)",
+        ),
+        (
+            "non-object data string",
+            "SELECT auditstream.log_event('invoice.exported', NULL, '\"bad\"'::jsonb)",
+        ),
+    ] {
+        let bad = sqlx::query(sql)
+            .execute(&mut app_conn)
+            .await
+            .expect_err(&format!("{label} must fail"));
+        assert_eq!(
+            bad.as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("22023"),
+            "{label}: expected SQLSTATE 22023, got {bad}"
+        );
+    }
 
     // Verify INSERT, UPDATE, DELETE, TRUNCATE denied on changes AND on changes_default partition.
     for target in ["auditstream.changes", "auditstream.changes_default"] {

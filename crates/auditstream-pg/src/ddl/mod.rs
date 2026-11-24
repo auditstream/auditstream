@@ -165,7 +165,12 @@ fn changes_table_sql(schema_q: &str) -> String {
   actor_source text,\n  \
   db_user text NOT NULL DEFAULT session_user,\n  \
   schema_version smallint NOT NULL DEFAULT 1,\n  \
-  PRIMARY KEY (id, occurred_at)\n\
+  PRIMARY KEY (id, occurred_at),\n  \
+  CONSTRAINT changes_source_check CHECK (source IN ('db', 'app')),\n  \
+  CONSTRAINT changes_actor_source_check CHECK (\n    \
+    actor_source IS NULL OR actor_source IN ('set_config', 'comment', 'jwt', 'invalid')\n  \
+  ),\n  \
+  CONSTRAINT changes_schema_version_check CHECK (schema_version >= 1)\n\
 ) PARTITION BY RANGE (occurred_at)"
     )
 }
@@ -233,8 +238,18 @@ BEGIN\n  \
   IF action IS NULL\n     \
      OR pg_catalog.char_length(pg_catalog.btrim(action)) < 1\n     \
      OR pg_catalog.char_length(action) > 64\n     \
-     OR pg_catalog.upper(action) IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE') THEN\n    \
+     OR pg_catalog.upper(pg_catalog.btrim(action)) IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE') THEN\n    \
     RAISE EXCEPTION 'auditstream.log_event: invalid action %', action\n      \
+      USING ERRCODE = '22023';\n  \
+  END IF;\n\n  \
+  IF target IS NOT NULL\n     \
+     AND pg_catalog.jsonb_typeof(target) IS DISTINCT FROM 'object' THEN\n    \
+    RAISE EXCEPTION 'auditstream.log_event: target must be a JSON object or NULL'\n      \
+      USING ERRCODE = '22023';\n  \
+  END IF;\n\n  \
+  IF data IS NOT NULL\n     \
+     AND pg_catalog.jsonb_typeof(data) IS DISTINCT FROM 'object' THEN\n    \
+    RAISE EXCEPTION 'auditstream.log_event: data must be a JSON object or NULL'\n      \
       USING ERRCODE = '22023';\n  \
   END IF;\n\n  \
   SELECT r.actor, r.context, r.actor_source\n    \

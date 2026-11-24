@@ -610,6 +610,15 @@ impl ChangeRow {
                 ));
             }
         };
+        if self.schema_version < 1 {
+            return Err(SourceError::decode(
+                format!("invalid schema_version `{}`", self.schema_version),
+                RowDecodeError(format!(
+                    "schema_version must be >= 1, got {}",
+                    self.schema_version
+                )),
+            ));
+        }
         let schema_version = u16::try_from(self.schema_version).map_err(|err| {
             SourceError::decode(
                 format!("invalid schema_version `{}`", self.schema_version),
@@ -727,5 +736,50 @@ fn source_as_str(source: Source) -> &'static str {
     match source {
         Source::Db => "db",
         Source::App => "app",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_row(schema_version: i16) -> ChangeRow {
+        ChangeRow {
+            id: 1,
+            event_id: "019ab123-4567-7000-8000-000000000001".to_owned(),
+            occurred_at: "2026-11-24T10:15:30.123456Z".to_owned(),
+            xact_id: "100".to_owned(),
+            source: "app".to_owned(),
+            schema_name: None,
+            table_name: None,
+            op: "invoice.exported".to_owned(),
+            record_id: None,
+            before: None,
+            after: None,
+            changed: None,
+            actor: None,
+            context: None,
+            actor_source: None,
+            db_user: "app_user".to_owned(),
+            schema_version,
+        }
+    }
+
+    #[test]
+    fn into_event_rejects_schema_version_below_one() {
+        for invalid in [0_i16, -1_i16] {
+            let err = sample_row(invalid)
+                .into_event()
+                .expect_err("schema_version < 1 must fail");
+            assert!(
+                err.to_string().contains("schema_version"),
+                "unexpected error for schema_version={invalid}: {err}"
+            );
+        }
+
+        let valid = sample_row(1)
+            .into_event()
+            .expect("schema_version = 1 must succeed");
+        assert_eq!(valid.schema_version, 1);
     }
 }

@@ -74,7 +74,7 @@ impl Op {
             });
         }
         if matches!(
-            action.to_ascii_uppercase().as_str(),
+            action.trim().to_ascii_uppercase().as_str(),
             "INSERT" | "UPDATE" | "DELETE" | "TRUNCATE"
         ) {
             return Err(CoreError::ReservedAction { action });
@@ -109,19 +109,7 @@ impl FromStr for Op {
             "UPDATE" => Ok(Self::Update),
             "DELETE" => Ok(Self::Delete),
             "TRUNCATE" => Ok(Self::Truncate),
-            other => {
-                if other.is_empty() {
-                    return Err(CoreError::EmptyAction);
-                }
-                let char_len = other.chars().count();
-                if char_len > MAX_ACTION_CHARS {
-                    return Err(CoreError::ActionTooLong {
-                        len: char_len,
-                        max: MAX_ACTION_CHARS,
-                    });
-                }
-                Ok(Self::App(other.to_owned()))
-            }
+            other => Self::app(other),
         }
     }
 }

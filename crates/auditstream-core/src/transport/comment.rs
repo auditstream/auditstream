@@ -146,8 +146,45 @@ pub fn decode(sql: &str) -> DecodedActor {
     parse_trigger_actor_json(text)
 }
 
-/// Validates and splits a JSON string using the database trigger rules (`spec/transport.md`):
-/// JSON object with non-empty string `type` and `id`, splitting `context` if it is an object.
+const ALLOWED_ACTOR_TYPES: &[&str] = &["user", "api_key", "ai_agent", "service", "system"];
+const KNOWN_CONTEXT_KEYS: &[&str] = &["requestId", "source", "ip", "userAgent"];
+
+fn is_valid_actor_type(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
+        .is_some_and(|s| ALLOWED_ACTOR_TYPES.contains(&s))
+}
+
+fn is_non_empty_json_string(value: &Value) -> bool {
+    value.as_str().is_some_and(|s| !s.is_empty())
+}
+
+fn is_valid_optional_non_empty_string(map: &serde_json::Map<String, Value>, key: &str) -> bool {
+    map.get(key).is_none_or(is_non_empty_json_string)
+}
+
+fn is_valid_nested_actor(value: &Value) -> bool {
+    let Value::Object(obo) = value else {
+        return false;
+    };
+    is_valid_actor_type(obo.get("type"))
+        && obo.get("id").is_some_and(is_non_empty_json_string)
+        && !obo.contains_key("onBehalfOf")
+        && is_valid_optional_non_empty_string(obo, "tenant")
+}
+
+fn is_valid_context_object(value: &Value) -> bool {
+    let Value::Object(ctx) = value else {
+        return false;
+    };
+    KNOWN_CONTEXT_KEYS
+        .iter()
+        .all(|key| is_valid_optional_non_empty_string(ctx, key))
+}
+
+/// Validates and splits a JSON string using the full `spec/actor.md` and `spec/transport.md` rules:
+/// JSON object with valid enum `type`, non-empty string `id`, optional valid `tenant` and
+/// single-level `onBehalfOf`, and optional `context` object with non-empty known fields.
 pub(crate) fn parse_trigger_actor_json(raw_json: &str) -> DecodedActor {
     if raw_json.len() > MAX_PAYLOAD_BYTES {
         return DecodedActor::Invalid;
@@ -157,22 +194,18 @@ pub(crate) fn parse_trigger_actor_json(raw_json: &str) -> DecodedActor {
         return DecodedActor::Invalid;
     };
 
-    let valid_type = map
-        .get("type")
-        .and_then(Value::as_str)
-        .is_some_and(|s| !s.is_empty());
-    let valid_id = map
-        .get("id")
-        .and_then(Value::as_str)
-        .is_some_and(|s| !s.is_empty());
-
-    if !valid_type || !valid_id {
+    if !is_valid_actor_type(map.get("type"))
+        || !map.get("id").is_some_and(is_non_empty_json_string)
+        || !is_valid_optional_non_empty_string(&map, "tenant")
+        || !map.get("onBehalfOf").is_none_or(is_valid_nested_actor)
+    {
         return DecodedActor::Invalid;
     }
 
     let context = match map.remove("context") {
-        Some(ctx @ Value::Object(_)) => Some(ctx),
-        _ => None,
+        None => None,
+        Some(ctx) if is_valid_context_object(&ctx) => Some(ctx),
+        Some(_) => return DecodedActor::Invalid,
     };
 
     DecodedActor::Valid {

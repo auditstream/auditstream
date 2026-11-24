@@ -161,10 +161,23 @@ fn op_maps_dml_variants_and_app_actions_in_both_directions() {
         Err(CoreError::ReservedAction { .. })
     ));
     assert!(matches!(
+        Op::app(" INSERT "),
+        Err(CoreError::ReservedAction { .. })
+    ));
+    assert!(matches!(
         Op::app("delete"),
         Err(CoreError::ReservedAction { .. })
     ));
     assert!(matches!(Op::app("   "), Err(CoreError::EmptyAction)));
+    assert!(matches!(Op::from_str("   "), Err(CoreError::EmptyAction)));
+    assert!(matches!(
+        Op::from_str("insert"),
+        Err(CoreError::ReservedAction { .. })
+    ));
+    assert!(matches!(
+        Op::from_str(" UPDATE "),
+        Err(CoreError::ReservedAction { .. })
+    ));
     assert!(matches!(
         Op::app("a".repeat(65)),
         Err(CoreError::ActionTooLong { len: 65, max: 64 })
@@ -220,6 +233,24 @@ fn event_preserves_arbitrary_precision_numeric_and_validates_against_event_schem
     assert!(
         validator.is_valid(&value),
         "serialized Event failed event.schema.json"
+    );
+
+    // Closed actor.type enum parity in event.schema.json (top-level and nested onBehalfOf).
+    let mut bad_actor = value.clone();
+    bad_actor["actor"] = serde_json::json!({"type": "bot", "id": "b_1"});
+    assert!(
+        !validator.is_valid(&bad_actor),
+        "event.schema.json must reject unknown actor.type"
+    );
+    let mut bad_obo = value.clone();
+    bad_obo["actor"] = serde_json::json!({
+        "type": "ai_agent",
+        "id": "a_1",
+        "onBehalfOf": {"type": "bot", "id": "b_1"}
+    });
+    assert!(
+        !validator.is_valid(&bad_obo),
+        "event.schema.json must reject unknown actor.onBehalfOf.type"
     );
 
     let round_tripped: Event = serde_json::from_str(&serialized).expect("deserialize event");
