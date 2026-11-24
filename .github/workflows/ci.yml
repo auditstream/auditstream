@@ -16,6 +16,7 @@ concurrency:
 jobs:
   fmt:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -24,14 +25,11 @@ jobs:
         with:
           toolchain: "1.100.0"
           components: rustfmt
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo xtask ci fmt
+      - run: cargo fmt --all --check
 
   clippy:
-    needs: fmt
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -45,30 +43,11 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo xtask ci clippy
 
-  test:
-    needs: fmt
+  build-tests:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        pg: [15, 16, 17, 18, 19]
-    services:
-      postgres:
-        image: postgres:${{ matrix.pg }}
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+    timeout-minutes: 20
     env:
-      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
-      AUDITSTREAM_TEST_PG: ${{ matrix.pg }}
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -82,11 +61,77 @@ jobs:
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: nextest
-      - run: cargo xtask ci test
+      - name: Run Postgres-independent crate tests
+        run: >-
+          cargo nextest run
+          --workspace
+          --locked
+          --profile ci
+          -E 'package(auditstream-core) | package(auditstream-export) | package(xtask)'
+      - name: Build nextest archive for Postgres test matrix
+        run: >-
+          cargo nextest archive
+          --workspace
+          --exclude auditstream-core
+          --exclude auditstream-export
+          --exclude xtask
+          --locked
+          --archive-file tests.tar.zst
+      - name: Upload nextest archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nextest-archive
+          path: tests.tar.zst
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+  test:
+    needs: build-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [15, 16, 17, 18, 19]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+      AUDITSTREAM_TEST_PG: ${{ matrix.pg }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download nextest archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: nextest-archive
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: nextest
+      - name: Run Postgres-dependent tests from archive
+        run: >-
+          cargo nextest run
+          --archive-file tests.tar.zst
+          --workspace-remap .
+          --profile ci
 
   doctest:
-    needs: fmt
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -100,8 +145,8 @@ jobs:
       - run: cargo xtask ci doctest
 
   docs:
-    needs: fmt
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -115,52 +160,50 @@ jobs:
       - run: cargo xtask ci docs
 
   msrv:
-    needs: fmt
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUSTUP_TOOLCHAIN: "1.96"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
-          toolchain: "1.100.0"
+          toolchain: "1.96"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-hack
-      - run: cargo xtask ci msrv
+      - run: cargo hack check --rust-version --workspace --locked
 
   deny:
-    needs: fmt
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
-        with:
-          toolchain: "1.100.0"
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-deny
-      - run: cargo xtask ci deny
+      - run: cargo deny check
 
   ci-ok:
     if: always()
     needs:
       - fmt
       - clippy
+      - build-tests
       - test
       - doctest
       - docs
       - msrv
       - deny
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Verify all blocking CI jobs succeeded
         env:

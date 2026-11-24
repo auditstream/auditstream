@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::PathBuf;
 
 use auditstream_core::transport::{DecodedActor, comment, resolve_precedence};
 use auditstream_pg::ddl::{self, DEFAULT_SCHEMA, DdlOptions, OWNER_ROLE, quote_ident};
@@ -26,8 +26,9 @@ fn app_role_url(db: &TestDb, role: &str, password: &str) -> String {
     format!("{scheme}://{role}:{password}@{host_and_db}")
 }
 
-fn conformance_dir() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+fn conformance_dir() -> PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from)
         .join("../..")
         .join("spec/conformance")
 }
