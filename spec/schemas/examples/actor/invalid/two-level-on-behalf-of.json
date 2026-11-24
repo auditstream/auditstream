@@ -1,0 +1,12 @@
+{
+  "type": "ai_agent",
+  "id": "agent_1",
+  "onBehalfOf": {
+    "type": "service",
+    "id": "svc_1",
+    "onBehalfOf": {
+      "type": "user",
+      "id": "usr_1"
+    }
+  }
+}

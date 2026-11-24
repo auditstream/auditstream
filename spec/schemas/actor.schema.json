@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auditstream.dev/schemas/spec/0.1.0/actor.schema.json",
+  "title": "Auditstream Actor and Context Payload",
+  "description": "Actor and optional context payload defined by Auditstream Specification 0.1.0.",
+  "type": "object",
+  "required": ["type", "id"],
+  "additionalProperties": true,
+  "properties": {
+    "type": {
+      "$ref": "#/$defs/actorType"
+    },
+    "id": {
+      "$ref": "#/$defs/nonEmptyString"
+    },
+    "onBehalfOf": {
+      "$ref": "#/$defs/nestedActor"
+    },
+    "tenant": {
+      "$ref": "#/$defs/nonEmptyString"
+    },
+    "context": {
+      "$ref": "#/$defs/context"
+    }
+  },
+  "$defs": {
+    "actorType": {
+      "type": "string",
+      "enum": ["user", "api_key", "ai_agent", "service", "system"]
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "nestedActor": {
+      "type": "object",
+      "required": ["type", "id"],
+      "additionalProperties": true,
+      "properties": {
+        "type": {
+          "$ref": "#/$defs/actorType"
+        },
+        "id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "tenant": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "onBehalfOf": false
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "requestId": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "source": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "ip": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "userAgent": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    }
+  }
+}

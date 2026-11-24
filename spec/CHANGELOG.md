@@ -12,3 +12,4 @@ Target release: `0.1.0` (unreleased until conformance fixtures are tagged in `#1
 
 - Initial specification skeleton (`spec/README.md`), RFC 2119 / RFC 8174 normative wording rules, independent versioning policy, and cross-repository change order.
 - Implementation compliance matrix (`spec/compliance.md`) covering the Rust engine, generated SQL, and TypeScript adapters.
+- Actor and context schema (`spec/actor.md`, `spec/schemas/actor.schema.json`) with valid and invalid JSON examples and the 512-byte payload limit.
