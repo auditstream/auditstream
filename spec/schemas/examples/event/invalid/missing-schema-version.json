@@ -1,0 +1,16 @@
+{
+  "event_id": "019ab123-4567-7000-8000-000000000005",
+  "occurred_at": "2026-11-24T10:15:30.123456Z",
+  "source": "db",
+  "schema_name": "public",
+  "table_name": "invoice",
+  "op": "INSERT",
+  "record_id": { "id": 101 },
+  "before": null,
+  "after": { "id": 101 },
+  "changed": null,
+  "actor": null,
+  "context": null,
+  "actor_source": null,
+  "db_user": "app_user"
+}

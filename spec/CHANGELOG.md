@@ -14,3 +14,4 @@ Target release: `0.1.0` (unreleased until conformance fixtures are tagged in `#1
 - Implementation compliance matrix (`spec/compliance.md`) covering the Rust engine, generated SQL, and TypeScript adapters.
 - Actor and context schema (`spec/actor.md`, `spec/schemas/actor.schema.json`) with valid and invalid JSON examples and the 512-byte payload limit.
 - Actor transport and precedence specification (`spec/transport.md`), including canonical JSON, unpadded base64url comments, transaction-local `set_config`, JWT fallback, and malformed-input handling.
+- Export record format (`spec/export.md`, `spec/schemas/event.schema.json`) for JSON Lines and RFC 4180 CSV with valid/invalid examples and CSV fixture.
