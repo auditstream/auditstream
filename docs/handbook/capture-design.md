@@ -41,7 +41,7 @@ v0.1 captures with generated triggers that write to a partitioned `auditstream.c
 | `schema_version` | smallint | Version of this layout |
 
 - **Partitioned by month** on `occurred_at`; the primary key includes it, and a DEFAULT partition always exists. Once a row lands in DEFAULT, PostgreSQL refuses to create that month's partition until the row is moved, which takes a detach, move and re-attach under lock. So the CLI creates partitions three months ahead, and `verify` fails when DEFAULT holds rows.
-- **Indexes.** BRIN on `occurred_at` always. The lookup index on `(table_name, record_id, occurred_at)` was the largest single write cost measured, so its final shape is decided by the benchmark issue.
+- **Indexes.** BRIN on `occurred_at`, B-tree on `(xact_id, id)` for export cursors, and a partial hash lookup index `USING hash (record_id) WHERE record_id IS NOT NULL` selected by [ADR-0008](../decisions/0008-history-lookup-index.md) (cutting bulk-insert index maintenance overhead by ~65% compared to the provisional `(table_name, record_id, occurred_at)` B-tree).
 - **The export cursor is an xid8 window.** Each export reads rows where `xact_id >= cursor` and `xact_id < pg_snapshot_xmin(pg_current_snapshot())`, ordered by `xact_id` then `id`, and stores that xmin as the next cursor. A cursor on `id` lost a row in testing when an earlier transaction committed after a later one.
 - **App events** go through `auditstream.log_event(action, target, data)`, so adapters never depend on the table layout.
 
@@ -54,7 +54,7 @@ v0.1 captures with generated triggers that write to a partitioned `auditstream.c
 
 ## Cost
 
-The worst case is a stream of small single-row updates. There the full design cost 40% of throughput with the comment (11,105 to 6,630 transactions per second) and 48% with `set_config`. Bulk writes cost much less per row, because INSERT and DELETE triggers run once per statement.
+The worst case is a stream of small single-row updates. On the initial prototype benchmark (PostgreSQL 16 on local disk), the full design with the provisional B-tree lookup index cost 40% of throughput with the comment (11,105 to 6,630 transactions per second) and 48% with `set_config`. Adopting the partial hash lookup index ([ADR-0008](../decisions/0008-history-lookup-index.md)) and replacing regexes in `resolve_actor()` with string builtins plus a single-column PK fast path in `capture()` improved single-row UPDATE throughput by +23.4% with comments (+43.4% with `set_config`) and cut 10,000-row bulk insert latency by 25.7% in PostgreSQL 19 `tmpfs` benchmarks. Bulk writes cost much less per row, because INSERT and DELETE triggers run once per statement.
 
 ## Where it does not run
 
