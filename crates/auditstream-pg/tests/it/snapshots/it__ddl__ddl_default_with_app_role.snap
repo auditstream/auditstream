@@ -1,0 +1,172 @@
+---
+source: crates/auditstream-pg/tests/it/ddl.rs
+expression: "first.join(\";\\n\\n\")"
+---
+DO $$
+DECLARE
+  granted_self boolean := false;
+BEGIN
+  PERFORM pg_catalog.pg_advisory_xact_lock(7022629640991829879);
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'auditstream_owner') THEN
+    EXECUTE 'CREATE ROLE "auditstream_owner" NOLOGIN';
+  END IF;
+  IF NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'USAGE') THEN
+    EXECUTE pg_catalog.format('GRANT "auditstream_owner" TO %I', current_user);
+    granted_self := true;
+  END IF;
+  PERFORM pg_catalog.set_config(
+    'auditstream._granted_self',
+    CASE WHEN granted_self THEN '1' ELSE '0' END,
+    false
+  );
+END
+$$;
+
+CREATE SCHEMA IF NOT EXISTS "auditstream" AUTHORIZATION "auditstream_owner";
+
+CREATE TABLE IF NOT EXISTS "auditstream".changes (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  event_id uuid NOT NULL DEFAULT gen_random_uuid(),
+  occurred_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  xact_id xid8 NOT NULL DEFAULT pg_current_xact_id(),
+  source text NOT NULL DEFAULT 'db',
+  schema_name text,
+  table_name text,
+  table_oid oid,
+  op text NOT NULL,
+  record_id jsonb,
+  before jsonb,
+  after jsonb,
+  changed text[],
+  actor jsonb,
+  context jsonb,
+  actor_source text,
+  db_user text NOT NULL DEFAULT session_user,
+  schema_version smallint NOT NULL DEFAULT 1,
+  PRIMARY KEY (id, occurred_at)
+) PARTITION BY RANGE (occurred_at);
+
+ALTER TABLE "auditstream".changes OWNER TO "auditstream_owner";
+
+DO $$
+DECLARE
+  base_month timestamp := pg_catalog.date_trunc('month', pg_catalog.now() AT TIME ZONE 'UTC');
+  m int;
+  month_start timestamp;
+  month_end timestamp;
+  part_name text;
+BEGIN
+  EXECUTE pg_catalog.format(
+    'CREATE TABLE IF NOT EXISTS %I.changes_default PARTITION OF %I.changes DEFAULT',
+    'auditstream',
+    'auditstream'
+  );
+  EXECUTE pg_catalog.format(
+    'ALTER TABLE %I.changes_default OWNER TO %I',
+    'auditstream',
+    'auditstream_owner'
+  );
+  FOR m IN 0..3 LOOP
+    month_start := base_month + pg_catalog.make_interval(months => m);
+    month_end := base_month + pg_catalog.make_interval(months => m + 1);
+    part_name := 'changes_' || pg_catalog.to_char(month_start, 'YYYY_MM');
+    EXECUTE pg_catalog.format(
+      'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.changes FOR VALUES FROM (%L) TO (%L)',
+      'auditstream',
+      part_name,
+      'auditstream',
+      pg_catalog.to_char(month_start, 'YYYY-MM-DD HH24:MI:SS') || '+00',
+      pg_catalog.to_char(month_end, 'YYYY-MM-DD HH24:MI:SS') || '+00'
+    );
+    EXECUTE pg_catalog.format(
+      'ALTER TABLE %I.%I OWNER TO %I',
+      'auditstream',
+      part_name,
+      'auditstream_owner'
+    );
+  END LOOP;
+END
+$$;
+
+CREATE INDEX IF NOT EXISTS changes_occurred_at_brin_idx ON "auditstream".changes USING brin (occurred_at);
+
+CREATE INDEX IF NOT EXISTS changes_xact_id_idx ON "auditstream".changes (xact_id, id);
+
+CREATE INDEX IF NOT EXISTS changes_lookup_idx ON "auditstream".changes (table_name, record_id, occurred_at);
+
+CREATE OR REPLACE FUNCTION "auditstream".log_event(
+  action text,
+  target jsonb DEFAULT NULL,
+  data jsonb DEFAULT NULL
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+  resolved record;
+  v_event_id uuid;
+BEGIN
+  IF action IS NULL
+     OR pg_catalog.char_length(pg_catalog.btrim(action)) < 1
+     OR pg_catalog.char_length(action) > 64
+     OR pg_catalog.upper(action) IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE') THEN
+    RAISE EXCEPTION 'auditstream.log_event: invalid action %', action
+      USING ERRCODE = '22023';
+  END IF;
+
+  SELECT r.actor, r.context, r.actor_source
+    INTO resolved
+    FROM "auditstream".resolve_actor() AS r;
+
+  INSERT INTO "auditstream".changes (
+    source,
+    op,
+    record_id,
+    after,
+    actor,
+    context,
+    actor_source,
+    db_user,
+    schema_version
+  )
+  VALUES (
+    'app',
+    action,
+    target,
+    data,
+    resolved.actor,
+    resolved.context,
+    resolved.actor_source,
+    session_user,
+    1
+  )
+  RETURNING event_id INTO v_event_id;
+
+  RETURN v_event_id;
+END
+$fn$;
+
+ALTER FUNCTION "auditstream".log_event(text, jsonb, jsonb) OWNER TO "auditstream_owner";
+
+REVOKE ALL ON SCHEMA "auditstream" FROM PUBLIC;
+
+REVOKE ALL ON "auditstream".changes FROM PUBLIC;
+
+REVOKE ALL ON FUNCTION "auditstream".log_event(text, jsonb, jsonb) FROM PUBLIC;
+
+GRANT USAGE ON SCHEMA "auditstream" TO "app_user";
+
+GRANT SELECT ON "auditstream".changes TO "app_user";
+
+GRANT EXECUTE ON FUNCTION "auditstream".log_event(text, jsonb, jsonb) TO "app_user";
+
+DO $$
+BEGIN
+  IF pg_catalog.current_setting('auditstream._granted_self', true) = '1' THEN
+    EXECUTE pg_catalog.format('REVOKE "auditstream_owner" FROM %I', current_user);
+    PERFORM pg_catalog.set_config('auditstream._granted_self', '', false);
+  END IF;
+END
+$$
