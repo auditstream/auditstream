@@ -1,6 +1,6 @@
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
 
@@ -17,7 +17,9 @@ use tokio::io::AsyncWrite;
 use uuid::Uuid;
 
 fn load_event_schema() -> jsonschema::Validator {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from);
+    let path = manifest_dir
         .join("../..")
         .join("spec/schemas/event.schema.json");
     let raw = fs::read_to_string(&path).expect("read event.schema.json");

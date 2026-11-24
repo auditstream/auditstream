@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
 
@@ -119,9 +119,14 @@ fn sample_events_all_five_kinds() -> Vec<Event> {
     ]
 }
 
+fn manifest_dir() -> PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from)
+}
+
 #[test]
 fn header_column_set_equals_event_schema_properties() {
-    let schema_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let schema_path = manifest_dir()
         .join("../..")
         .join("spec/schemas/event.schema.json");
     let raw = fs::read_to_string(&schema_path).expect("read event.schema.json");
@@ -140,7 +145,7 @@ fn header_column_set_equals_event_schema_properties() {
 
 #[tokio::test]
 async fn matches_spec_records_csv_example_byte_for_byte_with_crlf() {
-    let spec_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let spec_dir = manifest_dir()
         .join("../..")
         .join("spec/schemas/examples/event");
     let valid_files = [

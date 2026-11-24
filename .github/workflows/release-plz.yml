@@ -12,6 +12,7 @@ jobs:
   release-pr:
     name: release-pr
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     concurrency:
       group: release-plz-pr-${{ github.ref }}
       cancel-in-progress: false
@@ -47,6 +48,7 @@ jobs:
   release:
     name: release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     concurrency:
       group: release-plz-tag-${{ github.ref }}
       cancel-in-progress: false

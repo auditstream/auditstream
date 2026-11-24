@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use auditstream_core::{
     Actor, ActorPayload, ActorSource, ActorType, Context, CoreError, DecodedActor, NestedActor,
@@ -11,7 +11,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 fn conformance_transport_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from)
         .join("../..")
         .join("spec/conformance/transport")
 }

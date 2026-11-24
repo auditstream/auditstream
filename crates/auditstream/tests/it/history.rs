@@ -13,8 +13,9 @@ use tempfile::tempdir;
 use crate::support::{auditstream_cmd, auditstream_std_cmd};
 
 fn load_event_schema() -> jsonschema::Validator {
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../spec/schemas/event.schema.json");
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from);
+    let path = manifest_dir.join("../../spec/schemas/event.schema.json");
     let raw = std::fs::read_to_string(&path).expect("read spec/schemas/event.schema.json");
     let schema: serde_json::Value = serde_json::from_str(&raw).expect("parse event schema JSON");
     jsonschema::validator_for(&schema).expect("compile event.schema.json validator")
