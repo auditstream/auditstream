@@ -11,6 +11,7 @@ pub mod error;
 pub mod event;
 pub mod op;
 pub mod ports;
+pub mod transport;
 
 pub use crate::actor::{
     Actor, ActorPayload, ActorType, MAX_PAYLOAD_BYTES, NestedActor, validate_actor_payload,
@@ -22,6 +23,11 @@ pub use crate::error::{BoxError, CoreError, SinkError, SourceError};
 pub use crate::event::{CURRENT_SCHEMA_VERSION, Event};
 pub use crate::op::{ActorSource, MAX_ACTION_CHARS, Op, Source};
 pub use crate::ports::{EventSource, Sink};
+pub use crate::transport::{
+    DecodedActor, MAX_ENCODED_COMMENT_CHARS, ResolvedActor, SET_CONFIG_SQL, SetConfigStatement,
+    decode, encode, encode_with_context, resolve_precedence, set_config, set_config_with_context,
+    tag, tag_with_context,
+};
 
 /// Crate identifier retained for workspace smoke checks.
 pub const CRATE_NAME: &str = "auditstream-core";
