@@ -1,0 +1,49 @@
+name: Publish npm package
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: Serialized JSON dist plan manifest
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  publish:
+    name: Publish auditstream to npm
+    runs-on: ubuntu-24.04
+    environment: npm
+    permissions:
+      id-token: write
+    steps:
+      - name: Fetch npm packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: artifacts-*
+          path: npm/
+          merge-multiple: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Publish npm package via trusted publishing
+        env:
+          PLAN: ${{ inputs.plan }}
+        run: |
+          set -euo pipefail
+          mapfile -t packages < <(
+            printf '%s' "$PLAN" \
+              | jq -r '.releases[] | .artifacts[] | select(endswith("-npm-package.tar.gz"))'
+          )
+          if [ "${#packages[@]}" -eq 0 ]; then
+            echo "No npm package tarballs found in dist plan." >&2
+            exit 1
+          fi
+          for pkg in "${packages[@]}"; do
+            npm publish --access public "./npm/${pkg}"
+          done
