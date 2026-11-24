@@ -26,6 +26,7 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 assert_cmd.workspace = true
 auditstream-testkit = { path = "../auditstream-testkit" }
+csv.workspace = true
 insta.workspace = true
 insta-cmd.workspace = true
 jsonschema.workspace = true

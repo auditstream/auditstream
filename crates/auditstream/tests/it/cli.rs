@@ -8,23 +8,14 @@ use tempfile::tempdir;
 
 use crate::support::{auditstream_cmd, auditstream_std_cmd};
 
+// A zero batch size fails after the resolved config is logged and before connecting.
+const SHOW_CONFIG: [&str; 4] = ["-vv", "export", "--batch-size", "0"];
+
 #[test]
 fn help_output_matches_snapshot() {
     let mut cmd = auditstream_std_cmd();
     cmd.arg("--help");
     assert_cmd_snapshot!(cmd);
-}
-
-#[test]
-fn all_subcommand_stubs_exit_5_with_stderr_only() {
-    let dir = tempdir().unwrap();
-    auditstream_cmd()
-        .current_dir(dir.path())
-        .args(["-vv", "export"])
-        .assert()
-        .code(5)
-        .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains("not implemented yet"));
 }
 
 #[test]
@@ -81,9 +72,9 @@ fn config_precedence_layers_end_to_end() {
     // 1. Default file layer
     auditstream_cmd()
         .current_dir(dir.path())
-        .args(["-vv", "export"])
+        .args(SHOW_CONFIG)
         .assert()
-        .code(5)
+        .code(2)
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains("file-host"))
         .stderr(predicate::str::contains("from_file"));
@@ -92,9 +83,9 @@ fn config_precedence_layers_end_to_end() {
     auditstream_cmd()
         .current_dir(dir.path())
         .env("DATABASE_URL", "postgres://dbenv:pw@dbenv-host/db")
-        .args(["-vv", "export"])
+        .args(SHOW_CONFIG)
         .assert()
-        .code(5)
+        .code(2)
         .stderr(predicate::str::contains("dbenv-host"));
 
     // 3. AUDITSTREAM_DATABASE_URL and AUDITSTREAM_SCHEMA override DATABASE_URL and file
@@ -106,9 +97,9 @@ fn config_precedence_layers_end_to_end() {
             "postgres://asenv:pw@asenv-host/db",
         )
         .env("AUDITSTREAM_SCHEMA", "from_env")
-        .args(["-vv", "export"])
+        .args(SHOW_CONFIG)
         .assert()
-        .code(5)
+        .code(2)
         .stderr(predicate::str::contains("asenv-host"))
         .stderr(predicate::str::contains("from_env"));
 
@@ -125,11 +116,10 @@ fn config_precedence_layers_end_to_end() {
             "postgres://flag:pw@flag-host/db",
             "--schema",
             "from_flag",
-            "-vv",
-            "export",
         ])
+        .args(SHOW_CONFIG)
         .assert()
-        .code(5)
+        .code(2)
         .stderr(predicate::str::contains("flag-host"))
         .stderr(predicate::str::contains("from_flag"));
 }
@@ -143,9 +133,9 @@ fn auditstream_config_env_selects_config_file() {
     auditstream_cmd()
         .current_dir(dir.path())
         .env("AUDITSTREAM_CONFIG", custom.to_str().unwrap())
-        .args(["-vv", "export"])
+        .args(SHOW_CONFIG)
         .assert()
-        .code(5)
+        .code(2)
         .stderr(predicate::str::contains("via_env_config"));
 }
 
@@ -167,9 +157,9 @@ fn database_password_never_appears_in_help_logs_or_errors() {
     auditstream_cmd()
         .current_dir(dir.path())
         .env("AUDITSTREAM_DATABASE_URL", &url)
-        .args(["-vv", "export"])
+        .args(SHOW_CONFIG)
         .assert()
-        .code(5)
+        .code(2)
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains(secret).not())
         .stderr(predicate::str::contains(

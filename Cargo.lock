@@ -186,6 +186,7 @@ dependencies = [
  "auditstream-pg",
  "auditstream-testkit",
  "clap",
+ "csv",
  "insta",
  "insta-cmd",
  "jsonschema",

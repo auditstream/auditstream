@@ -5,10 +5,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
+use auditstream_export::SinkConfig;
 use clap::ValueEnum;
 use serde::Deserialize;
 
 use crate::cli::{Cli, Command};
+use crate::commands::export::Format;
 use crate::exit::{Exit, ExitCodeExt};
 
 /// Default Postgres schema name for Auditstream objects.
@@ -134,10 +136,8 @@ pub(crate) struct ExportConfig {
     pub(crate) cursor_file: Option<PathBuf>,
     /// Maximum number of events per batch.
     pub(crate) batch_size: usize,
-    /// Sink format name (placeholder until C2's `SinkConfig` lands in F5).
-    pub(crate) format: Option<String>,
-    /// Output path (defaults to stdout when `None`).
-    pub(crate) output: Option<PathBuf>,
+    /// Built-in sink format and optional output path (defaults to JSON Lines on stdout).
+    pub(crate) sink: SinkConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -174,7 +174,7 @@ struct MigrationsFileConfig {
 struct ExportFileConfig {
     cursor_file: Option<PathBuf>,
     batch_size: Option<usize>,
-    sink: Option<toml::Value>,
+    sink: Option<SinkConfig>,
 }
 
 impl Config {
@@ -220,14 +220,7 @@ impl Config {
         let mut export = ExportConfig {
             cursor_file: file.export.cursor_file,
             batch_size: file.export.batch_size.unwrap_or(DEFAULT_BATCH_SIZE),
-            format: file
-                .export
-                .sink
-                .as_ref()
-                .and_then(|val| val.get("type"))
-                .and_then(toml::Value::as_str)
-                .map(str::to_owned),
-            output: None,
+            sink: file.export.sink.unwrap_or(SinkConfig::Jsonl { path: None }),
         };
 
         match &cli.command {
@@ -252,12 +245,15 @@ impl Config {
                 if let Some(batch_size) = args.batch_size {
                     export.batch_size = batch_size;
                 }
-                if let Some(format) = &args.format {
-                    export.format = Some(format.clone());
-                }
-                if let Some(output) = &args.output {
-                    export.output = Some(output.clone());
-                }
+                let (format, path) = match export.sink {
+                    SinkConfig::Jsonl { path } => (Format::Jsonl, path),
+                    SinkConfig::Csv { path } => (Format::Csv, path),
+                };
+                let path = args.output.clone().or(path);
+                export.sink = match args.format.unwrap_or(format) {
+                    Format::Jsonl => SinkConfig::Jsonl { path },
+                    Format::Csv => SinkConfig::Csv { path },
+                };
             }
             Command::Status(_) | Command::Verify(_) | Command::History(_) => {}
         }
@@ -308,6 +304,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    use auditstream_export::SinkConfig;
     use clap::Parser;
     use tempfile::tempdir;
 
@@ -329,6 +326,7 @@ mod tests {
         assert_eq!(cfg.migrations.dir, None);
         assert_eq!(cfg.export.cursor_file, None);
         assert_eq!(cfg.export.batch_size, DEFAULT_BATCH_SIZE);
+        assert_eq!(cfg.export.sink, SinkConfig::Jsonl { path: None });
     }
 
     #[test]
@@ -468,6 +466,55 @@ batch_size = 250
         let err = Config::load_with_fallback_env(&cli, dir.path(), None).unwrap_err();
         assert_eq!(exit_code_for(&err), Exit::Usage);
         assert!(err.to_string().contains("missing.toml"));
+    }
+
+    #[test]
+    fn export_sink_overrides_preserve_other_fields() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("auditstream.toml"),
+            "[export.sink]\ntype = \"csv\"\npath = \"events.csv\"\n",
+        )
+        .unwrap();
+        for (args, expected) in [
+            (
+                ["--format", "jsonl"],
+                SinkConfig::Jsonl {
+                    path: Some("events.csv".into()),
+                },
+            ),
+            (
+                ["--output", "override.csv"],
+                SinkConfig::Csv {
+                    path: Some("override.csv".into()),
+                },
+            ),
+        ] {
+            let cli =
+                Cli::try_parse_from(["auditstream", "export"].into_iter().chain(args)).unwrap();
+            let cfg = Config::load_with_fallback_env(&cli, dir.path(), None).unwrap();
+            assert_eq!(cfg.export.sink, expected);
+        }
+    }
+
+    #[test]
+    fn invalid_export_sink_is_a_usage_error() {
+        let dir = tempdir().unwrap();
+        for (sink, invalid) in [
+            ("type = \"parquet\"", "parquet"),
+            ("type = \"jsonl\"\ncompression = \"gzip\"", "compression"),
+            ("type = \"csv\"\npath = 42", "path"),
+        ] {
+            fs::write(
+                dir.path().join("auditstream.toml"),
+                format!("[export.sink]\n{sink}\n"),
+            )
+            .unwrap();
+            let cli = Cli::try_parse_from(["auditstream", "export"]).unwrap();
+            let err = Config::load_with_fallback_env(&cli, dir.path(), None).unwrap_err();
+            assert_eq!(exit_code_for(&err), Exit::Usage);
+            assert!(err.to_string().contains(invalid), "{err}");
+        }
     }
 
     #[test]

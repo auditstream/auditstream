@@ -29,7 +29,7 @@ Values resolve in strict order (first non-empty source wins):
 | `migrations.dir` | path | per format | `init --out` | none |
 | `export.cursor_file` | path | none | `export --cursor-file` | none |
 | `export.batch_size` | integer | `1000` | `export --batch-size` | none |
-| `export.sink` | sink table (`SinkConfig`) | JSON Lines on stdout | `export --format`, `--output` | none |
+| `export.sink` | table with `type` (`jsonl` or `csv`) and optional `path` | JSON Lines on stdout | `export --format` overrides `type` and `--output` overrides `path` | none |
 
 ## Example
 
