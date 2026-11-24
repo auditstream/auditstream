@@ -1,0 +1,14 @@
+---
+source: crates/auditstream/tests/it/e2e.rs
+info:
+  program: auditstream
+  args:
+    - verify
+---
+success: false
+exit_code: 1
+----- stdout -----
+[error] public.invoice  disabled  trigger `auditstream_update` on `public.invoice` is disabled (`tgenabled = 'D'`) — hint: Re-enable `public.invoice.auditstream_update` or re-apply the Auditstream migration.
+
+----- stderr -----
+error: verification failed with 1 finding(s)

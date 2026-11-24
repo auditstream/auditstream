@@ -1,0 +1,14 @@
+---
+source: crates/auditstream/tests/it/e2e.rs
+info:
+  program: auditstream
+  args:
+    - verify
+---
+success: false
+exit_code: 1
+----- stdout -----
+[error] public.invoice  missing  trigger `auditstream_delete` (AFTER DELETE) is missing on `public.invoice` — hint: Run `auditstream init` and apply the generated migration.
+
+----- stderr -----
+error: verification failed with 1 finding(s)
