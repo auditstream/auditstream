@@ -3,7 +3,9 @@ all-features = false
 
 [advisories]
 version = 2
-ignore = []
+ignore = [
+  { id = "RUSTSEC-2026-0440", reason = "astral-tokio-tar is unmaintained via testcontainers 0.28 in unpublished auditstream-testkit; remove once testcontainers migrates" },
+]
 
 [licenses]
 version = 2
@@ -22,7 +24,7 @@ multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = true
 deny = [
-  { crate = "sqlx", wrappers = ["auditstream-pg"] },
+  { crate = "sqlx", wrappers = ["auditstream-pg", "auditstream-testkit"] },
 ]
 
 [sources]
