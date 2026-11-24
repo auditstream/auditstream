@@ -1,0 +1,47 @@
+[changelog]
+header = """
+# Changelog
+
+All notable changes to Auditstream are documented in this file.
+"""
+body = """
+{%- if version %}
+## [{{ version | trim_start_matches(pat="auditstream-v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{%- else %}
+## [Unreleased]
+{%- endif %}
+{%- set breaking_commits = commits | filter(attribute="breaking", value=true) -%}
+{%- if breaking_commits | length > 0 %}
+
+### Breaking Changes
+{%- for commit in breaking_commits %}
+- {% if commit.scope %}**({{ commit.scope }})** {% endif %}{{ commit.message | split(pat="\n") | first | trim }}
+{%- endfor %}
+{%- endif %}
+{%- for group, commits in commits | filter(attribute="breaking", value=false) | group_by(attribute="group") %}
+
+### {{ group | striptags | trim }}
+{%- for commit in commits %}
+- {% if commit.scope %}**({{ commit.scope }})** {% endif %}{{ commit.message | split(pat="\n") | first | trim }}
+{%- endfor %}
+{%- endfor %}
+"""
+footer = "\n"
+trim = false
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+split_commits = false
+protect_breaking_commits = true
+filter_commits = true
+tag_pattern = "auditstream-v[0-9].*"
+commit_parsers = [
+  { message = "^feat", group = "<!-- 1 -->Features" },
+  { message = "^fix", group = "<!-- 2 -->Bug Fixes" },
+  { message = "^perf", group = "<!-- 3 -->Performance" },
+  { message = "^refactor", group = "<!-- 4 -->Refactors" },
+  { message = "^docs", group = "<!-- 5 -->Documentation" },
+  { message = "^revert", group = "<!-- 6 -->Reverts" },
+  { message = "^(ci|chore|test|build|style)", skip = true },
+]
