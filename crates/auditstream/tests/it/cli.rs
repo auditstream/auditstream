@@ -18,15 +18,13 @@ fn help_output_matches_snapshot() {
 #[test]
 fn all_subcommand_stubs_exit_5_with_stderr_only() {
     let dir = tempdir().unwrap();
-    for sub in ["history", "export"] {
-        auditstream_cmd()
-            .current_dir(dir.path())
-            .args(["-vv", sub])
-            .assert()
-            .code(5)
-            .stdout(predicate::str::is_empty())
-            .stderr(predicate::str::contains("not implemented yet"));
-    }
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .args(["-vv", "export"])
+        .assert()
+        .code(5)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("not implemented yet"));
 }
 
 #[test]

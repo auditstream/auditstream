@@ -1,0 +1,19 @@
+---
+source: crates/auditstream/tests/it/history.rs
+info:
+  program: auditstream
+  args:
+    - history
+---
+success: true
+exit_code: 0
+----- stdout -----
+OCCURRED_AT                  OP                TABLE             RECORD_ID                     ACTOR                          ACTOR_SOURCE  CHANGED
+2026-06-16T00:00:00.000000Z  invoice.exported  -                 -                             user:usr_2                     set_config    -
+2026-06-15T18:30:00.000000Z  INSERT            public.line_item  {"seq":3,"tenant_id":"acme"}  service:sync_1                 jwt           -
+2026-06-15T12:00:00.000000Z  INSERT            public.line_item  {"seq":2,"tenant_id":"acme"}  -                              -             -
+2026-06-15T12:00:00.000000Z  INSERT            public.invoice    {"id":"1"}                    api_key:key_9                  set_config    -
+2026-06-15T00:00:00.000000Z  UPDATE            public.invoice    {"id":1}                      ai_agent:bot_7 for user:usr_1  comment       amount,status
+2026-06-14T23:59:59.000000Z  INSERT            public.invoice    {"id":1}                      user:usr_1                     set_config    -
+
+----- stderr -----
