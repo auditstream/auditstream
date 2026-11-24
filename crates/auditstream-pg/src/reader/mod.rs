@@ -41,18 +41,34 @@ pub const DEFAULT_LOOKUP_LIMIT: i64 = 50;
 /// Maximum row limit accepted by [`lookup`].
 pub const MAX_LOOKUP_LIMIT: i64 = 1000;
 
+/// Record-ID filter mode for point-in-time lookups (`auditstream history --record-id`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordIdFilter {
+    /// Exact JSONB equality (`record_id = $1::jsonb`).
+    Exact(String),
+    /// Scalar value matching any single-key JSONB `record_id` object whose sole value equals
+    /// `$1::jsonb` (preserving JSONB type distinction between e.g. `1` and `"1"`).
+    Scalar(String),
+    /// JSONB object containment (`record_id @> $1::jsonb`), supporting partial or full composite keys.
+    Contains(String),
+}
+
 /// Optional filters applied when reading batches from [`PgEventSource`].
 ///
 /// Filtered-out rows inside a drained `xid8` snapshot window still advance the returned
 /// [`Cursor`] so callers (such as `auditstream export`) can persist progress past skipped rows.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ExportFilter {
-    /// Inclusive lower bound on `occurred_at`.
+    /// Inclusive lower bound on `occurred_at` (`occurred_at >= from`).
     pub from: Option<OffsetDateTime>,
-    /// Inclusive upper bound on `occurred_at`.
+    /// Inclusive upper bound on `occurred_at` (`occurred_at <= to`).
     pub to: Option<OffsetDateTime>,
-    /// Filter matching `actor->>'id'`.
+    /// Exclusive upper bound on `occurred_at` (`occurred_at < until`, used by CLI `--until`).
+    pub until: Option<OffsetDateTime>,
+    /// Filter matching `actor->>'id'` only.
     pub actor_id: Option<String>,
+    /// Filter matching `actor->>'id'` OR `actor->'onBehalfOf'->>'id'` (used by CLI `--actor`).
+    pub actor_or_on_behalf_of: Option<String>,
     /// Filter matching `source` (`db` or `app`).
     pub source: Option<Source>,
 }
@@ -66,12 +82,18 @@ pub struct HistoryQuery {
     pub schema_name: Option<String>,
     /// Optional primary key JSON object (`record_id = $param::jsonb`).
     pub record_id: Option<String>,
-    /// Optional actor identifier (`actor->>'id'`).
+    /// Optional flexible `record_id` filter supporting scalar single-key and `@>` containment.
+    pub record_id_filter: Option<RecordIdFilter>,
+    /// Optional actor identifier (`actor->>'id'` only).
     pub actor_id: Option<String>,
-    /// Inclusive lower bound on `occurred_at`.
+    /// Optional actor identifier matching `actor->>'id'` OR `actor->'onBehalfOf'->>'id'`.
+    pub actor_or_on_behalf_of: Option<String>,
+    /// Inclusive lower bound on `occurred_at` (`occurred_at >= from`).
     pub from: Option<OffsetDateTime>,
-    /// Inclusive upper bound on `occurred_at`.
+    /// Inclusive upper bound on `occurred_at` (`occurred_at <= to`).
     pub to: Option<OffsetDateTime>,
+    /// Exclusive upper bound on `occurred_at` (`occurred_at < until`, used by CLI `--until`).
+    pub until: Option<OffsetDateTime>,
     /// Optional source filter (`db` or `app`).
     pub source: Option<Source>,
     /// Maximum number of rows to return (clamped to `1..=1000`, defaulting to `50`).
@@ -84,9 +106,12 @@ impl Default for HistoryQuery {
             table: None,
             schema_name: None,
             record_id: None,
+            record_id_filter: None,
             actor_id: None,
+            actor_or_on_behalf_of: None,
             from: None,
             to: None,
+            until: None,
             source: None,
             limit: DEFAULT_LOOKUP_LIMIT,
         }
@@ -215,9 +240,21 @@ impl PgEventSource {
             qb.push_bind(format_rfc3339_utc(to));
             qb.push("::timestamptz");
         }
+        if let Some(until) = self.filter.until {
+            qb.push(" AND occurred_at < ");
+            qb.push_bind(format_rfc3339_utc(until));
+            qb.push("::timestamptz");
+        }
         if let Some(ref actor_id) = self.filter.actor_id {
             qb.push(" AND actor->>'id' = ");
             qb.push_bind(actor_id.clone());
+        }
+        if let Some(ref actor_any) = self.filter.actor_or_on_behalf_of {
+            qb.push(" AND (actor->>'id' = ");
+            qb.push_bind(actor_any.clone());
+            qb.push(" OR actor->'onBehalfOf'->>'id' = ");
+            qb.push_bind(actor_any.clone());
+            qb.push(")");
         }
         if let Some(source) = self.filter.source {
             qb.push(" AND source = ");
@@ -356,9 +393,39 @@ pub async fn lookup(
         qb.push_bind(record_id.clone());
         qb.push("::jsonb");
     }
+    if let Some(ref filter) = query.record_id_filter {
+        match filter {
+            RecordIdFilter::Exact(json) => {
+                qb.push(" AND record_id = ");
+                qb.push_bind(json.clone());
+                qb.push("::jsonb");
+            }
+            RecordIdFilter::Contains(json_obj) => {
+                qb.push(" AND record_id @> ");
+                qb.push_bind(json_obj.clone());
+                qb.push("::jsonb");
+            }
+            RecordIdFilter::Scalar(json_scalar) => {
+                qb.push(
+                    " AND pg_catalog.jsonb_typeof(record_id) = 'object' \
+                      AND (SELECT count(*) FROM pg_catalog.jsonb_object_keys(record_id)) = 1 \
+                      AND EXISTS (SELECT 1 FROM pg_catalog.jsonb_each(record_id) AS e(k, v) WHERE e.v = ",
+                );
+                qb.push_bind(json_scalar.clone());
+                qb.push("::jsonb)");
+            }
+        }
+    }
     if let Some(ref actor_id) = query.actor_id {
         qb.push(" AND actor->>'id' = ");
         qb.push_bind(actor_id.clone());
+    }
+    if let Some(ref actor_any) = query.actor_or_on_behalf_of {
+        qb.push(" AND (actor->>'id' = ");
+        qb.push_bind(actor_any.clone());
+        qb.push(" OR actor->'onBehalfOf'->>'id' = ");
+        qb.push_bind(actor_any.clone());
+        qb.push(")");
     }
     if let Some(from) = query.from {
         qb.push(" AND occurred_at >= ");
@@ -368,6 +435,11 @@ pub async fn lookup(
     if let Some(to) = query.to {
         qb.push(" AND occurred_at <= ");
         qb.push_bind(format_rfc3339_utc(to));
+        qb.push("::timestamptz");
+    }
+    if let Some(until) = query.until {
+        qb.push(" AND occurred_at < ");
+        qb.push_bind(format_rfc3339_utc(until));
         qb.push("::timestamptz");
     }
     if let Some(source) = query.source {

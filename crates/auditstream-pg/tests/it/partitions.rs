@@ -274,3 +274,76 @@ async fn lock_timeout_returns_retryable_error_and_leaves_no_partial_partition() 
         .expect("coverage after rollback");
     assert_eq!(cov.monthly_partitions.len(), 4);
 }
+
+#[tokio::test]
+async fn history_stats_reports_missing_clean_contiguous_gap_and_default_rows() {
+    let db = TestDb::new().await.expect("create TestDb");
+
+    // 1. Before install: exists = false and zeroed stats.
+    let missing = partitions::history_stats(db.pool(), DEFAULT_SCHEMA)
+        .await
+        .expect("history_stats before install");
+    assert!(!missing.exists);
+    assert_eq!(missing.current_month, None);
+    assert_eq!(missing.monthly_partitions, Vec::<YearMonth>::new());
+    assert_eq!(missing.months_covered_ahead, 0);
+    assert!(!missing.default_has_rows);
+    assert_eq!(missing.estimated_rows, 0);
+    assert_eq!(missing.total_size_bytes, 0);
+
+    // 2. Fresh install: 4 monthly partitions (0..=3 => 3 contiguous months ahead), empty default.
+    install_ddl(&db).await;
+    let fresh = partitions::history_stats(db.pool(), DEFAULT_SCHEMA)
+        .await
+        .expect("history_stats fresh");
+    assert!(fresh.exists);
+    let current = fresh.current_month.expect("current_month present");
+    assert_eq!(fresh.monthly_partitions.len(), 4);
+    assert_eq!(fresh.months_covered_ahead, 3);
+    assert!(!fresh.default_has_rows);
+
+    // 3. Seed rows into month +4 (routing to changes_default), then create month +5 via ensure_ahead.
+    //    Monthly partitions will be [0, 1, 2, 3, 5], so contiguous months_covered_ahead must remain 3!
+    let target = target_months_from(current, 5);
+    let (month4_start, _) = target[4].utc_bounds();
+    sqlx::query(
+        "INSERT INTO auditstream.changes (occurred_at, source, op, db_user, schema_version) \
+         VALUES \
+           ($1::timestamptz + interval '1 day', 'app', 'gap.one', 'postgres', 1), \
+           ($1::timestamptz + interval '2 days', 'app', 'gap.two', 'postgres', 1)",
+    )
+    .bind(&month4_start)
+    .execute(db.pool())
+    .await
+    .expect("seed default rows in month +4");
+
+    let report = partitions::ensure_ahead(db.pool(), DEFAULT_SCHEMA, 5)
+        .await
+        .expect("ensure_ahead with gap");
+    assert_eq!(report.created, vec![target[5]]);
+
+    db.execute("ANALYZE auditstream.changes")
+        .await
+        .expect("analyze auditstream.changes");
+
+    let after = partitions::history_stats(db.pool(), DEFAULT_SCHEMA)
+        .await
+        .expect("history_stats after gap");
+    assert!(after.exists);
+    assert_eq!(after.monthly_partitions.len(), 5);
+    assert_eq!(
+        after.months_covered_ahead, 3,
+        "contiguous coverage ahead must stop at the missing month +4 gap"
+    );
+    assert!(after.default_has_rows);
+    assert!(
+        after.estimated_rows >= 2,
+        "expected catalog estimate >= 2 after ANALYZE, got {}",
+        after.estimated_rows
+    );
+    assert!(
+        after.total_size_bytes > 0,
+        "expected positive total_size_bytes, got {}",
+        after.total_size_bytes
+    );
+}

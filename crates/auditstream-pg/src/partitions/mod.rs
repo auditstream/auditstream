@@ -478,6 +478,141 @@ async fn fetch_existing_monthly_partitions(
     Ok(names)
 }
 
+/// Cheap catalog-only summary of `{schema}.changes` for `auditstream status` and `verify`.
+///
+/// Never runs `count(*)` over monthly partitions; uses `pg_class.reltuples`,
+/// `pg_total_relation_size()`, and `EXISTS (... LIMIT 1)` on `changes_default`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryTableStats {
+    /// Whether `{schema}.changes` exists in `pg_catalog.pg_class`.
+    pub exists: bool,
+    /// Current UTC calendar month according to PostgreSQL `now() AT TIME ZONE 'UTC'`.
+    pub current_month: Option<YearMonth>,
+    /// Existing monthly partitions (`changes_YYYY_MM`) sorted chronologically.
+    pub monthly_partitions: Vec<YearMonth>,
+    /// Count of contiguous monthly partitions present strictly after `current_month`.
+    pub months_covered_ahead: u32,
+    /// Whether `{schema}.changes_default` exists and holds at least one row.
+    pub default_has_rows: bool,
+    /// Catalog row estimate summed across all child partitions (`GREATEST(reltuples, 0)`).
+    pub estimated_rows: i64,
+    /// Total relation size (heap + indexes + TOAST) in bytes summed across all child partitions.
+    pub total_size_bytes: i64,
+}
+
+#[derive(Debug, FromRow)]
+struct HistoryChildStatRow {
+    relname: String,
+    est_rows: i64,
+    total_bytes: i64,
+}
+
+/// Inspects `{schema}.changes` cheaply using PostgreSQL system catalogs (never scanning
+/// monthly partitions with `count(*)`).
+///
+/// # Errors
+///
+/// Returns [`PartitionError::Database`] if querying PostgreSQL fails.
+pub async fn history_stats(
+    pool: &PgPool,
+    schema: &str,
+) -> Result<HistoryTableStats, PartitionError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+
+    let parent_oid: Option<i64> = sqlx::query_scalar(
+        "SELECT c.oid::bigint \
+           FROM pg_catalog.pg_class c \
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+          WHERE n.nspname = $1 \
+            AND c.relname = 'changes' \
+            AND c.relkind IN ('r', 'p')",
+    )
+    .bind(schema)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if parent_oid.is_none() {
+        tx.commit().await?;
+        return Ok(HistoryTableStats {
+            exists: false,
+            current_month: None,
+            monthly_partitions: Vec::new(),
+            months_covered_ahead: 0,
+            default_has_rows: false,
+            estimated_rows: 0,
+            total_size_bytes: 0,
+        });
+    }
+
+    let current_month = fetch_db_utc_month(&mut tx).await?;
+    let children: Vec<HistoryChildStatRow> = sqlx::query_as(
+        "SELECT \
+           child.relname, \
+           GREATEST(child.reltuples::bigint, 0) AS est_rows, \
+           pg_catalog.pg_total_relation_size(child.oid)::bigint AS total_bytes \
+         FROM pg_catalog.pg_inherits i \
+         JOIN pg_catalog.pg_class parent ON parent.oid = i.inhparent \
+         JOIN pg_catalog.pg_namespace pn ON pn.oid = parent.relnamespace \
+         JOIN pg_catalog.pg_class child ON child.oid = i.inhrelid \
+        WHERE pn.nspname = $1 \
+          AND parent.relname = 'changes' \
+        ORDER BY child.relname ASC",
+    )
+    .bind(schema)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut monthly_partitions = Vec::new();
+    let mut has_default_table = false;
+    let mut estimated_rows: i64 = 0;
+    let mut total_size_bytes: i64 = 0;
+
+    for child in &children {
+        estimated_rows = estimated_rows.saturating_add(child.est_rows);
+        total_size_bytes = total_size_bytes.saturating_add(child.total_bytes);
+        if child.relname == "changes_default" {
+            has_default_table = true;
+        } else if let Some(ym) = YearMonth::parse_partition_name(&child.relname) {
+            monthly_partitions.push(ym);
+        }
+    }
+    monthly_partitions.sort();
+    monthly_partitions.dedup();
+
+    let present_set: HashSet<YearMonth> = monthly_partitions.iter().copied().collect();
+    let mut months_covered_ahead: u32 = 0;
+    let mut probe = current_month.next();
+    while present_set.contains(&probe) {
+        months_covered_ahead = months_covered_ahead.saturating_add(1);
+        probe = probe.next();
+    }
+
+    let default_has_rows = if has_default_table {
+        let schema_q = quote_ident(schema);
+        let sql = format!("SELECT EXISTS (SELECT 1 FROM ONLY {schema_q}.changes_default LIMIT 1)");
+        sqlx::query_scalar(AssertSqlSafe(sql))
+            .fetch_one(&mut *tx)
+            .await?
+    } else {
+        false
+    };
+
+    tx.commit().await?;
+
+    Ok(HistoryTableStats {
+        exists: true,
+        current_month: Some(current_month),
+        monthly_partitions,
+        months_covered_ahead,
+        default_has_rows,
+        estimated_rows,
+        total_size_bytes,
+    })
+}
+
 async fn count_default_rows_in_range(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     schema: &str,

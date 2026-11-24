@@ -238,6 +238,82 @@ impl TestDb {
     pub fn role_name(&self) -> Option<&str> {
         self.role_name.as_deref()
     }
+
+    /// Executes a single SQL statement against this test database.
+    ///
+    /// Provided so downstream integration tests (such as `crates/auditstream`) can prepare
+    /// fixtures without adding a direct `sqlx` dependency.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Sqlx`] if statement execution fails.
+    pub async fn execute(&self, sql: &str) -> Result<(), Error> {
+        self.pool.execute(AssertSqlSafe(sql)).await?;
+        Ok(())
+    }
+
+    /// Executes a multi-statement SQL script (for example a Prisma or plain-SQL migration file)
+    /// against this test database using the PostgreSQL simple query protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Sqlx`] if any statement in the script fails.
+    pub async fn execute_batch(&self, sql: &str) -> Result<(), Error> {
+        sqlx::raw_sql(AssertSqlSafe(sql))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Executes an ordered sequence of single SQL statements sequentially on one connection
+    /// (preserving session-local settings such as `auditstream._granted_self` across statements).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Sqlx`] if acquiring a connection or executing any statement fails.
+    pub async fn execute_statements(&self, stmts: &[String]) -> Result<(), Error> {
+        let mut conn = self.pool.acquire().await?;
+        for stmt in stmts {
+            conn.execute(AssertSqlSafe(stmt.as_str())).await?;
+        }
+        Ok(())
+    }
+
+    /// Executes a scalar SQL query returning a single `BIGINT` (`i64`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Sqlx`] if the query fails or does not return one row.
+    pub async fn query_scalar_i64(&self, sql: &str) -> Result<i64, Error> {
+        let val: i64 = sqlx::query_scalar(AssertSqlSafe(sql))
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(val)
+    }
+
+    /// Executes a scalar SQL query returning a single `TEXT` (`String`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Sqlx`] if the query fails or does not return one row.
+    pub async fn query_scalar_string(&self, sql: &str) -> Result<String, Error> {
+        let val: String = sqlx::query_scalar(AssertSqlSafe(sql))
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(val)
+    }
+
+    /// Executes a single-column `TEXT` SQL query returning all rows in query order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Sqlx`] if the query fails.
+    pub async fn query_strings(&self, sql: &str) -> Result<Vec<String>, Error> {
+        let rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(sql))
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows)
+    }
 }
 
 impl Drop for TestDb {

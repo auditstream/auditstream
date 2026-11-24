@@ -142,6 +142,38 @@ pub enum WriteOutcome {
     },
 }
 
+/// Outcome of calling [`preview()`] (`--dry-run`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewOutcome {
+    /// New migration SQL that [`write()`] would emit, without modifying the filesystem.
+    Sql {
+        /// Rendered migration SQL text.
+        sql: String,
+        /// `(schema, table)` pairs whose Auditstream triggers would be dropped.
+        dropped_tables: Vec<(String, String)>,
+    },
+    /// The newest existing Auditstream migration already matches the requested selection.
+    UpToDate {
+        /// Path of the matching existing Auditstream migration SQL file.
+        existing: PathBuf,
+    },
+}
+
+/// Renders the migration SQL that [`write()`] would generate without creating directories or
+/// writing any files on disk.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Io`] on filesystem read errors or [`MigrationError::InvalidMetadata`]
+/// if an existing Drizzle `meta/_journal.json` or Auditstream manifest cannot be parsed.
+pub fn preview(options: &MigrationOptions) -> Result<PreviewOutcome, MigrationError> {
+    match options.format {
+        MigrationFormat::Prisma => prisma::preview(options),
+        MigrationFormat::Drizzle => drizzle::preview(options),
+        MigrationFormat::Sql => sql::preview(options),
+    }
+}
+
 /// Writes an Auditstream migration in the configured format (`prisma`, `drizzle`, or `sql`).
 ///
 /// - Composes D2 history schema DDL and D3 capture triggers, keeping D2's temporary
