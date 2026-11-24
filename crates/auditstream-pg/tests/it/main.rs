@@ -3,6 +3,7 @@
 mod ddl;
 mod introspect;
 mod migrations;
+mod partitions;
 mod reader;
 mod triggers;
 mod verify;
