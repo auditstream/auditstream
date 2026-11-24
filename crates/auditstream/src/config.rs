@@ -97,7 +97,6 @@ pub(crate) struct Config {
     /// Resolved configuration file path (`--config` / `AUDITSTREAM_CONFIG` or `./auditstream.toml`).
     pub(crate) file_path: PathBuf,
     /// Whether `-q` / `--quiet` was passed on the command line.
-    #[allow(dead_code)]
     pub(crate) quiet: bool,
     /// Postgres connection URL (password redacted in debug/logs).
     pub(crate) database_url: Option<RedactedUrl>,

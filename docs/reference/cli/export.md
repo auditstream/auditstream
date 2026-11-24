@@ -27,19 +27,19 @@ Flags override the configured sink type, path, cursor file, or batch size indivi
 
 Delivery is **at least once**. The reader advances through committed transaction IDs. An open transaction can postpone an event until a later run. Each batch is acknowledged after the sink flushes. Downstream consumers can deduplicate using `event_id`. See the [export specification](../../../spec/export.md).
 
-The cursor file is JSON. `cursor` contains the transaction ID `xact_id` and row `id`. `filters` records `since`, `until`, `actor`, and `source`, with `null` for unused filters. Omitted filters also mean no restriction. The `database` object stores the host or socket directory, port, and database name. The checkpoint also records the audit `schema`, the `sink` type and destination, and `output_len` in bytes for a regular file. Stdout and devices have no recoverable file length.
+The cursor file is JSON. `cursor` contains the transaction ID `xact_id` and row `id`. `filters` records `since`, `until`, `actor`, and `source`, with `null` for unused filters. Omitted filters also mean no restriction. The `database` object records the server-side PostgreSQL identity (`system_identifier` when permitted by role privileges, `name`, `oid`, and `history_table_oid`), so resuming works across equivalent endpoints (such as `localhost` vs `127.0.0.1`, PgBouncer, or failover) while rejecting a different or recreated database. The checkpoint also records the audit `schema`, the `sink` type and destination, and `output_len` in bytes for a regular file. Stdout and devices have no recoverable file length.
 
-Use one cursor and output file per export. Rows excluded by filters still advance the cursor, so resuming requires the same filters. On resume, the CLI trims any bytes beyond the last acknowledged length before appending. It refuses to extend a shortened file. Keep other writers off this output, since recovery discards anything appended after the checkpoint. For stdout, a downstream consumer may receive the last batch again after an interruption.
+Use one cursor and output file per export. Rows excluded by filters still advance the cursor, so resuming requires the same filters, format, and output path. On resume, the CLI trims any bytes beyond the last acknowledged length before appending. It refuses to extend a shortened file. Keep other writers off this output, since recovery discards anything appended after the checkpoint. For stdout, a downstream consumer may receive the last batch again after an interruption.
 
-A sidecar named `<cursor-file>.lock` stays in place between runs. The CLI holds its OS lock while exporting and replaces the cursor atomically. Closing the process releases the lock.
+A sidecar named `<cursor-file>.lock` (mode `0600` on Unix) stays in place between runs. The CLI holds its OS lock while exporting and replaces the cursor atomically. Closing the process releases the lock.
 
 ## Exit codes
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Export completed, or the consumer closed its stdout pipe. |
-| `2` | Invalid arguments, configuration, or incompatible checkpoint filters. |
+| `0` | Export completed, or the consumer closed its stdout pipe on a stateless export. |
+| `2` | Invalid arguments, configuration, or incompatible checkpoint filters, format, schema, database, or output path. |
 | `3` | PostgreSQL connection or read failure. |
-| `4` | Output or cursor I/O failure, including a held lock or incompatible output path. |
+| `4` | Output or cursor I/O failure, including a held lock, corrupt cursor, shortened output file, or a broken stdout pipe on a stateful (`--cursor-file`) export. |
 
 See the [exit code reference](../exit-codes.md) for the full table.
