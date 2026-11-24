@@ -356,11 +356,12 @@ async fn setup_runs_as_non_superuser_revokes_self_grant_and_fails_without_self_g
         let err = run_statements(&mut conn2, &without_self_grant)
             .await
             .expect_err("non-superuser setup without self-grant must fail");
-        assert!(
-            err.to_string().contains("must be a member of")
-                || err.to_string().contains("must be able to SET ROLE")
-                || err.to_string().contains("permission denied"),
-            "unexpected failure without self-grant: {err}"
+        assert_eq!(
+            err.as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("42501"),
+            "expected SQLSTATE 42501 without self-grant, got: {err}"
         );
         conn2.close().await.expect("close conn2");
     }
