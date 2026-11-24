@@ -6,7 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-Target release: `0.1.0` (unreleased until conformance fixtures are tagged in `#18`).
+## [0.1.0] - 2026-11-24
+
+Tag: `spec-v0.1.0` (`auditstream-spec-0.1.0.tar.gz`).
 
 ### Added
 
@@ -16,3 +18,4 @@ Target release: `0.1.0` (unreleased until conformance fixtures are tagged in `#1
 - Actor transport and precedence specification (`spec/transport.md`), including canonical JSON, unpadded base64url comments, transaction-local `set_config`, JWT fallback, and malformed-input handling.
 - History table, partitioning, trigger guarantees, `auditstream.log_event()`, security model, export cursor contract, and reference DDL (`spec/history-table.md`).
 - Export record format (`spec/export.md`, `spec/schemas/event.schema.json`) for JSON Lines and RFC 4180 CSV with valid/invalid examples and CSV fixture.
+- Language-neutral conformance fixture format (`spec/conformance/README.md`, `spec/conformance/fixture.schema.json`), transport fixtures (`encode.json`, `decode.json`, `precedence.json`), and capture fixtures (`kit-t1-t9.json`, `edge-tables.json`).
