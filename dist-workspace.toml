@@ -48,3 +48,7 @@ attestations = "write"
 contents = "read"
 id-token = "write"
 packages = "write"
+
+# Restrict publish-npm to OIDC id-token only (drops cargo-dist's default packages:write)
+[dist.github-custom-job-permissions.publish-npm]
+id-token = "write"
