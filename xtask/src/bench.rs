@@ -47,7 +47,7 @@ const INDEX_VARIANTS: [IndexVariant; 4] = [
     },
     IndexVariant {
         id: "current",
-        label: "Current: `(table_name, record_id, occurred_at)`",
+        label: "Legacy composite B-tree: `(table_name, record_id, occurred_at)`",
         create_sql: Some(
             "CREATE INDEX changes_lookup_idx ON auditstream.changes (table_name, record_id, occurred_at)",
         ),
@@ -61,7 +61,7 @@ const INDEX_VARIANTS: [IndexVariant; 4] = [
     },
     IndexVariant {
         id: "record_id_hash",
-        label: "Partial hash: `USING hash (record_id) WHERE record_id IS NOT NULL`",
+        label: "Default partial hash (ADR-0008): `USING hash (record_id) WHERE record_id IS NOT NULL`",
         create_sql: Some(
             "CREATE INDEX changes_lookup_idx ON auditstream.changes USING hash (record_id) WHERE record_id IS NOT NULL",
         ),

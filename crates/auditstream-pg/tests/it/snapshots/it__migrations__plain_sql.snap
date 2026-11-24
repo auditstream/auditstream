@@ -97,7 +97,7 @@ CREATE INDEX IF NOT EXISTS changes_occurred_at_brin_idx ON "auditstream".changes
 
 CREATE INDEX IF NOT EXISTS changes_xact_id_idx ON "auditstream".changes (xact_id, id);
 
-CREATE INDEX IF NOT EXISTS changes_lookup_idx ON "auditstream".changes (table_name, record_id, occurred_at);
+CREATE INDEX IF NOT EXISTS changes_lookup_idx ON "auditstream".changes USING hash (record_id) WHERE record_id IS NOT NULL;
 
 CREATE OR REPLACE FUNCTION "auditstream".log_event(
   action text,

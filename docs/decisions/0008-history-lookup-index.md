@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 date: 2026-11-24
 decision-makers: Gabriel Lobo, Cleisson
 ---
@@ -58,15 +58,15 @@ Measured across three fresh runs of `cargo xtask bench --quick` (`-M prepared -c
 
 ## Decision Outcome
 
-Recommended option: **Option 4 (`record_id_hash`) — `CREATE INDEX IF NOT EXISTS changes_lookup_idx ON <schema>.changes USING hash (record_id) WHERE record_id IS NOT NULL`**, because it cuts bulk-insert lookup-index maintenance cost by **65%** relative to `current` (`+7.5 ms` vs `+21.2 ms` per 10,000 rows, bringing 10k bulk insert down from `66.8 ms` to `53.1 ms`), avoids the concurrent B-tree hot-leaf contention measured on `table_occurred_at` (`62.9k` vs `56.0k` median tps on concurrent single-row updates), and accelerates the primary point-in-time record history query (`WHERE table_name = $1 AND record_id = $2::jsonb`) natively with no query rewrites.
+Chosen option: **Option 4 (`record_id_hash`) — `CREATE INDEX IF NOT EXISTS changes_lookup_idx ON <schema>.changes USING hash (record_id) WHERE record_id IS NOT NULL`**, because it cuts bulk-insert lookup-index maintenance cost by **65%** relative to `current` (`+7.5 ms` vs `+21.2 ms` per 10,000 rows, bringing 10k bulk insert down from `66.8 ms` to `53.1 ms`), avoids the concurrent B-tree hot-leaf contention measured on `table_occurred_at` (`62.9k` vs `56.0k` median tps on concurrent single-row updates), and accelerates the primary point-in-time record history query (`WHERE table_name = $1 AND record_id = $2::jsonb`) natively with no query rewrites.
 
-Why the other options were not recommended:
+Why the other options were not chosen:
 
 * **`none`** delivers the lowest write cost (`45.6 ms` bulk insert, `65.0k` tps single-row update), but forces every `auditstream history --table T --record-id K` lookup to scan an entire monthly partition.
 * **`current` (`(table_name, record_id, occurred_at)`)** carries the highest bulk-insert maintenance cost (`+21.2 ms` over `none`, nearly 3x `record_id_hash`) because every insert encodes and compares composite `(text, jsonb, timestamptz)` B-tree tuples across random `record_id` leaf pages.
 * **`table_occurred_at` (`(table_name, occurred_at DESC)`)** still cannot index `record_id` filters, costs more than `record_id_hash` on 10k bulk inserts (`57.2 ms` vs `53.1 ms`), and showed the worst concurrent single-row UPDATE contention (`56.0k` median tps, dropping to `53.4k` tps) because all concurrent writers on a hot table contend on the same leading `(table_name, newest occurred_at)` B-tree leaf page.
 
-Once maintainers accept this ADR, a follow-up PR will update `crates/auditstream-pg/src/ddl/mod.rs` and `spec/history-table.md` to adopt the accepted index definition.
+Adopted in `crates/auditstream-pg/src/ddl/mod.rs` (#92); `spec/history-table.md` already leaves secondary lookup index shapes to implementations and benchmarks.
 
 ### Consequences
 

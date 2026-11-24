@@ -40,6 +40,22 @@ fn generate_is_deterministic_contains_no_drops_and_matches_snapshot() {
     insta::assert_snapshot!("ddl_default_with_app_role", first.join(";\n\n"));
 }
 
+#[test]
+fn ddl_lookup_index_uses_adr0008_partial_hash() {
+    let stmts = ddl::generate(&DdlOptions::new(DEFAULT_SCHEMA, vec![]));
+    let expected = "CREATE INDEX IF NOT EXISTS changes_lookup_idx ON \"auditstream\".changes USING hash (record_id) WHERE record_id IS NOT NULL";
+    assert!(
+        stmts.iter().any(|s| s == expected),
+        "expected ADR-0008 partial hash lookup index statement:\n  {expected}\nfound:\n{}",
+        stmts
+            .iter()
+            .filter(|s| s.contains("changes_lookup_idx"))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn setup_runs_as_non_superuser_revokes_self_grant_and_fails_without_self_grant() {
@@ -186,18 +202,34 @@ async fn setup_runs_as_non_superuser_revokes_self_grant_and_fails_without_self_g
             );
         }
 
-        // Verify named indexes exist on auditstream.changes.
-        let indexes: Vec<String> = sqlx::query_scalar(
-            "SELECT indexname::text FROM pg_catalog.pg_indexes \
-             WHERE schemaname = 'auditstream' AND tablename = 'changes' \
-             ORDER BY indexname",
+        // Verify named indexes exist on auditstream.changes and changes_lookup_idx uses ADR-0008 partial hash.
+        let indexes: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT i.indexname::text, am.amname::text, i.indexdef::text \
+             FROM pg_catalog.pg_indexes i \
+             JOIN pg_catalog.pg_namespace n ON n.nspname = i.schemaname \
+             JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = i.indexname \
+             JOIN pg_catalog.pg_am am ON am.oid = c.relam \
+             WHERE i.schemaname = 'auditstream' AND i.tablename = 'changes' \
+             ORDER BY i.indexname",
         )
         .fetch_all(&mut conn)
         .await
         .expect("query indexes");
-        assert!(indexes.contains(&"changes_occurred_at_brin_idx".to_owned()));
-        assert!(indexes.contains(&"changes_xact_id_idx".to_owned()));
-        assert!(indexes.contains(&"changes_lookup_idx".to_owned()));
+        let index_names: Vec<&str> = indexes.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert!(index_names.contains(&"changes_occurred_at_brin_idx"));
+        assert!(index_names.contains(&"changes_xact_id_idx"));
+        let (_, lookup_am, lookup_def) = indexes
+            .iter()
+            .find(|(name, _, _)| name == "changes_lookup_idx")
+            .expect("changes_lookup_idx must exist");
+        assert_eq!(
+            lookup_am, "hash",
+            "changes_lookup_idx must use hash access method per ADR-0008, got {lookup_def}"
+        );
+        assert!(
+            lookup_def.contains("USING hash (record_id) WHERE (record_id IS NOT NULL)"),
+            "unexpected changes_lookup_idx definition: {lookup_def}"
+        );
 
         conn.close().await.expect("close migrator");
     }
