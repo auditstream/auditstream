@@ -286,10 +286,26 @@ jobs:
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
+  custom-publish-image:
+    needs:
+      - plan
+      - build-local-artifacts
+      - build-global-artifacts
+    uses: $/.github/workflows/publish-image.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
+    secrets: inherit
+    permissions:
+      "attestations": "write"
+      "contents": "read"
+      "id-token": "write"
+      "packages": "write"
+
   publish-homebrew-formula:
     needs:
       - plan
       - host
+      - custom-publish-image
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -336,6 +352,7 @@ jobs:
     needs:
       - plan
       - host
+      - custom-publish-image
     if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
     uses: $/.github/workflows/publish-npm.yml
     with:
@@ -352,6 +369,7 @@ jobs:
       - host
       - publish-homebrew-formula
       - custom-publish-npm
+      - custom-publish-image
     # use "always() && ..." to allow us to wait for all publish jobs while
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
@@ -364,17 +382,3 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
-
-  custom-publish-image:
-    needs:
-      - plan
-      - announce
-    uses: $/.github/workflows/publish-image.yml
-    with:
-      plan: ${{ needs.plan.outputs.val }}
-    secrets: inherit
-    permissions:
-      "attestations": "write"
-      "contents": "read"
-      "id-token": "write"
-      "packages": "write"
