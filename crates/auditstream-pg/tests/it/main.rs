@@ -6,5 +6,6 @@ mod introspect;
 mod migrations;
 mod partitions;
 mod reader;
+mod tls;
 mod triggers;
 mod verify;
