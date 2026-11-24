@@ -84,7 +84,8 @@ pub fn generate(options: &DdlOptions) -> Vec<String> {
     stmts.push(runtime_partitions_sql(&schema_lit, &owner_lit));
 
     // Named indexes: BRIN on occurred_at, B-tree on (xact_id, id) for export cursor reads
-    // (PostgreSQL 15-19 has no BRIN operator class for xid8), and the provisional lookup index.
+    // (PostgreSQL 15-19 has no BRIN operator class for xid8), and partial hash on record_id
+    // per ADR-0008 (`docs/decisions/0008-history-lookup-index.md`).
     stmts.push(format!(
         "CREATE INDEX IF NOT EXISTS changes_occurred_at_brin_idx ON {schema_q}.changes USING brin (occurred_at)"
     ));
@@ -92,7 +93,7 @@ pub fn generate(options: &DdlOptions) -> Vec<String> {
         "CREATE INDEX IF NOT EXISTS changes_xact_id_idx ON {schema_q}.changes (xact_id, id)"
     ));
     stmts.push(format!(
-        "CREATE INDEX IF NOT EXISTS changes_lookup_idx ON {schema_q}.changes (table_name, record_id, occurred_at)"
+        "CREATE INDEX IF NOT EXISTS changes_lookup_idx ON {schema_q}.changes USING hash (record_id) WHERE record_id IS NOT NULL"
     ));
 
     stmts.push(log_event_sql(&schema_q));
