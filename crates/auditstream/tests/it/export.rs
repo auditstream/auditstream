@@ -54,6 +54,14 @@ fn invalid_export_options_exit_usage_without_writing() {
         vec!["--since", "yesterday"],
         vec!["--until", "tomorrow"],
         vec!["--source", "invalid"],
+        vec!["--since", "2026-01-02", "--until", "2026-01-02"],
+        vec![
+            "--since",
+            "2026-01-03T00:00:00Z",
+            "--until",
+            "2026-01-02T00:00:00Z",
+        ],
+        vec!["--actor", ""],
     ] {
         auditstream_cmd()
             .current_dir(dir.path())
@@ -407,4 +415,348 @@ async fn foreign_database_and_failed_replay_preserve_cursor_and_output() {
             saved_output
         );
     }
+}
+
+#[tokio::test]
+async fn output_colliding_with_cursor_or_lock_exits_usage() {
+    let db = export_db().await;
+    let dir = tempdir().expect("tempdir");
+    for output in ["cursor.json", "cursor.json.lock"] {
+        auditstream_cmd()
+            .current_dir(dir.path())
+            .env("AUDITSTREAM_DATABASE_URL", db.url())
+            .args(["export", "--cursor-file", "cursor.json", "--output", output])
+            .assert()
+            .code(2)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::contains("--output"));
+        assert!(!dir.path().join("cursor.json").exists());
+    }
+}
+
+#[tokio::test]
+async fn failed_database_query_does_not_create_output_or_cursor_and_rejects_dir_output() {
+    let db = export_db().await;
+    let dir = tempdir().expect("tempdir");
+
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args([
+            "export",
+            "--schema",
+            "missing_schema",
+            "--cursor-file",
+            "cursor.json",
+            "--output",
+            "fresh.jsonl",
+        ])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("failed to query history batch"));
+    assert!(
+        !dir.path().join("fresh.jsonl").exists(),
+        "failed DB query must not create a stray empty output file"
+    );
+    assert!(
+        !dir.path().join("cursor.json").exists(),
+        "failed DB query must not create a cursor file"
+    );
+
+    let out_dir = dir.path().join("out_dir");
+    fs::create_dir(&out_dir).expect("create directory");
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["export", "--output", "out_dir"])
+        .assert()
+        .code(4)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("directory"));
+}
+
+#[tokio::test]
+async fn resume_rejects_mismatched_output_format_corrupt_cursor_and_shortened_output() {
+    let db = export_db().await;
+    seed_events(&db).await;
+    let dir = tempdir().expect("tempdir");
+    let args = ["--cursor-file", "cursor.json", "--output", "events.jsonl"];
+    export_file_until(&db, dir.path(), &args, 3).await;
+    let saved_cursor = fs::read(dir.path().join("cursor.json")).unwrap();
+    let saved_output = fs::read(dir.path().join("events.jsonl")).unwrap();
+
+    // Mismatched --output must exit 2 (Usage) without touching existing files or creating the new one.
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args([
+            "export",
+            "--cursor-file",
+            "cursor.json",
+            "--output",
+            "other.jsonl",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--output"))
+        .stderr(predicate::str::contains("--from-start"));
+    assert!(!dir.path().join("other.jsonl").exists());
+    assert_eq!(
+        fs::read(dir.path().join("cursor.json")).unwrap(),
+        saved_cursor
+    );
+    assert_eq!(
+        fs::read(dir.path().join("events.jsonl")).unwrap(),
+        saved_output
+    );
+
+    // Mismatched --format must exit 2 (Usage).
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args([
+            "export",
+            "--cursor-file",
+            "cursor.json",
+            "--output",
+            "events.jsonl",
+            "--format",
+            "csv",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--format"))
+        .stderr(predicate::str::contains("--from-start"));
+    assert_eq!(
+        fs::read(dir.path().join("cursor.json")).unwrap(),
+        saved_cursor
+    );
+    assert_eq!(
+        fs::read(dir.path().join("events.jsonl")).unwrap(),
+        saved_output
+    );
+
+    // Output shortened below acknowledged output_len must exit 4 (Io).
+    fs::write(
+        dir.path().join("events.jsonl"),
+        &saved_output[..saved_output.len() - 1],
+    )
+    .expect("truncate output");
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .arg("export")
+        .args(args)
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("shorter"));
+    assert_eq!(
+        fs::read(dir.path().join("cursor.json")).unwrap(),
+        saved_cursor
+    );
+    fs::write(dir.path().join("events.jsonl"), &saved_output).expect("restore output");
+
+    // Corrupt cursor JSON must exit 4 (Io) without modifying output.
+    fs::write(dir.path().join("cursor.json"), b"{corrupt-cursor").expect("corrupt cursor");
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .arg("export")
+        .args(args)
+        .assert()
+        .code(4);
+    assert_eq!(
+        fs::read(dir.path().join("events.jsonl")).unwrap(),
+        saved_output
+    );
+}
+
+#[tokio::test]
+async fn csv_cursor_resumes_and_recovers_partial_tail_with_single_header() {
+    let db = export_db().await;
+    seed_events(&db).await;
+    let dir = tempdir().expect("tempdir");
+    let args = [
+        "--format",
+        "csv",
+        "--cursor-file",
+        "cursor.json",
+        "--output",
+        "events.csv",
+        "--batch-size",
+        "1",
+    ];
+
+    let read_csv = |path: &Path| -> Vec<csv::StringRecord> {
+        let mut reader = csv::ReaderBuilder::new()
+            .flexible(false)
+            .from_path(path)
+            .expect("open CSV");
+        assert_eq!(reader.headers().expect("CSV headers").len(), 15);
+        reader
+            .records()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("strict CSV rows")
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        run_export(&db, dir.path(), &args);
+        if fs::metadata(dir.path().join("events.csv")).is_ok_and(|m| m.len() > 0)
+            && read_csv(&dir.path().join("events.csv")).len() == 3
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "CSV export timed out");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    OpenOptions::new()
+        .append(true)
+        .open(dir.path().join("events.csv"))
+        .unwrap()
+        .write_all(b"partial-row,\"unterminated")
+        .unwrap();
+    db.execute("INSERT INTO auditstream.changes (source, op) VALUES ('app', 'invoice.refunded')")
+        .await
+        .expect("insert 4th event");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let records = loop {
+        run_export(&db, dir.path(), &args);
+        let rows = read_csv(&dir.path().join("events.csv"));
+        if rows.len() == 4 {
+            break rows;
+        }
+        assert!(Instant::now() < deadline, "CSV resume timed out");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    let ids: BTreeSet<_> = records.iter().map(|r| r[0].to_owned()).collect();
+    assert_eq!(
+        ids.len(),
+        4,
+        "CSV recovery must yield 4 unique events under a single header"
+    );
+}
+
+#[tokio::test]
+async fn server_side_database_identity_handles_endpoint_aliases_and_rejects_recreated_table() {
+    let db = export_db().await;
+    seed_events(&db).await;
+    let dir = tempdir().expect("tempdir");
+    let args = ["--cursor-file", "cursor.json", "--output", "events.jsonl"];
+    export_file_until(&db, dir.path(), &args, 3).await;
+
+    let checkpoint: Value =
+        serde_json::from_slice(&fs::read(dir.path().join("cursor.json")).unwrap())
+            .expect("parse cursor JSON");
+    let db_meta = &checkpoint["database"];
+    assert!(
+        db_meta.get("host").is_none() && db_meta.get("port").is_none(),
+        "checkpoint database identity must not depend on client host/port: {db_meta}"
+    );
+    assert!(db_meta["oid"].as_u64().is_some());
+    let first_table_oid = db_meta["history_table_oid"]
+        .as_u64()
+        .expect("history_table_oid must be recorded");
+
+    // Resuming through an equivalent connection endpoint alias must succeed.
+    let alias_url = if db.url().contains("@127.0.0.1:") {
+        db.url().replace("@127.0.0.1:", "@localhost:")
+    } else if db.url().contains("@localhost:") {
+        db.url().replace("@localhost:", "@127.0.0.1:")
+    } else if db.url().contains('?') {
+        format!("{}&application_name=auditstream_alias", db.url())
+    } else {
+        format!("{}?application_name=auditstream_alias", db.url())
+    };
+    let alias_status = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", &alias_url)
+        .arg("export")
+        .args(args)
+        .output()
+        .expect("run export through endpoint alias");
+    assert!(
+        alias_status.status.success(),
+        "endpoint alias resume failed: {}",
+        String::from_utf8_lossy(&alias_status.stderr)
+    );
+
+    // Dropping and recreating the history table on the same database URL must invalidate the cursor.
+    {
+        let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+        db.execute("DROP SCHEMA auditstream CASCADE")
+            .await
+            .expect("drop audit schema");
+        db.execute_statements(&ddl::generate(&DdlOptions::new(DEFAULT_SCHEMA, vec![])))
+            .await
+            .expect("reinstall history schema");
+    }
+    db.execute("INSERT INTO auditstream.changes (source, op) VALUES ('app', 'post.recreate')")
+        .await
+        .expect("insert post-recreate event");
+
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .arg("export")
+        .args(args)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("database"))
+        .stderr(predicate::str::contains("--from-start"));
+
+    // Explicit --from-start replaces the saved history_table_oid cleanly.
+    let mut from_start = args.to_vec();
+    from_start.push("--from-start");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        run_export(&db, dir.path(), &from_start);
+        let updated: Value =
+            serde_json::from_slice(&fs::read(dir.path().join("cursor.json")).unwrap())
+                .expect("parse updated cursor");
+        if updated["database"]["history_table_oid"].as_u64() != Some(first_table_oid)
+            && json_events(&fs::read(dir.path().join("events.jsonl")).unwrap()).len() >= 4
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "recreated-table replay timed out"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn date_only_filters_use_utc_midnight_bounds() {
+    let db = export_db().await;
+    seed_events(&db).await;
+    db.execute(
+        "INSERT INTO auditstream.changes (occurred_at, source, op) VALUES \
+         ('2020-01-02T23:59:59Z', 'app', 'invoice.late')",
+    )
+    .await
+    .expect("seed late-day event");
+
+    let dir = tempdir().expect("tempdir");
+    let args = [
+        "--output",
+        "events.jsonl",
+        "--since",
+        "2020-01-02",
+        "--until",
+        "2020-01-03",
+    ];
+    let events = export_file_until(&db, dir.path(), &args, 2).await;
+    let ops: BTreeSet<_> = events
+        .iter()
+        .map(|e| e["op"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        ops,
+        BTreeSet::from(["invoice.paid".to_owned(), "invoice.late".to_owned()])
+    );
 }

@@ -1,13 +1,13 @@
 //! Export committed events and checkpoint each batch after its destination flushes.
 
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
-use auditstream_core::{Batch, Cursor, EventSource, SinkError, Source, SourceError};
+use auditstream_core::{Batch, Cursor, EventSource, Sink, SinkError, Source, SourceError};
 use auditstream_export::{AnySink, ExportError, Options, SinkConfig};
-use auditstream_pg::reader::{ExportFilter, PgEventSource};
+use auditstream_pg::reader::{self, DatabaseIdentity, ExportFilter, PgEventSource};
 use clap::{Args as ClapArgs, ValueEnum};
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
@@ -43,7 +43,7 @@ pub(crate) struct Args {
     filters: Filters,
 }
 
-#[derive(Debug, Clone, ClapArgs, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, ClapArgs, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Filters {
     /// Include events at or after this RFC 3339 timestamp or UTC date.
@@ -93,7 +93,7 @@ impl Filters {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Checkpoint {
     cursor: Cursor,
@@ -104,26 +104,24 @@ struct Checkpoint {
     output_len: Option<u64>,
 }
 
-#[derive(PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Database {
-    host: PathBuf,
-    port: u16,
+    #[serde(default)]
+    system_identifier: Option<String>,
     name: String,
+    oid: u32,
+    #[serde(default)]
+    history_table_oid: Option<u32>,
 }
 
-impl Database {
-    fn from_pool(pool: &auditstream_pg::PgPool) -> Self {
-        let options = pool.connect_options();
+impl From<DatabaseIdentity> for Database {
+    fn from(id: DatabaseIdentity) -> Self {
         Self {
-            host: options
-                .get_socket()
-                .cloned()
-                .unwrap_or_else(|| PathBuf::from(options.get_host())),
-            port: options.get_port(),
-            name: options
-                .get_database()
-                .unwrap_or_else(|| options.get_username())
-                .to_owned(),
+            system_identifier: id.system_identifier,
+            name: id.name,
+            oid: id.oid,
+            history_table_oid: id.history_table_oid,
         }
     }
 }
@@ -178,6 +176,10 @@ impl Checkpoint {
                 std::mem::discriminant(&self.sink) != std::mem::discriminant(&request.sink),
                 "--format",
             ),
+            (
+                sink_path(&self.sink) != sink_path(&request.sink),
+                "--output",
+            ),
         ] {
             if changed {
                 return Err(anyhow!(
@@ -186,18 +188,16 @@ impl Checkpoint {
                 .exit_code(Exit::Usage);
             }
         }
-        if sink_path(&self.sink) != sink_path(&request.sink) {
-            return Err(anyhow!("output path differs from the saved cursor")).exit_code(Exit::Io);
-        }
         Ok(())
     }
 
     fn measure_output(&mut self) -> io::Result<()> {
         self.output_len = match sink_path(&self.sink) {
-            Some(path) => {
-                let meta = path.metadata()?;
-                meta.is_file().then_some(meta.len())
-            }
+            Some(path) => match path.metadata() {
+                Ok(meta) => meta.is_file().then_some(meta.len()),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => Some(0),
+                Err(err) => return Err(err),
+            },
             None => None,
         };
         Ok(())
@@ -238,12 +238,18 @@ struct CursorFile {
 impl CursorFile {
     fn lock(path: &Path) -> anyhow::Result<Self> {
         let path = resolve_path(path)?;
-        let lock = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path.with_added_extension("lock"))?;
+        let lock_path = path.with_added_extension("lock");
+        if lock_path.is_symlink() {
+            return Err(anyhow!(
+                "refusing to follow symlink at cursor lock {}",
+                lock_path.display()
+            ));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let lock = options.open(&lock_path)?;
         lock.try_lock()
             .with_context(|| format!("cannot lock cursor {}", path.display()))?;
         Ok(Self { path, _lock: lock })
@@ -258,13 +264,14 @@ impl CursorFile {
     }
 
     fn save(&self, checkpoint: &Checkpoint) -> io::Result<()> {
+        let bytes = serde_json::to_vec(checkpoint)?;
         // Exclusive creation prevents following symlinks or overwriting files left by another process.
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let mut attempt = 0_u64;
-        let (temp, file) = loop {
+        let (temp, mut file) = loop {
             let temp = self
                 .path
                 .with_added_extension(format!("tmp.{}.{attempt}", std::process::id()));
@@ -274,7 +281,7 @@ impl CursorFile {
             }
         };
         let result = (|| {
-            serde_json::to_writer(&file, checkpoint)?;
+            file.write_all(&bytes)?;
             file.sync_all()?;
             drop(file);
             fs::rename(&temp, &self.path)
@@ -289,14 +296,17 @@ impl CursorFile {
     }
 }
 
-struct ExportSource {
-    reader: PgEventSource,
+struct ExportSource<S> {
+    reader: S,
     file: Option<CursorFile>,
     checkpoint: Checkpoint,
-    first_read: bool,
+    // Record the starting length of a regular output file before batch 1 writes, only when no
+    // prior checkpoint exists on disk. Replays (`--from-start`) keep the previous checkpoint
+    // intact until the first batch flushes and reaches `ack`.
+    save_initial: bool,
 }
 
-impl ExportSource {
+impl<S> ExportSource<S> {
     fn save(&mut self, files_only: bool) -> io::Result<()> {
         if let Some(file) = &self.file {
             self.checkpoint.measure_output()?;
@@ -308,13 +318,11 @@ impl ExportSource {
     }
 }
 
-impl EventSource for ExportSource {
+impl<S: EventSource> EventSource for ExportSource<S> {
     async fn next_batch(&mut self, max: usize) -> Result<Option<Batch>, SourceError> {
         let batch = self.reader.next_batch(max).await?;
-        if std::mem::take(&mut self.first_read) {
-            // On a new file export, preserve its original length before writing the first batch.
-            // A failed PostgreSQL read must leave any previous checkpoint intact.
-            self.save(batch.is_some())
+        if std::mem::take(&mut self.save_initial) && batch.is_some() {
+            self.save(true)
                 .map_err(|err| SourceError::backend("initializing export cursor", err))?;
         }
         Ok(batch)
@@ -325,6 +333,51 @@ impl EventSource for ExportSource {
         self.checkpoint.cursor = *cursor;
         self.save(false)
             .map_err(|err| SourceError::backend("saving export cursor", err))
+    }
+}
+
+enum LazySink {
+    Pending { config: SinkConfig, sync_dir: bool },
+    Open(AnySink),
+}
+
+impl LazySink {
+    fn new(config: SinkConfig, sync_dir: bool) -> Self {
+        Self::Pending { config, sync_dir }
+    }
+
+    fn ensure_open(&mut self) -> Result<&mut AnySink, SinkError> {
+        if let Self::Pending { config, sync_dir } = self {
+            let sink = AnySink::open(config)?;
+            #[cfg(unix)]
+            if *sync_dir
+                && let Some(path) = sink_path(config)
+                && path.is_file()
+            {
+                sync_parent(path)?;
+            }
+            *self = Self::Open(sink);
+        }
+        match self {
+            Self::Open(sink) => Ok(sink),
+            Self::Pending { .. } => unreachable!("sink opened immediately above"),
+        }
+    }
+}
+
+impl Sink for LazySink {
+    async fn write(&mut self, batch: &Batch) -> Result<(), SinkError> {
+        if batch.events.is_empty() {
+            return Ok(());
+        }
+        self.ensure_open()?.write(batch).await
+    }
+
+    async fn flush(&mut self) -> Result<(), SinkError> {
+        match self {
+            Self::Open(sink) => sink.flush().await,
+            Self::Pending { .. } => Ok(()),
+        }
     }
 }
 
@@ -345,25 +398,37 @@ pub(crate) fn run(args: &Args, config: &Config) -> anyhow::Result<()> {
     }
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()?
+        .build()
+        .context("failed to start async runtime")
+        .exit_code(Exit::Internal)?
         .block_on(export(args, config))
+}
+
+struct OpenedCheckpoint {
+    file: Option<CursorFile>,
+    checkpoint: Checkpoint,
+    had_saved: bool,
 }
 
 fn open_checkpoint(
     args: &Args,
     config: &Config,
-    pool: &auditstream_pg::PgPool,
-) -> anyhow::Result<(Option<CursorFile>, Checkpoint, bool)> {
+    database: Database,
+) -> anyhow::Result<OpenedCheckpoint> {
     let mut requested = Checkpoint {
         cursor: Cursor::new(0, 0),
-        database: Database::from_pool(pool),
+        database,
         schema: config.schema.clone(),
         filters: args.filters.clone(),
         sink: config.export.sink.clone(),
         output_len: None,
     };
     let Some(path) = &config.export.cursor_file else {
-        return Ok((None, requested, false));
+        return Ok(OpenedCheckpoint {
+            file: None,
+            checkpoint: requested,
+            had_saved: false,
+        });
     };
     let file = CursorFile::lock(path)
         .with_context(|| format!("opening cursor {}", path.display()))
@@ -385,66 +450,51 @@ fn open_checkpoint(
     }
     if args.from_start {
         // Replay starts at the beginning, but a partial batch in this destination still needs repair.
-        if let Ok(Some(saved)) = file.read()
+        let saved = file.read().ok().flatten();
+        let had_saved = saved.is_some();
+        if let Some(saved) = saved
             && requested.sink == saved.sink
         {
             requested.output_len = saved.output_len;
         }
-    } else if let Some(saved) = file
+        return Ok(OpenedCheckpoint {
+            file: Some(file),
+            checkpoint: requested,
+            had_saved,
+        });
+    }
+    if let Some(saved) = file
         .read()
         .with_context(|| format!("reading cursor {}", path.display()))
         .exit_code(Exit::Io)?
     {
         saved.check_resume(&requested)?;
-        return Ok((Some(file), saved, true));
+        return Ok(OpenedCheckpoint {
+            file: Some(file),
+            checkpoint: saved,
+            had_saved: true,
+        });
     }
-    Ok((Some(file), requested, false))
+    Ok(OpenedCheckpoint {
+        file: Some(file),
+        checkpoint: requested,
+        had_saved: false,
+    })
 }
 
-async fn export(args: &Args, config: &Config) -> anyhow::Result<()> {
-    let url = config.database_url.as_ref().context("missing database URL: pass --database-url or set AUDITSTREAM_DATABASE_URL / DATABASE_URL").exit_code(Exit::Usage)?;
-    let pool = auditstream_pg::connect(url.expose())
-        .await
-        .with_context(|| format!("could not connect to database {}", url.redacted()))
-        .exit_code(Exit::Database)?;
-    let (file, checkpoint, resuming) = open_checkpoint(args, config, &pool)?;
-    checkpoint
-        .restore_output(args.from_start)
-        .context("recovering export output")
-        .exit_code(Exit::Io)?;
-    let reader = PgEventSource::new(
-        pool,
-        &config.schema,
-        checkpoint.cursor,
-        args.filters.reader_filter(),
-    );
-    let mut sink = AnySink::open(&checkpoint.sink)
-        .context("opening export output")
-        .exit_code(Exit::Io)?;
-    #[cfg(unix)]
-    if file.is_some()
-        && let Some(path) = sink_path(&checkpoint.sink)
-        && path.is_file()
-    {
-        // The output directory entry must survive a crash before a durable cursor can refer to it.
-        sync_parent(path)
-            .context("syncing export output directory")
-            .exit_code(Exit::Io)?;
-    }
-    let mut source = ExportSource {
-        reader,
-        file,
-        checkpoint,
-        first_read: !resuming,
-    };
-    let options = Options::with_batch_size(config.export.batch_size);
-    let report = match auditstream_export::run(&mut source, &mut sink, &options).await {
-        Ok(report) => report,
+async fn run_pipeline<S: EventSource, K: Sink>(
+    source: &mut ExportSource<S>,
+    sink: &mut K,
+    options: &Options,
+) -> anyhow::Result<Option<auditstream_export::Report>> {
+    match auditstream_export::run(source, sink, options).await {
+        Ok(report) => Ok(Some(report)),
         Err(ExportError::Sink(SinkError::Io(err)))
-            if sink_path(&source.checkpoint.sink).is_none()
+            if source.file.is_none()
+                && sink_path(&source.checkpoint.sink).is_none()
                 && err.kind() == io::ErrorKind::BrokenPipe =>
         {
-            return Ok(());
+            Ok(None)
         }
         Err(err) => {
             let exit = match &err {
@@ -458,9 +508,81 @@ async fn export(args: &Args, config: &Config) -> anyhow::Result<()> {
                 ExportError::InvalidOptions(_) => Exit::Usage,
                 _ => Exit::Internal,
             };
-            return Err(err).exit_code(exit);
+            Err(err).exit_code(exit)
         }
+    }
+}
+
+async fn export(args: &Args, config: &Config) -> anyhow::Result<()> {
+    let url = config
+        .database_url
+        .as_ref()
+        .context("missing database URL: pass --database-url or set AUDITSTREAM_DATABASE_URL / DATABASE_URL")
+        .exit_code(Exit::Usage)?;
+    let pool = auditstream_pg::connect(url.expose())
+        .await
+        .with_context(|| format!("could not connect to database {}", url.redacted()))
+        .exit_code(Exit::Database)?;
+    let result = export_with_pool(args, config, pool.clone()).await;
+    pool.close().await;
+    result
+}
+
+async fn export_with_pool(
+    args: &Args,
+    config: &Config,
+    pool: auditstream_pg::PgPool,
+) -> anyhow::Result<()> {
+    let database = reader::database_identity(&pool, &config.schema)
+        .await
+        .context("identifying PostgreSQL database")
+        .exit_code(Exit::Database)?
+        .into();
+    let opened = open_checkpoint(args, config, database)?;
+    opened
+        .checkpoint
+        .restore_output(args.from_start)
+        .context("recovering export output")
+        .exit_code(Exit::Io)?;
+    if let Some(path) = sink_path(&opened.checkpoint.sink)
+        && path.is_dir()
+    {
+        return Err(anyhow!(
+            "opening export output: {} is a directory",
+            path.display()
+        ))
+        .exit_code(Exit::Io);
+    }
+
+    let had_saved = opened.had_saved;
+    let reader = PgEventSource::new(
+        pool,
+        &config.schema,
+        opened.checkpoint.cursor,
+        args.filters.reader_filter(),
+    );
+    let mut sink = LazySink::new(opened.checkpoint.sink.clone(), opened.file.is_some());
+    let mut source = ExportSource {
+        reader,
+        file: opened.file,
+        checkpoint: opened.checkpoint,
+        save_initial: !had_saved,
     };
+    let options = Options::with_batch_size(config.export.batch_size);
+    let Some(report) = run_pipeline(&mut source, &mut sink, &options).await? else {
+        return Ok(());
+    };
+    // Now that the PostgreSQL query succeeded, validate/create any configured output file even
+    // when zero events matched, and persist the initial or `--from-start` checkpoint if 0 batches ran.
+    sink.ensure_open()
+        .context("opening export output")
+        .exit_code(Exit::Io)?;
+    if report.batches == 0 && (args.from_start || !had_saved) {
+        source
+            .save(false)
+            .context("saving export cursor")
+            .exit_code(Exit::Io)?;
+    }
     if !config.quiet {
         let cursor = source.checkpoint.cursor;
         eprintln!(
@@ -473,11 +595,291 @@ async fn export(args: &Args, config: &Config) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExportFilter, Filters};
+    use std::fs;
+    use std::future::Future;
+    use std::io;
+    use std::path::PathBuf;
+
+    use auditstream_core::{Batch, Cursor, Event, EventSource, Sink, SinkError, SourceError};
+    use auditstream_export::{Options, SinkConfig};
+    use auditstream_pg::reader::ExportFilter;
+    use tempfile::tempdir;
+
+    use super::{Checkpoint, CursorFile, Database, ExportSource, Filters, LazySink, run_pipeline};
+    use crate::exit::{Exit, exit_code_for};
+
+    struct StaticSource {
+        batches: std::collections::VecDeque<Result<Batch, SourceError>>,
+    }
+
+    impl EventSource for StaticSource {
+        fn next_batch(
+            &mut self,
+            _max: usize,
+        ) -> impl Future<Output = Result<Option<Batch>, SourceError>> + Send {
+            let next = self.batches.pop_front().transpose();
+            std::future::ready(next)
+        }
+
+        fn ack(&mut self, _upto: &Cursor) -> impl Future<Output = Result<(), SourceError>> + Send {
+            std::future::ready(Ok(()))
+        }
+    }
+
+    struct FailingSink {
+        kind: io::ErrorKind,
+    }
+
+    impl Sink for FailingSink {
+        fn write(&mut self, _batch: &Batch) -> impl Future<Output = Result<(), SinkError>> + Send {
+            std::future::ready(Err(SinkError::Io(io::Error::new(
+                self.kind,
+                "simulated sink error",
+            ))))
+        }
+
+        fn flush(&mut self) -> impl Future<Output = Result<(), SinkError>> + Send {
+            std::future::ready(Ok(()))
+        }
+    }
+
+    fn sample_database() -> Database {
+        Database {
+            system_identifier: Some("7123456789012345678".to_owned()),
+            name: "audit_test".to_owned(),
+            oid: 16384,
+            history_table_oid: Some(24576),
+        }
+    }
+
+    fn sample_event() -> Event {
+        serde_json::from_str(
+            r#"{
+                "event_id": "00000000-0000-4000-8000-000000000001",
+                "occurred_at": "1970-01-01T00:00:00.000000Z",
+                "source": "app",
+                "schema_name": null,
+                "table_name": null,
+                "op": "test.event",
+                "record_id": null,
+                "before": null,
+                "after": null,
+                "changed": null,
+                "actor": null,
+                "context": null,
+                "actor_source": null,
+                "db_user": "postgres",
+                "schema_version": 1
+            }"#,
+        )
+        .expect("valid sample event JSON")
+    }
+
+    fn sample_checkpoint(sink: SinkConfig, cursor: Cursor, output_len: Option<u64>) -> Checkpoint {
+        Checkpoint {
+            cursor,
+            database: sample_database(),
+            schema: "auditstream".to_owned(),
+            filters: Filters::default(),
+            sink,
+            output_len,
+        }
+    }
 
     #[test]
     fn missing_checkpoint_filters_mean_no_restrictions() {
         let filters: Filters = serde_json::from_str("{}").expect("omitted filters are optional");
         assert_eq!(filters.reader_filter(), ExportFilter::default());
+    }
+
+    #[test]
+    fn database_checkpoint_rejects_unknown_fields() {
+        let raw = r#"{"name":"db","oid":1,"host":"localhost"}"#;
+        let err = serde_json::from_str::<Database>(raw).expect_err("unknown field must fail");
+        assert!(err.to_string().contains("host"), "{err}");
+    }
+
+    #[test]
+    fn check_resume_exits_usage_for_mismatched_output_and_format() {
+        let saved = sample_checkpoint(
+            SinkConfig::Jsonl {
+                path: Some(PathBuf::from("/tmp/a.jsonl")),
+            },
+            Cursor::new(10, 1),
+            Some(128),
+        );
+
+        let diff_output = sample_checkpoint(
+            SinkConfig::Jsonl {
+                path: Some(PathBuf::from("/tmp/b.jsonl")),
+            },
+            Cursor::new(0, 0),
+            None,
+        );
+        let err = saved.check_resume(&diff_output).expect_err("must reject");
+        assert_eq!(exit_code_for(&err), Exit::Usage);
+        assert!(err.to_string().contains("--output"), "{err}");
+        assert!(err.to_string().contains("--from-start"), "{err}");
+
+        let diff_format = sample_checkpoint(
+            SinkConfig::Csv {
+                path: Some(PathBuf::from("/tmp/a.jsonl")),
+            },
+            Cursor::new(0, 0),
+            None,
+        );
+        let err = saved.check_resume(&diff_format).expect_err("must reject");
+        assert_eq!(exit_code_for(&err), Exit::Usage);
+        assert!(err.to_string().contains("--format"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn from_start_preserves_existing_cursor_when_first_batch_write_fails() {
+        let dir = tempdir().expect("tempdir");
+        let cursor_path = dir.path().join("cursor.json");
+        let output_path = dir.path().join("events.jsonl");
+        fs::write(&output_path, b"existing-acked-line\n").expect("seed output");
+
+        let sink_cfg = SinkConfig::Jsonl {
+            path: Some(output_path.clone()),
+        };
+        let initial = sample_checkpoint(sink_cfg.clone(), Cursor::new(42, 7), Some(20));
+        let cursor_file = CursorFile::lock(&cursor_path).expect("lock cursor");
+        cursor_file.save(&initial).expect("write prior checkpoint");
+        let before_bytes = fs::read(&cursor_path).expect("read prior checkpoint");
+
+        let mut source = ExportSource {
+            reader: StaticSource {
+                batches: [Ok(Batch::new(
+                    vec![sample_event()],
+                    Some(Cursor::new(99, 1)),
+                ))]
+                .into_iter()
+                .collect(),
+            },
+            file: Some(cursor_file),
+            checkpoint: sample_checkpoint(sink_cfg, Cursor::new(0, 0), Some(20)),
+            save_initial: false,
+        };
+        let mut sink = FailingSink {
+            kind: io::ErrorKind::StorageFull,
+        };
+
+        let err = run_pipeline(&mut source, &mut sink, &Options::with_batch_size(1))
+            .await
+            .expect_err("storage full must fail");
+        assert_eq!(exit_code_for(&err), Exit::Io);
+        assert_eq!(
+            fs::read(&cursor_path).expect("read cursor after failure"),
+            before_bytes,
+            "failed --from-start replay must leave the prior cursor untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn broken_pipe_on_stdout_succeeds_statelessly_and_fails_with_cursor_file() {
+        let dir = tempdir().expect("tempdir");
+        let sink_cfg = SinkConfig::Jsonl { path: None };
+
+        // 1. Stateless stdout BrokenPipe -> Ok(None) (exit 0)
+        let mut stateless = ExportSource {
+            reader: StaticSource {
+                batches: [Ok(Batch::new(
+                    vec![sample_event()],
+                    Some(Cursor::new(10, 1)),
+                ))]
+                .into_iter()
+                .collect(),
+            },
+            file: None,
+            checkpoint: sample_checkpoint(sink_cfg.clone(), Cursor::new(0, 0), None),
+            save_initial: false,
+        };
+        let mut sink = FailingSink {
+            kind: io::ErrorKind::BrokenPipe,
+        };
+        let outcome = run_pipeline(&mut stateless, &mut sink, &Options::with_batch_size(1))
+            .await
+            .expect("stateless broken pipe is quiet success");
+        assert!(outcome.is_none());
+
+        // 2. Stateful stdout (--cursor-file) BrokenPipe -> Exit::Io (4)
+        let cursor_file = CursorFile::lock(&dir.path().join("cursor.json")).expect("lock");
+        let mut stateful = ExportSource {
+            reader: StaticSource {
+                batches: [Ok(Batch::new(
+                    vec![sample_event()],
+                    Some(Cursor::new(10, 1)),
+                ))]
+                .into_iter()
+                .collect(),
+            },
+            file: Some(cursor_file),
+            checkpoint: sample_checkpoint(sink_cfg, Cursor::new(0, 0), None),
+            save_initial: false,
+        };
+        let err = run_pipeline(&mut stateful, &mut sink, &Options::with_batch_size(1))
+            .await
+            .expect_err("stateful broken pipe must fail with Exit::Io");
+        assert_eq!(exit_code_for(&err), Exit::Io);
+    }
+
+    #[tokio::test]
+    async fn lazy_sink_does_not_create_output_file_when_source_read_fails() {
+        let dir = tempdir().expect("tempdir");
+        let output_path = dir.path().join("should-not-exist.jsonl");
+        let sink_cfg = SinkConfig::Jsonl {
+            path: Some(output_path.clone()),
+        };
+
+        let mut source = ExportSource {
+            reader: StaticSource {
+                batches: [Err(SourceError::backend(
+                    "simulated db failure",
+                    io::Error::other("relation does not exist"),
+                ))]
+                .into_iter()
+                .collect(),
+            },
+            file: None,
+            checkpoint: sample_checkpoint(sink_cfg.clone(), Cursor::new(0, 0), None),
+            save_initial: false,
+        };
+        let mut sink = LazySink::new(sink_cfg, false);
+
+        let _ = run_pipeline(&mut source, &mut sink, &Options::with_batch_size(1))
+            .await
+            .expect_err("source failure must propagate");
+        assert!(
+            !output_path.exists(),
+            "output file must not be created when initial source read fails"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_lock_uses_0600_mode_and_refuses_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempdir().expect("tempdir");
+        let cursor_path = dir.path().join("cursor.json");
+        let lock_path = dir.path().join("cursor.json.lock");
+        let locked = CursorFile::lock(&cursor_path).expect("lock new cursor");
+        let mode = fs::metadata(&lock_path)
+            .expect("lock meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        drop(locked);
+
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"keep").expect("victim");
+        let sym_cursor = dir.path().join("sym.cursor");
+        symlink(&victim, dir.path().join("sym.cursor.lock")).expect("create symlink");
+        let err = CursorFile::lock(&sym_cursor)
+            .err()
+            .expect("symlink lock must be rejected");
+        assert!(err.to_string().contains("symlink"), "{err}");
     }
 }

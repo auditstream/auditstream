@@ -41,6 +41,95 @@ pub const DEFAULT_LOOKUP_LIMIT: i64 = 50;
 /// Maximum row limit accepted by [`lookup`].
 pub const MAX_LOOKUP_LIMIT: i64 = 1000;
 
+/// Server-side PostgreSQL identity for the connected database and audit history table.
+///
+/// Resumable readers such as `auditstream export` store this identity in checkpoints so
+/// resuming works across equivalent client endpoints (such as `localhost` vs `127.0.0.1`,
+/// `PgBouncer`, port-forwards, or failover) while rejecting a different cluster, a different
+/// database, or a recreated `{audit_schema}.changes` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseIdentity {
+    /// Cluster-wide `pg_control_system().system_identifier`, when the role has execute access.
+    pub system_identifier: Option<String>,
+    /// Current PostgreSQL database name (`current_database()`).
+    pub name: String,
+    /// PostgreSQL catalog OID of the current database (`pg_database.oid`).
+    pub oid: u32,
+    /// PostgreSQL catalog OID of `{audit_schema}.changes`, if present.
+    pub history_table_oid: Option<u32>,
+}
+
+/// Queries the server-side identity of the connected PostgreSQL database and
+/// `{audit_schema}.changes`.
+///
+/// Requires no elevated privileges: `pg_database`, `pg_namespace`, `pg_class`, and
+/// `has_function_privilege` are readable by `PUBLIC`. `pg_control_system()` is queried only
+/// when the connected role has `EXECUTE` permission on it, falling back to `None` otherwise.
+///
+/// # Errors
+///
+/// Returns [`SourceError::Backend`] if the catalog query fails, or [`SourceError::Decode`] if
+/// a returned catalog OID falls outside `u32`.
+pub async fn database_identity(
+    pool: &PgPool,
+    audit_schema: &str,
+) -> Result<DatabaseIdentity, SourceError> {
+    #[derive(FromRow)]
+    struct IdentityRow {
+        name: String,
+        oid: i64,
+        history_table_oid: Option<i64>,
+        can_read_system_id: bool,
+    }
+
+    let row: IdentityRow = sqlx::query_as(
+        "SELECT \
+           d.datname::text AS name, \
+           d.oid::bigint AS oid, \
+           c.oid::bigint AS history_table_oid, \
+           pg_catalog.has_function_privilege('pg_catalog.pg_control_system()', 'EXECUTE') \
+             AS can_read_system_id \
+         FROM pg_catalog.pg_database d \
+         LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = $1 \
+         LEFT JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = 'changes' \
+         WHERE d.datname = pg_catalog.current_database()",
+    )
+    .bind(audit_schema)
+    .fetch_one(pool)
+    .await
+    .map_err(|err| SourceError::backend("failed to query database identity", err))?;
+
+    let oid = u32::try_from(row.oid)
+        .map_err(|err| SourceError::decode(format!("invalid database oid `{}`", row.oid), err))?;
+    let history_table_oid = row
+        .history_table_oid
+        .map(|raw| {
+            u32::try_from(raw).map_err(|err| {
+                SourceError::decode(format!("invalid history table oid `{raw}`"), err)
+            })
+        })
+        .transpose()?;
+
+    let system_identifier = if row.can_read_system_id {
+        sqlx::query_scalar::<_, String>(
+            "SELECT system_identifier::text FROM pg_catalog.pg_control_system()",
+        )
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+
+    Ok(DatabaseIdentity {
+        system_identifier,
+        name: row.name,
+        oid,
+        history_table_oid,
+    })
+}
+
 /// Record-ID filter mode for point-in-time lookups (`auditstream history --record-id`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordIdFilter {
