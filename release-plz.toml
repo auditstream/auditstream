@@ -1,0 +1,60 @@
+[workspace]
+git_only = true
+git_release_enable = false
+git_tag_enable = false
+git_tag_name = "auditstream-v{{ version }}"
+semver_check = false
+features_always_increment_minor = false
+release_always = false
+changelog_config = "cliff.toml"
+changelog_update = false
+pr_name = "chore: release v{{ version }}"
+pr_body = """
+{% for release in releases -%}
+{%- if release.package == "auditstream" -%}
+## {{ release.package }}: `{{ release.previous_version }}` -> `{{ release.next_version }}`
+{% if release.changelog %}
+{{ release.changelog }}
+{% endif %}
+{%- endif -%}
+{% endfor %}
+## AI disclosure
+
+- [x] none
+"""
+
+[[package]]
+name = "auditstream"
+release = true
+version_group = "engine"
+git_tag_enable = true
+git_tag_name = "auditstream-v{{ version }}"
+changelog_update = true
+changelog_path = "CHANGELOG.md"
+changelog_include = ["auditstream-core", "auditstream-pg", "auditstream-export"]
+
+[[package]]
+name = "auditstream-core"
+version_group = "engine"
+git_tag_enable = false
+changelog_update = false
+
+[[package]]
+name = "auditstream-pg"
+version_group = "engine"
+git_tag_enable = false
+changelog_update = false
+
+[[package]]
+name = "auditstream-export"
+version_group = "engine"
+git_tag_enable = false
+changelog_update = false
+
+[[package]]
+name = "auditstream-testkit"
+release = false
+
+[[package]]
+name = "xtask"
+release = false
