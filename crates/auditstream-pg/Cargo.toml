@@ -1,0 +1,18 @@
+[package]
+name = "auditstream-pg"
+description = "Postgres schema introspection, DDL and trigger generation, migration writers and history reader"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+auditstream-core.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

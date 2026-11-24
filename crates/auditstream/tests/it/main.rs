@@ -1,0 +1,6 @@
+//! Integration test binary for the `auditstream` CLI crate.
+
+#[test]
+fn binary_crate_compiles() {
+    assert_eq!(auditstream_core::CRATE_NAME, "auditstream-core");
+}
