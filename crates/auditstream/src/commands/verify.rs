@@ -9,13 +9,17 @@ use std::fmt::Write as _;
 use std::io;
 
 use anyhow::anyhow;
-use auditstream_pg::introspect::{self, IntrospectOptions, TableInfo, TableKind};
+use auditstream_pg::introspect::{self, IntrospectOptions, TableInfo};
 use auditstream_pg::partitions::{self, DEFAULT_MONTHS_AHEAD};
-use auditstream_pg::triggers::TableTriggerSpec;
 use auditstream_pg::verify::{self, Finding, FindingKind, Severity, VerifyOptions};
 use clap::{Args as ClapArgs, ValueEnum};
 use serde::Serialize;
 
+use crate::commands::common::{
+    build_configured_verify_specs, build_installed_verify_specs, connect_database,
+    group_excludes_by_table, parse_exclude_refs, parse_table_refs, require_database_url,
+    run_async as run_command_async,
+};
 use crate::config::Config;
 use crate::exit::{Exit, ExitCodeExt, write_stdout};
 
@@ -66,31 +70,17 @@ struct VerifyFinding {
 
 /// Runs the `verify` command.
 pub(crate) fn run(args: &Args, config: &Config) -> anyhow::Result<()> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| anyhow!("failed to start async runtime: {err}"))
-        .exit_code(Exit::Internal)?;
-
-    runtime.block_on(run_async(args, config))
+    run_command_async(run_async(args, config))
 }
 
 #[allow(clippy::too_many_lines)]
 async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
-    let Some(db_url) = config.database_url.as_ref() else {
-        return Err(anyhow!(
-            "missing database URL: pass --database-url or set AUDITSTREAM_DATABASE_URL / DATABASE_URL"
-        ))
-        .exit_code(Exit::Usage);
-    };
+    let db_url = require_database_url(config)?;
 
-    let configured_tables = parse_table_refs(&config.capture.tables)?;
-    let configured_excludes = parse_exclude_refs(&config.capture.exclude)?;
+    let configured_tables = parse_table_refs(&config.capture.tables, true)?;
+    let configured_excludes = parse_exclude_refs(&config.capture.exclude, true)?;
 
-    let pool = auditstream_pg::connect(db_url.expose())
-        .await
-        .map_err(|err| anyhow!("could not connect to database {}: {err}", db_url.redacted()))
-        .exit_code(Exit::Database)?;
+    let pool = connect_database(db_url).await?;
 
     // Optional --fix step runs D8's ensure_ahead(3) before reading verification state.
     let mut created_partitions = Vec::new();
@@ -140,48 +130,23 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
             .into_iter()
             .collect();
 
-        let introspected_map = if installed_schemas.is_empty() {
-            BTreeMap::new()
+        let introspected = if installed_schemas.is_empty() {
+            Vec::new()
         } else {
-            let list = introspect::tables_with_options(&pool, &installed_schemas, &introspect_opts)
+            introspect::tables_with_options(&pool, &installed_schemas, &introspect_opts)
                 .await
                 .map_err(|err| anyhow!("failed to introspect database tables: {err}"))
-                .exit_code(Exit::Database)?;
-            list.into_iter()
-                .map(|t| ((t.schema.clone(), t.name.clone()), t))
-                .collect::<BTreeMap<_, _>>()
+                .exit_code(Exit::Database)?
         };
+        let introspected_map: BTreeMap<(String, String), &TableInfo> = introspected
+            .iter()
+            .map(|t| ((t.schema.clone(), t.name.clone()), t))
+            .collect();
 
-        installed
-            .into_iter()
-            .map(|cap| {
-                let key = (cap.schema.clone(), cap.table.clone());
-                let (pk, is_part) = introspected_map.get(&key).map_or_else(
-                    || (cap.primary_key, cap.is_partitioned),
-                    |info| {
-                        (
-                            info.primary_key.clone(),
-                            info.kind == TableKind::Partitioned,
-                        )
-                    },
-                );
-                let mut spec =
-                    TableTriggerSpec::new(cap.schema, cap.table, pk, cap.excluded_columns);
-                if is_part {
-                    spec = spec.partitioned();
-                }
-                spec
-            })
-            .collect()
+        build_installed_verify_specs(&installed, &introspected_map)
     } else {
         let configured_set: BTreeSet<(String, String)> = configured_tables.into_iter().collect();
-        let mut excludes_by_table: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
-        for (schema, table, col) in configured_excludes {
-            excludes_by_table
-                .entry((schema, table))
-                .or_default()
-                .insert(col);
-        }
+        let excludes_by_table = group_excludes_by_table(&configured_excludes);
 
         let target_schemas: Vec<&str> = configured_set
             .iter()
@@ -191,41 +156,20 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
             .into_iter()
             .collect();
 
-        let introspected_map: BTreeMap<(String, String), TableInfo> = if target_schemas.is_empty() {
-            BTreeMap::new()
+        let introspected = if target_schemas.is_empty() {
+            Vec::new()
         } else {
             introspect::tables_with_options(&pool, &target_schemas, &introspect_opts)
                 .await
                 .map_err(|err| anyhow!("failed to introspect database tables: {err}"))
                 .exit_code(Exit::Database)?
-                .into_iter()
-                .map(|t| ((t.schema.clone(), t.name.clone()), t))
-                .collect()
         };
+        let introspected_map: BTreeMap<(String, String), &TableInfo> = introspected
+            .iter()
+            .map(|t| ((t.schema.clone(), t.name.clone()), t))
+            .collect();
 
-        configured_set
-            .into_iter()
-            .map(|key| {
-                let excl: Vec<String> = excludes_by_table
-                    .get(&key)
-                    .map(|set| set.iter().cloned().collect())
-                    .unwrap_or_default();
-                let (pk, is_part) = introspected_map.get(&key).map_or_else(
-                    || (Vec::new(), false),
-                    |info| {
-                        (
-                            info.primary_key.clone(),
-                            info.kind == TableKind::Partitioned,
-                        )
-                    },
-                );
-                let mut spec = TableTriggerSpec::new(key.0, key.1, pk, excl);
-                if is_part {
-                    spec = spec.partitioned();
-                }
-                spec
-            })
-            .collect()
+        build_configured_verify_specs(&configured_set, &excludes_by_table, &introspected_map)
     };
 
     let d7_report = verify::check_with_options(&pool, &VerifyOptions::new(&config.schema, specs))
@@ -349,48 +293,4 @@ fn render_text(report: &VerifyJsonReport) -> String {
         );
     }
     out
-}
-
-fn parse_table_refs(raw: &[String]) -> anyhow::Result<Vec<(String, String)>> {
-    let mut parsed = Vec::with_capacity(raw.len());
-    for entry in raw {
-        let mut parts = entry.split('.');
-        let (Some(schema), Some(table), None) = (parts.next(), parts.next(), parts.next()) else {
-            return Err(anyhow!(
-                "invalid table specifier `{entry}` in config: expected `<schema>.<table>`"
-            ))
-            .exit_code(Exit::Usage);
-        };
-        if schema.is_empty() || table.is_empty() {
-            return Err(anyhow!(
-                "invalid table specifier `{entry}` in config: expected `<schema>.<table>`"
-            ))
-            .exit_code(Exit::Usage);
-        }
-        parsed.push((schema.to_owned(), table.to_owned()));
-    }
-    Ok(parsed)
-}
-
-fn parse_exclude_refs(raw: &[String]) -> anyhow::Result<Vec<(String, String, String)>> {
-    let mut parsed = Vec::with_capacity(raw.len());
-    for entry in raw {
-        let mut parts = entry.split('.');
-        let (Some(schema), Some(table), Some(column), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            return Err(anyhow!(
-                "invalid excluded column specifier `{entry}` in config: expected `<schema>.<table>.<column>`"
-            ))
-            .exit_code(Exit::Usage);
-        };
-        if schema.is_empty() || table.is_empty() || column.is_empty() {
-            return Err(anyhow!(
-                "invalid excluded column specifier `{entry}` in config: expected `<schema>.<table>.<column>`"
-            ))
-            .exit_code(Exit::Usage);
-        }
-        parsed.push((schema.to_owned(), table.to_owned(), column.to_owned()));
-    }
-    Ok(parsed)
 }

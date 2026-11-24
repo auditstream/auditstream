@@ -71,6 +71,111 @@ impl NestedActor {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActorMapKind {
+    Nested,
+    Primary,
+    Payload,
+}
+
+struct ParsedActorMap {
+    actor_type: ActorType,
+    id: String,
+    on_behalf_of: Option<NestedActor>,
+    tenant: Option<String>,
+    context: Option<Context>,
+}
+
+fn parse_unique_field<'de, A, T>(
+    slot: &mut Option<T>,
+    field: &'static str,
+    map: &mut A,
+) -> Result<(), A::Error>
+where
+    A: MapAccess<'de>,
+    T: Deserialize<'de>,
+{
+    if slot.is_some() {
+        return Err(de::Error::duplicate_field(field));
+    }
+    *slot = Some(map.next_value()?);
+    Ok(())
+}
+
+fn parse_non_empty_field<'de, A>(
+    slot: &mut Option<String>,
+    field: &'static str,
+    empty_error: &'static str,
+    map: &mut A,
+) -> Result<(), A::Error>
+where
+    A: MapAccess<'de>,
+{
+    if slot.is_some() {
+        return Err(de::Error::duplicate_field(field));
+    }
+    let value: String = map.next_value()?;
+    if value.is_empty() {
+        return Err(de::Error::custom(empty_error));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+fn parse_actor_map<'de, A>(mut map: A, kind: ActorMapKind) -> Result<ParsedActorMap, A::Error>
+where
+    A: MapAccess<'de>,
+{
+    let (empty_id_msg, empty_tenant_msg) = match kind {
+        ActorMapKind::Nested => (
+            "onBehalfOf.id must not be empty",
+            "onBehalfOf.tenant must not be empty",
+        ),
+        ActorMapKind::Primary | ActorMapKind::Payload => (
+            "actor.id must not be empty",
+            "actor.tenant must not be empty",
+        ),
+    };
+
+    let mut actor_type: Option<ActorType> = None;
+    let mut id: Option<String> = None;
+    let mut on_behalf_of: Option<NestedActor> = None;
+    let mut tenant: Option<String> = None;
+    let mut context: Option<Context> = None;
+
+    while let Some(key) = map.next_key::<String>()? {
+        match key.as_str() {
+            "type" => parse_unique_field(&mut actor_type, "type", &mut map)?,
+            "id" => parse_non_empty_field(&mut id, "id", empty_id_msg, &mut map)?,
+            "tenant" => parse_non_empty_field(&mut tenant, "tenant", empty_tenant_msg, &mut map)?,
+            "onBehalfOf" if kind == ActorMapKind::Nested => {
+                let _: IgnoredAny = map.next_value()?;
+                return Err(de::Error::custom(
+                    "onBehalfOf cannot be nested more than one level deep",
+                ));
+            }
+            "onBehalfOf" => parse_unique_field(&mut on_behalf_of, "onBehalfOf", &mut map)?,
+            "context" if kind == ActorMapKind::Payload => {
+                parse_unique_field(&mut context, "context", &mut map)?;
+            }
+            _ => {
+                let _: IgnoredAny = map.next_value()?;
+            }
+        }
+    }
+
+    let actor_type = actor_type.ok_or_else(|| de::Error::missing_field("type"))?;
+    let id = id.ok_or_else(|| de::Error::missing_field("id"))?;
+
+    Ok(ParsedActorMap {
+        actor_type,
+        id,
+        on_behalf_of,
+        tenant,
+        context,
+    })
+}
+
 impl<'de> Deserialize<'de> for NestedActor {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -85,63 +190,15 @@ impl<'de> Deserialize<'de> for NestedActor {
                 f.write_str("a nested Auditstream actor JSON object without onBehalfOf")
             }
 
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
             where
                 A: MapAccess<'de>,
             {
-                let mut actor_type: Option<ActorType> = None;
-                let mut id: Option<String> = None;
-                let mut tenant: Option<String> = None;
-
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "type" => {
-                            if actor_type.is_some() {
-                                return Err(de::Error::duplicate_field("type"));
-                            }
-                            actor_type = Some(map.next_value()?);
-                        }
-                        "id" => {
-                            if id.is_some() {
-                                return Err(de::Error::duplicate_field("id"));
-                            }
-                            let value: String = map.next_value()?;
-                            if value.is_empty() {
-                                return Err(de::Error::custom("onBehalfOf.id must not be empty"));
-                            }
-                            id = Some(value);
-                        }
-                        "tenant" => {
-                            if tenant.is_some() {
-                                return Err(de::Error::duplicate_field("tenant"));
-                            }
-                            let value: String = map.next_value()?;
-                            if value.is_empty() {
-                                return Err(de::Error::custom(
-                                    "onBehalfOf.tenant must not be empty",
-                                ));
-                            }
-                            tenant = Some(value);
-                        }
-                        "onBehalfOf" => {
-                            let _: IgnoredAny = map.next_value()?;
-                            return Err(de::Error::custom(
-                                "onBehalfOf cannot be nested more than one level deep",
-                            ));
-                        }
-                        _ => {
-                            let _: IgnoredAny = map.next_value()?;
-                        }
-                    }
-                }
-
-                let actor_type = actor_type.ok_or_else(|| de::Error::missing_field("type"))?;
-                let id = id.ok_or_else(|| de::Error::missing_field("id"))?;
-
+                let parsed = parse_actor_map(map, ActorMapKind::Nested)?;
                 Ok(NestedActor {
-                    actor_type,
-                    id,
-                    tenant,
+                    actor_type: parsed.actor_type,
+                    id: parsed.id,
+                    tenant: parsed.tenant,
                 })
             }
         }
@@ -235,64 +292,16 @@ impl<'de> Deserialize<'de> for Actor {
                 f.write_str("an Auditstream actor JSON object")
             }
 
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
             where
                 A: MapAccess<'de>,
             {
-                let mut actor_type: Option<ActorType> = None;
-                let mut id: Option<String> = None;
-                let mut on_behalf_of: Option<NestedActor> = None;
-                let mut tenant: Option<String> = None;
-
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "type" => {
-                            if actor_type.is_some() {
-                                return Err(de::Error::duplicate_field("type"));
-                            }
-                            actor_type = Some(map.next_value()?);
-                        }
-                        "id" => {
-                            if id.is_some() {
-                                return Err(de::Error::duplicate_field("id"));
-                            }
-                            let value: String = map.next_value()?;
-                            if value.is_empty() {
-                                return Err(de::Error::custom("actor.id must not be empty"));
-                            }
-                            id = Some(value);
-                        }
-                        "onBehalfOf" => {
-                            if on_behalf_of.is_some() {
-                                return Err(de::Error::duplicate_field("onBehalfOf"));
-                            }
-                            on_behalf_of = Some(map.next_value()?);
-                        }
-                        "tenant" => {
-                            if tenant.is_some() {
-                                return Err(de::Error::duplicate_field("tenant"));
-                            }
-                            let value: String = map.next_value()?;
-                            if value.is_empty() {
-                                return Err(de::Error::custom("actor.tenant must not be empty"));
-                            }
-                            tenant = Some(value);
-                        }
-                        // Unknown keys (including sibling "context") are ignored on Actor itself.
-                        _ => {
-                            let _: IgnoredAny = map.next_value()?;
-                        }
-                    }
-                }
-
-                let actor_type = actor_type.ok_or_else(|| de::Error::missing_field("type"))?;
-                let id = id.ok_or_else(|| de::Error::missing_field("id"))?;
-
+                let parsed = parse_actor_map(map, ActorMapKind::Primary)?;
                 Ok(Actor {
-                    actor_type,
-                    id,
-                    on_behalf_of,
-                    tenant,
+                    actor_type: parsed.actor_type,
+                    id: parsed.id,
+                    on_behalf_of: parsed.on_behalf_of,
+                    tenant: parsed.tenant,
                 })
             }
         }
@@ -382,71 +391,17 @@ impl<'de> Deserialize<'de> for ActorPayload {
                 f.write_str("an Auditstream actor and optional context JSON object")
             }
 
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
             where
                 A: MapAccess<'de>,
             {
-                let mut actor_type: Option<ActorType> = None;
-                let mut id: Option<String> = None;
-                let mut on_behalf_of: Option<NestedActor> = None;
-                let mut tenant: Option<String> = None;
-                let mut context: Option<Context> = None;
-
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "type" => {
-                            if actor_type.is_some() {
-                                return Err(de::Error::duplicate_field("type"));
-                            }
-                            actor_type = Some(map.next_value()?);
-                        }
-                        "id" => {
-                            if id.is_some() {
-                                return Err(de::Error::duplicate_field("id"));
-                            }
-                            let value: String = map.next_value()?;
-                            if value.is_empty() {
-                                return Err(de::Error::custom("actor.id must not be empty"));
-                            }
-                            id = Some(value);
-                        }
-                        "onBehalfOf" => {
-                            if on_behalf_of.is_some() {
-                                return Err(de::Error::duplicate_field("onBehalfOf"));
-                            }
-                            on_behalf_of = Some(map.next_value()?);
-                        }
-                        "tenant" => {
-                            if tenant.is_some() {
-                                return Err(de::Error::duplicate_field("tenant"));
-                            }
-                            let value: String = map.next_value()?;
-                            if value.is_empty() {
-                                return Err(de::Error::custom("actor.tenant must not be empty"));
-                            }
-                            tenant = Some(value);
-                        }
-                        "context" => {
-                            if context.is_some() {
-                                return Err(de::Error::duplicate_field("context"));
-                            }
-                            context = Some(map.next_value()?);
-                        }
-                        _ => {
-                            let _: IgnoredAny = map.next_value()?;
-                        }
-                    }
-                }
-
-                let actor_type = actor_type.ok_or_else(|| de::Error::missing_field("type"))?;
-                let id = id.ok_or_else(|| de::Error::missing_field("id"))?;
-
+                let parsed = parse_actor_map(map, ActorMapKind::Payload)?;
                 Ok(ActorPayload {
-                    actor_type,
-                    id,
-                    on_behalf_of,
-                    tenant,
-                    context,
+                    actor_type: parsed.actor_type,
+                    id: parsed.id,
+                    on_behalf_of: parsed.on_behalf_of,
+                    tenant: parsed.tenant,
+                    context: parsed.context,
                 })
             }
         }

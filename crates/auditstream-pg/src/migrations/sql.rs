@@ -7,56 +7,25 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::{
-    Manifest, MigrationError, MigrationOptions, PreviewOutcome, WriteOutcome, build_manifest,
-    compose_statements, compute_dropped_tables, header_comment, next_unique_timestamp,
-    parse_manifest_from_file,
+    Manifest, MigrationError, MigrationOptions, PlannedMigration, PreviewOutcome, WriteOutcome,
+    header_comment, next_unique_timestamp, parse_manifest_from_file, plan_migration, preview_with,
 };
 
 pub(crate) fn preview(options: &MigrationOptions) -> Result<PreviewOutcome, MigrationError> {
-    let current = build_manifest(options);
     let newest = find_newest_sql_migration(&options.out_dir)?;
-
-    if let Some((ref existing_path, ref prev_manifest)) = newest
-        && prev_manifest.canonical_json == current.canonical_json
-        && options.removed_tables.is_empty()
-    {
-        return Ok(PreviewOutcome::UpToDate {
-            existing: existing_path.clone(),
-        });
-    }
-
-    let dropped_tables = compute_dropped_tables(
-        newest.as_ref().map(|(_, m)| m),
-        &current,
-        &options.removed_tables,
-    );
-    let statements = compose_statements(options, &dropped_tables);
-    Ok(PreviewOutcome::Sql {
-        sql: render_plain_sql(&current, &statements),
-        dropped_tables,
-    })
+    Ok(preview_with(options, newest, render_plain_sql))
 }
 
 pub(crate) fn write(options: &MigrationOptions) -> Result<WriteOutcome, MigrationError> {
-    let current = build_manifest(options);
     let newest = find_newest_sql_migration(&options.out_dir)?;
-
-    if let Some((ref existing_path, ref prev_manifest)) = newest
-        && prev_manifest.canonical_json == current.canonical_json
-        && options.removed_tables.is_empty()
-    {
-        return Ok(WriteOutcome::UpToDate {
-            existing: existing_path.clone(),
-        });
-    }
-
-    let dropped_tables = compute_dropped_tables(
-        newest.as_ref().map(|(_, m)| m),
-        &current,
-        &options.removed_tables,
-    );
-    let statements = compose_statements(options, &dropped_tables);
-    let rendered = render_plain_sql(&current, &statements);
+    let (rendered, dropped_tables) = match plan_migration(options, newest) {
+        PlannedMigration::UpToDate { existing } => return Ok(WriteOutcome::UpToDate { existing }),
+        PlannedMigration::Changed {
+            manifest,
+            dropped_tables,
+            statements,
+        } => (render_plain_sql(&manifest, &statements), dropped_tables),
+    };
 
     fs::create_dir_all(&options.out_dir)?;
     let ts = next_unique_timestamp(options.now, |ts| {

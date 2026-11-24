@@ -10,7 +10,6 @@
 //! spreadsheet consumers should import columns as plain text rather than evaluating formulas.
 
 use std::borrow::Cow;
-use std::fs::OpenOptions;
 use std::io;
 use std::path::Path;
 
@@ -268,10 +267,7 @@ impl OpenedCsvSink {
         match path {
             None => Ok(Self::Stdout(CsvSink::new(tokio::io::stdout()))),
             Some(file_path) => {
-                let std_file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(file_path)?;
+                let std_file = crate::open_append_file(file_path)?;
                 let is_empty = std_file.metadata()?.len() == 0;
                 Ok(Self::File(CsvSink::with_header(
                     File::from_std(std_file),
@@ -282,22 +278,4 @@ impl OpenedCsvSink {
     }
 }
 
-impl Sink for OpenedCsvSink {
-    async fn write(&mut self, batch: &Batch) -> Result<(), SinkError> {
-        match self {
-            Self::Stdout(sink) => sink.write(batch).await,
-            Self::File(sink) => sink.write(batch).await,
-        }
-    }
-
-    async fn flush(&mut self) -> Result<(), SinkError> {
-        match self {
-            Self::Stdout(sink) => sink.flush().await,
-            Self::File(sink) => {
-                sink.flush().await?;
-                sink.get_mut().sync_data().await?;
-                Ok(())
-            }
-        }
-    }
-}
+crate::impl_opened_sink!(OpenedCsvSink);

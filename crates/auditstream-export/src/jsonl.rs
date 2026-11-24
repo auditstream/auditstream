@@ -1,6 +1,5 @@
 //! Streaming JSON Lines (`jsonl`) export sink matching `spec/export.md`.
 
-use std::fs::OpenOptions;
 use std::path::Path;
 
 use auditstream_core::{Batch, Sink, SinkError};
@@ -84,32 +83,11 @@ impl OpenedJsonLinesSink {
         match path {
             None => Ok(Self::Stdout(JsonLinesSink::new(tokio::io::stdout()))),
             Some(file_path) => {
-                let std_file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(file_path)?;
+                let std_file = crate::open_append_file(file_path)?;
                 Ok(Self::File(JsonLinesSink::new(File::from_std(std_file))))
             }
         }
     }
 }
 
-impl Sink for OpenedJsonLinesSink {
-    async fn write(&mut self, batch: &Batch) -> Result<(), SinkError> {
-        match self {
-            Self::Stdout(sink) => sink.write(batch).await,
-            Self::File(sink) => sink.write(batch).await,
-        }
-    }
-
-    async fn flush(&mut self) -> Result<(), SinkError> {
-        match self {
-            Self::Stdout(sink) => sink.flush().await,
-            Self::File(sink) => {
-                sink.flush().await?;
-                sink.get_mut().sync_data().await?;
-                Ok(())
-            }
-        }
-    }
-}
+crate::impl_opened_sink!(OpenedJsonLinesSink);
