@@ -10,8 +10,12 @@ publish.workspace = true
 
 [dependencies]
 auditstream-core.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+toml.workspace = true
 
 [lints]
 workspace = true
