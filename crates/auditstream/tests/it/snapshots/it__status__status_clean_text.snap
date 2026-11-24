@@ -1,0 +1,14 @@
+---
+source: crates/auditstream/tests/it/status.rs
+expression: scrub_volatile(&text_stdout)
+---
+Tables (2 total, 1 captured):
+  public.invoice  captured  triggers=enabled  excluded=password_hash
+  public.notes  uncaptured  triggers=none  excluded=none
+
+History table (auditstream.changes):
+  partitions: 4 monthly (changes_<YYYY>_<MM>..changes_<YYYY>_<MM>)
+  months_covered_ahead: 3
+  default_has_rows: no
+  estimated_rows: 0
+  total_size_bytes: <BYTES>

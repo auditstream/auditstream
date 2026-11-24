@@ -1,0 +1,11 @@
+---
+source: crates/auditstream/tests/it/verify.rs
+expression: "String::from_utf8_lossy(&json_out.stdout).into_owned()"
+---
+{
+  "ok": true,
+  "schema": "auditstream",
+  "months_covered_ahead": 3,
+  "created_partitions": [],
+  "findings": []
+}

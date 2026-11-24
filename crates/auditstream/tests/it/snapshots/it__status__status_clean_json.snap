@@ -1,0 +1,39 @@
+---
+source: crates/auditstream/tests/it/status.rs
+expression: scrub_volatile(&json_stdout)
+---
+{
+  "schema": "auditstream",
+  "tables": [
+    {
+      "table": "public.invoice",
+      "captured": true,
+      "configured": true,
+      "trigger_state": "enabled",
+      "excluded_columns": [
+        "password_hash"
+      ]
+    },
+    {
+      "table": "public.notes",
+      "captured": false,
+      "configured": false,
+      "trigger_state": "none",
+      "excluded_columns": []
+    }
+  ],
+  "history": {
+    "exists": true,
+    "partitions": [
+      "changes_<YYYY>_<MM>",
+      "changes_<YYYY>_<MM>",
+      "changes_<YYYY>_<MM>",
+      "changes_<YYYY>_<MM>"
+    ],
+    "months_covered_ahead": 3,
+    "default_has_rows": false,
+    "estimated_rows": 0,
+    "total_size_bytes": "<BYTES>"
+  },
+  "problems_found": 0
+}

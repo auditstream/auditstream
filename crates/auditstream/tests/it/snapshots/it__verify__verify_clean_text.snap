@@ -1,0 +1,5 @@
+---
+source: crates/auditstream/tests/it/verify.rs
+expression: "String::from_utf8_lossy(&text_out.stdout).into_owned()"
+---
+ok: no findings
