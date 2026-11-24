@@ -47,4 +47,8 @@ dir = "prisma/migrations"
 [export]
 cursor_file = ".auditstream.cursor"
 batch_size = 1000
+
+[export.sink]
+type = "jsonl"
+path = "events.jsonl"
 ```
