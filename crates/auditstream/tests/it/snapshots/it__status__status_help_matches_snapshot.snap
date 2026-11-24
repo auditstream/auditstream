@@ -1,0 +1,50 @@
+---
+source: crates/auditstream/tests/it/status.rs
+info:
+  program: auditstream
+  args:
+    - status
+    - "--help"
+---
+success: true
+exit_code: 0
+----- stdout -----
+Show audit schema, trigger and partition status
+
+Usage: auditstream status [OPTIONS]
+
+Options:
+      --config <PATH>
+          Path to the configuration file (defaults to ./auditstream.toml if present)
+          
+          [env: AUDITSTREAM_CONFIG=]
+
+      --format <FORMAT>
+          Output format (`text` or `json`)
+
+          Possible values:
+          - text: Human-readable text summary
+          - json: Machine-readable JSON summary
+          
+          [default: text]
+
+      --database-url <URL>
+          Postgres connection URL (also reads `DATABASE_URL` as fallback)
+          
+          [env: AUDITSTREAM_DATABASE_URL]
+
+      --schema <SCHEMA>
+          Audit schema name (defaults to `auditstream`)
+          
+          [env: AUDITSTREAM_SCHEMA=]
+
+  -v, --verbose...
+          Increase log verbosity (`-v` info, `-vv` debug)
+
+  -q, --quiet
+          Silence warnings and info logs (errors only)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+----- stderr -----

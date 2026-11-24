@@ -190,6 +190,7 @@ dependencies = [
  "insta-cmd",
  "predicates",
  "serde",
+ "serde_json",
  "tempfile",
  "time",
  "tokio",

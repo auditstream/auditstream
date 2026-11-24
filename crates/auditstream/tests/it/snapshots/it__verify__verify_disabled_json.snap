@@ -1,0 +1,20 @@
+---
+source: crates/auditstream/tests/it/verify.rs
+expression: "String::from_utf8_lossy(&json_out.stdout).into_owned()"
+---
+{
+  "ok": false,
+  "schema": "auditstream",
+  "months_covered_ahead": 3,
+  "created_partitions": [],
+  "findings": [
+    {
+      "severity": "error",
+      "kind": "disabled",
+      "table": "public.invoice",
+      "object": "public.invoice.auditstream_update",
+      "detail": "trigger `auditstream_update` on `public.invoice` is disabled (`tgenabled = 'D'`)",
+      "hint": "Re-enable `public.invoice.auditstream_update` or re-apply the Auditstream migration."
+    }
+  ]
+}

@@ -18,7 +18,7 @@ fn help_output_matches_snapshot() {
 #[test]
 fn all_subcommand_stubs_exit_5_with_stderr_only() {
     let dir = tempdir().unwrap();
-    for sub in ["status", "verify", "history", "export"] {
+    for sub in ["history", "export"] {
         auditstream_cmd()
             .current_dir(dir.path())
             .args(["-vv", sub])
@@ -83,7 +83,7 @@ fn config_precedence_layers_end_to_end() {
     // 1. Default file layer
     auditstream_cmd()
         .current_dir(dir.path())
-        .args(["-vv", "status"])
+        .args(["-vv", "export"])
         .assert()
         .code(5)
         .stdout(predicate::str::is_empty())
@@ -94,7 +94,7 @@ fn config_precedence_layers_end_to_end() {
     auditstream_cmd()
         .current_dir(dir.path())
         .env("DATABASE_URL", "postgres://dbenv:pw@dbenv-host/db")
-        .args(["-vv", "status"])
+        .args(["-vv", "export"])
         .assert()
         .code(5)
         .stderr(predicate::str::contains("dbenv-host"));
@@ -108,7 +108,7 @@ fn config_precedence_layers_end_to_end() {
             "postgres://asenv:pw@asenv-host/db",
         )
         .env("AUDITSTREAM_SCHEMA", "from_env")
-        .args(["-vv", "status"])
+        .args(["-vv", "export"])
         .assert()
         .code(5)
         .stderr(predicate::str::contains("asenv-host"))
@@ -128,7 +128,7 @@ fn config_precedence_layers_end_to_end() {
             "--schema",
             "from_flag",
             "-vv",
-            "status",
+            "export",
         ])
         .assert()
         .code(5)
@@ -145,7 +145,7 @@ fn auditstream_config_env_selects_config_file() {
     auditstream_cmd()
         .current_dir(dir.path())
         .env("AUDITSTREAM_CONFIG", custom.to_str().unwrap())
-        .args(["-vv", "status"])
+        .args(["-vv", "export"])
         .assert()
         .code(5)
         .stderr(predicate::str::contains("via_env_config"));
@@ -169,7 +169,7 @@ fn database_password_never_appears_in_help_logs_or_errors() {
     auditstream_cmd()
         .current_dir(dir.path())
         .env("AUDITSTREAM_DATABASE_URL", &url)
-        .args(["-vv", "status"])
+        .args(["-vv", "export"])
         .assert()
         .code(5)
         .stdout(predicate::str::is_empty())

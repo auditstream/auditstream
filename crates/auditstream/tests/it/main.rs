@@ -2,7 +2,9 @@
 
 mod cli;
 mod init;
+mod status;
 mod support;
+mod verify;
 
 #[test]
 fn binary_crate_compiles() {
