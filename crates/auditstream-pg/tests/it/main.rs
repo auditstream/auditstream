@@ -1,5 +1,6 @@
 //! Integration test entrypoint for `auditstream-pg`.
 
+mod capture;
 mod ddl;
 mod introspect;
 mod migrations;
