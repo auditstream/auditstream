@@ -1,0 +1,14 @@
+---
+source: crates/auditstream/tests/it/e2e.rs
+info:
+  program: auditstream
+  args:
+    - verify
+---
+success: false
+exit_code: 1
+----- stdout -----
+[error] auditstream.changes_default  default_partition_rows  DEFAULT partition `auditstream.changes_default` holds 1 row(s) (oldest: 2020-01-15T10:00:00.000000Z, newest: 2020-01-15T10:00:00.000000Z); monthly partitions cannot be created for covered months until those rows are moved — hint: Move rows out of changes_default into monthly partitions, then run `auditstream verify --fix`.
+
+----- stderr -----
+error: verification failed with 1 finding(s)
