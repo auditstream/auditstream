@@ -1,6 +1,7 @@
 //! Postgres introspection, DDL and trigger generation, migration writers and history reader.
 
 pub mod ddl;
+pub mod reader;
 pub mod triggers;
 
 use sqlx as _;
