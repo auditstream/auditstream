@@ -1,6 +1,7 @@
 //! Integration test binary for the `auditstream` CLI crate.
 
 mod cli;
+mod init;
 mod support;
 
 #[test]

@@ -46,6 +46,13 @@ impl RedactedUrl {
     pub(crate) fn redacted(&self) -> String {
         redact_url_password(&self.0)
     }
+
+    /// Returns the raw connection string for passing directly to [`auditstream_pg::connect`].
+    ///
+    /// Never log or include this value in user-facing error messages.
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Debug for RedactedUrl {
@@ -85,6 +92,11 @@ fn redact_url_password(raw: &str) -> String {
 /// Resolved CLI configuration (public contract: `docs/reference/config.md`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Config {
+    /// Resolved configuration file path (`--config` / `AUDITSTREAM_CONFIG` or `./auditstream.toml`).
+    pub(crate) file_path: PathBuf,
+    /// Whether `-q` / `--quiet` was passed on the command line.
+    #[allow(dead_code)]
+    pub(crate) quiet: bool,
     /// Postgres connection URL (password redacted in debug/logs).
     pub(crate) database_url: Option<RedactedUrl>,
     /// Audit schema name.
@@ -250,7 +262,14 @@ impl Config {
             Command::Status(_) | Command::Verify(_) | Command::History(_) => {}
         }
 
+        let file_path = cli
+            .config
+            .clone()
+            .unwrap_or_else(|| cwd.join(DEFAULT_CONFIG_FILE));
+
         Ok(Self {
+            file_path,
+            quiet: cli.quiet,
             database_url,
             schema,
             capture,
