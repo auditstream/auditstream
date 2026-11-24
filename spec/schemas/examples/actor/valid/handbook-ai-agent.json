@@ -1,0 +1,6 @@
+{
+  "type": "ai_agent",
+  "id": "billing-agent",
+  "onBehalfOf": { "type": "user", "id": "usr_42" },
+  "tenant": "org_acme"
+}

@@ -1,0 +1,8 @@
+{
+  "type": "service",
+  "id": "billing-worker",
+  "context": {
+    "requestId": "req_9f2a",
+    "source": "worker"
+  }
+}

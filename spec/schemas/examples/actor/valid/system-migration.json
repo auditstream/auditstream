@@ -1,0 +1,7 @@
+{
+  "type": "system",
+  "id": "schema-migrator",
+  "context": {
+    "source": "migration"
+  }
+}

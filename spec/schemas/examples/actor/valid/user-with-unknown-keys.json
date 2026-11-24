@@ -1,0 +1,9 @@
+{
+  "type": "user",
+  "id": "usr_7",
+  "futureField": "ignored-by-readers",
+  "context": {
+    "requestId": "req_7",
+    "customTag": "v2"
+  }
+}
