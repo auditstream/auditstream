@@ -1,12 +1,168 @@
-//! Export sinks (JSON Lines, CSV) and batch export pipeline.
+//! Export sinks (JSON Lines, CSV), closed sink configuration, and batch export pipeline.
 
+pub mod csv;
+pub mod jsonl;
+
+use std::path::PathBuf;
+
+use auditstream_core::{Batch, Sink, SinkError};
+use serde::{Deserialize, Serialize};
 use thiserror as _;
 use tokio as _;
 
-/// Placeholder marker for workspace bootstrap verification.
+pub use crate::csv::CsvSink;
+pub use crate::jsonl::JsonLinesSink;
+
+/// Crate identifier retained for workspace smoke checks.
 pub const CRATE_NAME: &str = "auditstream-export";
 
 /// Re-verify dependency wiring to `auditstream-core`.
 pub fn core_crate_name() -> &'static str {
     auditstream_core::CRATE_NAME
+}
+
+/// Closed configuration enum selecting one built-in export sink.
+///
+/// Deserialized with `#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]`
+/// so unknown sink types and unknown fields fail fast with a clear error message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SinkConfig {
+    /// JSON Lines (`jsonl`) sink (`spec/export.md`). Writes to stdout when `path` is absent.
+    Jsonl {
+        /// Optional destination file path; writes to stdout when `None`.
+        path: Option<PathBuf>,
+    },
+    /// RFC 4180 CSV (`csv`) sink (`spec/export.md`). Writes to stdout when `path` is absent.
+    Csv {
+        /// Optional destination file path; writes to stdout when `None`.
+        path: Option<PathBuf>,
+    },
+}
+
+/// Closed runtime sink dispatcher implementing [`Sink`] via exhaustive `match` without boxing.
+#[derive(Debug)]
+pub enum AnySink {
+    /// JSON Lines sink.
+    Jsonl(JsonLinesSink),
+    /// RFC 4180 CSV sink.
+    Csv(CsvSink),
+}
+
+impl AnySink {
+    /// Constructs an [`AnySink`] from a [`SinkConfig`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SinkError`] if opening the underlying sink fails.
+    pub fn open(config: &SinkConfig) -> Result<Self, SinkError> {
+        match config {
+            SinkConfig::Jsonl { path } => Ok(Self::Jsonl(JsonLinesSink::open(path.clone())?)),
+            SinkConfig::Csv { path } => Ok(Self::Csv(CsvSink::open(path.clone())?)),
+        }
+    }
+}
+
+impl Sink for AnySink {
+    async fn write(&mut self, batch: &Batch) -> Result<(), SinkError> {
+        match self {
+            Self::Jsonl(sink) => sink.write(batch).await,
+            Self::Csv(sink) => sink.write(batch).await,
+        }
+    }
+
+    async fn flush(&mut self) -> Result<(), SinkError> {
+        match self {
+            Self::Jsonl(sink) => sink.flush().await,
+            Self::Csv(sink) => sink.flush().await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::path::PathBuf;
+
+    use auditstream_core::{Batch, Sink, SinkError};
+
+    use super::{AnySink, SinkConfig};
+
+    fn assert_send<F: Future + Send>(_: &F) {}
+
+    #[test]
+    fn deserializes_jsonl_and_csv_variants_from_toml() {
+        let jsonl_stdout: SinkConfig = toml::from_str("type = \"jsonl\"\n").expect("parse jsonl");
+        assert_eq!(jsonl_stdout, SinkConfig::Jsonl { path: None });
+
+        let jsonl_file: SinkConfig =
+            toml::from_str("type = \"jsonl\"\npath = \"/tmp/audit.jsonl\"\n")
+                .expect("parse jsonl with path");
+        assert_eq!(
+            jsonl_file,
+            SinkConfig::Jsonl {
+                path: Some(PathBuf::from("/tmp/audit.jsonl"))
+            }
+        );
+
+        let csv_stdout: SinkConfig = toml::from_str("type = \"csv\"\n").expect("parse csv");
+        assert_eq!(csv_stdout, SinkConfig::Csv { path: None });
+
+        let csv_file: SinkConfig = toml::from_str("type = \"csv\"\npath = \"/tmp/audit.csv\"\n")
+            .expect("parse csv with path");
+        assert_eq!(
+            csv_file,
+            SinkConfig::Csv {
+                path: Some(PathBuf::from("/tmp/audit.csv"))
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_type_and_unknown_field_in_toml() {
+        let bad_type = toml::from_str::<SinkConfig>("type = \"parquet\"\n")
+            .expect_err("unknown sink type must fail");
+        assert!(
+            bad_type.to_string().contains("parquet"),
+            "error must name unknown type: {bad_type}"
+        );
+
+        let bad_field = toml::from_str::<SinkConfig>("type = \"jsonl\"\ncompression = \"gzip\"\n")
+            .expect_err("unknown field must fail");
+        assert!(
+            bad_field.to_string().contains("compression"),
+            "error must name unknown field: {bad_field}"
+        );
+    }
+
+    #[tokio::test]
+    async fn any_sink_dispatches_to_placeholders_naming_e1_and_e2() {
+        let batch = Batch::default();
+
+        let mut jsonl =
+            AnySink::open(&SinkConfig::Jsonl { path: None }).expect("open jsonl placeholder");
+        let write_fut = jsonl.write(&batch);
+        assert_send(&write_fut);
+        let err = write_fut.await.expect_err("placeholder must return error");
+        assert!(
+            matches!(err, SinkError::Unimplemented(msg) if msg.contains("E1")),
+            "expected E1 error, got {err:?}"
+        );
+        let flush_err = jsonl.flush().await.expect_err("placeholder flush error");
+        assert!(matches!(flush_err, SinkError::Unimplemented(msg) if msg.contains("E1")));
+
+        let mut csv = AnySink::open(&SinkConfig::Csv {
+            path: Some(PathBuf::from("/tmp/out.csv")),
+        })
+        .expect("open csv placeholder");
+        let write_fut = csv.write(&batch);
+        assert_send(&write_fut);
+        let err = write_fut.await.expect_err("placeholder must return error");
+        assert!(
+            matches!(err, SinkError::Unimplemented(msg) if msg.contains("E2")),
+            "expected E2 error, got {err:?}"
+        );
+        let flush_err = csv.flush().await.expect_err("placeholder flush error");
+        assert!(matches!(flush_err, SinkError::Unimplemented(msg) if msg.contains("E2")));
+    }
 }

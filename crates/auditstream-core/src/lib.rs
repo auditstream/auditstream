@@ -10,6 +10,7 @@ pub mod cursor;
 pub mod error;
 pub mod event;
 pub mod op;
+pub mod ports;
 
 pub use crate::actor::{
     Actor, ActorPayload, ActorType, MAX_PAYLOAD_BYTES, NestedActor, validate_actor_payload,
@@ -17,9 +18,10 @@ pub use crate::actor::{
 pub use crate::batch::Batch;
 pub use crate::context::Context;
 pub use crate::cursor::Cursor;
-pub use crate::error::CoreError;
+pub use crate::error::{BoxError, CoreError, SinkError, SourceError};
 pub use crate::event::{CURRENT_SCHEMA_VERSION, Event};
 pub use crate::op::{ActorSource, MAX_ACTION_CHARS, Op, Source};
+pub use crate::ports::{EventSource, Sink};
 
 /// Crate identifier retained for workspace smoke checks.
 pub const CRATE_NAME: &str = "auditstream-core";
