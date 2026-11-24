@@ -16,12 +16,20 @@ auditstream-pg = { path = "crates/auditstream-pg" }
 auditstream-export = { path = "crates/auditstream-export" }
 
 anyhow = "1"
+assert_cmd = "2"
 clap = { version = "4", features = ["derive", "env"] }
+insta = "1"
+insta-cmd = "0.6"
+predicates = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value", "arbitrary_precision"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "derive"] }
+tempfile = "3"
 thiserror = "2"
 tokio = { version = "1.54", features = ["rt-multi-thread", "macros"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
