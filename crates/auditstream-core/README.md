@@ -16,3 +16,5 @@ Core domain crate for the Auditstream Rust engine.
 - Any I/O or database crate
 
 May depend only on `serde` and `thiserror` (plus pure data helpers).
+
+See the [repository README](../../README.md) and [auditstream.dev/docs](https://auditstream.dev/docs) for full documentation.

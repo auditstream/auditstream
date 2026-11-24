@@ -16,3 +16,5 @@ Postgres adapter crate for the Auditstream Rust engine.
 - `auditstream` (the CLI binary)
 
 May depend on `auditstream-core`, `sqlx` (runtime API only, no `query!` macros), and `tokio`.
+
+See the [repository README](../../README.md) and [auditstream.dev/docs](https://auditstream.dev/docs) for full documentation.

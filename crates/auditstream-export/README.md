@@ -13,3 +13,5 @@ Export sinks and pipeline crate for the Auditstream Rust engine.
 - `auditstream-pg`
 
 May depend on `auditstream-core` and `tokio`.
+
+See the [repository README](../../README.md) and [auditstream.dev/docs](https://auditstream.dev/docs) for full documentation.

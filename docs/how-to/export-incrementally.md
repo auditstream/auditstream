@@ -42,7 +42,7 @@ When appending to a non-empty CSV file, `export` keeps the existing header row.
 
 ## 3. Filter exported events
 
-Narrow exports with `--since`, `--until`, `--actor`, or `--source db|app`:
+Narrow exports with `--since`, `--until`, `--actor`, `--tenant`, or `--source db|app`:
 
 ```sh
 auditstream export \

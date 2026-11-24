@@ -13,7 +13,7 @@ v0.1 captures with generated triggers that write to a partitioned `auditstream.c
 ## Who acted: resolution order
 
 1. `nullif(current_setting('auditstream.actor', true), '')`, set with `set_config(..., true)` inside the transaction. After the transaction the setting reads as an empty string, hence the `nullif`.
-2. The `auditstream` key of the last comment at the end of `right(current_query(), 4096)`, whose body contains no `/`. The value must be base64url; its length is checked outside the regex, because PostgreSQL caps regex repetition counts at 255.
+2. The `auditstream` key of the last comment at the end of `right(current_query(), 4096)`, whose body contains no `/`. `#102` replaced POSIX regex extraction with pure PostgreSQL string builtins (`rtrim`, `right`, `reverse`, `strpos`, `substr`, `ltrim`), checking that the value is 1–683 unpadded base64url characters (`<= 512` decoded UTF-8 bytes) directly without regexes.
 3. The `sub` of `request.jwt.claims`, for Supabase and PostgREST callers.
 4. No actor: the row is still written, with `actor` NULL and `db_user` set to `session_user`.
 
@@ -54,7 +54,13 @@ v0.1 captures with generated triggers that write to a partitioned `auditstream.c
 
 ## Cost
 
-The worst case is a stream of small single-row updates. On the initial prototype benchmark (PostgreSQL 16 on local disk), the full design with the provisional B-tree lookup index cost 40% of throughput with the comment (11,105 to 6,630 transactions per second) and 48% with `set_config`. Adopting the partial hash lookup index ([ADR-0008](../decisions/0008-history-lookup-index.md)) and replacing regexes in `resolve_actor()` with string builtins plus a single-column PK fast path in `capture()` improved single-row UPDATE throughput by +23.4% with comments (+43.4% with `set_config`) and cut 10,000-row bulk insert latency by 25.7% in PostgreSQL 19 `tmpfs` benchmarks. Bulk writes cost much less per row, because INSERT and DELETE triggers run once per statement.
+Measured on 2026-11-24 against PostgreSQL 19.0 and PgBouncer 1.26.1 after adopting the partial hash lookup index ([ADR-0008](../decisions/0008-history-lookup-index.md)), replacing regexes in `resolve_actor()` with string builtins (`#102`), and adding a single-column PK fast path in `capture()` ([full benchmark evidence](https://auditstream.dev/docs/evidence); see also [Evidence](evidence.md)):
+
+- **Durable disk (`fsync=on`, 16 clients):** single-row `UPDATE` adds `+3.2%` (`+5.1 µs/row`), single-row `INSERT` measures `−0.2%`, and a 10,000-row bulk `INSERT` completes in `60.5 ms` (`+3.8 µs/row`).
+- **`tmpfs` ceiling:** statement-level bulk `INSERT`/`DELETE` reach `211k–213k rows/s` and excluded-column no-op updates run at `208k tps` (`0` rows written). Single-statement 10,000-row bulk `UPDATE` runs row-by-row at `~15k rows/s` (`665 ms`, `+64.5 µs/row`) by design so primary-key changes are not split.
+- **PgBouncer 1.26.1:** trailing SQL comments run `1.8×–2.4×` faster than `set_config` across `2,407,659` pooled transactions at 8× oversubscription with `0` actor leaks.
+
+(For historical reference, the initial PostgreSQL 16 prototype with the superseded B-tree lookup index and POSIX regexes measured −40% with comments and −48% with `set_config` on single-row updates.)
 
 ## Where it does not run
 
@@ -69,14 +75,14 @@ v0.1 captures with triggers. Logical replication, which reads the WAL through `p
 | Database setup | Any Postgres the app can migrate, managed free tiers included | `wal_level = logical` and a role with REPLICATION. Neon and RDS need it switched on first; RDS also needs a reboot |
 | Before and after | `OLD` and `NEW` inside the trigger | Full old rows need `REPLICA IDENTITY FULL` on every audited table, which grows the WAL |
 | Actor | Trailing SQL comment per statement, or `set_config` per transaction | Neither reaches the WAL. Each write needs `pg_logical_emit_message(true, 'auditstream', ...)` in an explicit transaction, or a trigger that emits it |
-| Write cost | Synchronous: 40% on single-row updates, the worst case measured | Lower on the write path; the cost moves to WAL volume and a consumer |
+| Write cost | Synchronous: `+3.2%` (`+5.1 µs/row`) on durable-disk single-row updates; `~15k rows/s` on single-statement bulk `UPDATE` (`211k–213k rows/s` on bulk `INSERT`/`DELETE` over `tmpfs`) | Lower on the write path; the cost moves to WAL volume and a consumer |
 | Operations | Nothing runs between exports; `export` reads on demand | A consumer runs all the time. A stopped consumer's slot keeps WAL and can fill the disk; `max_slot_wal_keep_size` caps it by invalidating the slot |
 | History | In the user's database, queried by the app and the CLI | Wherever the consumer writes it |
 
 Two other options were rejected:
 
 - **An outbox drained by a daemon** with LISTEN/NOTIFY and `FOR UPDATE SKIP LOCKED`. The history table is the product and stays append-only, and marking rows as processed would make it mutable. Production reports also show NOTIFY serializing commits under load; a recent core change targets it, but older supported versions still have it.
-- **`set_config` as the main transport.** Comments need no explicit transaction, cost less (40% against 48%) and do not pin RDS Proxy sessions.
+- **`set_config` as the main transport.** Comments need no explicit transaction, run `1.8×–2.4×` faster behind PgBouncer, and do not pin RDS Proxy sessions.
 
 A replication mode comes when users ask for less write overhead and accept the operations it needs. It would read the actor from logical decoding messages, which `pgoutput` delivers since PostgreSQL 14 with its `messages` option. Like the comment, any session can send such a message, so it records who the application says acted; it is not proof of identity. The mode would keep the same history record and contract, in its own crate (see [Cross-cutting choices](engine-architecture.md#cross-cutting-choices)).
 

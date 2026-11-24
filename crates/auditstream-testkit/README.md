@@ -53,3 +53,5 @@ docker run -d --rm --name as-pg16 -e POSTGRES_PASSWORD=postgres -p 5432:5432 pos
 DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres AUDITSTREAM_TEST_PG=16 \
   cargo nextest run -p auditstream-testkit --test it
 ```
+
+See the [repository README](../../README.md) and [auditstream.dev/docs](https://auditstream.dev/docs) for full documentation.

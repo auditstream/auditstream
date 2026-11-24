@@ -2,9 +2,24 @@
 
 Every load-bearing claim in [the handbook](README.md) was re-checked on 2026-11-24, by experiment or against its primary source. Seven experiments and ten source checks changed the handbook; everything else was confirmed as written.
 
+## Release verification suite (2026-11-24 — PostgreSQL 19.0 & PgBouncer 1.26.1)
+
+Post-optimization v0.1.0 benchmark and stress suite run on 2026-11-24 after adopting the partial hash lookup index ([ADR-0008](../decisions/0008-history-lookup-index.md)) and replacing POSIX regexes in `resolve_actor()` with pure string builtins (`#102`). Full methodology and tables live at **[auditstream.dev/docs/evidence](https://auditstream.dev/docs/evidence)**.
+
+| Suite | Environment | Verified result |
+| --- | --- | --- |
+| Durable-disk single-row `UPDATE` | PostgreSQL 19.0, `fsync=on`, 16 clients | **`+3.2%` (`+5.1 µs/row`)** overhead |
+| Durable-disk single-row `INSERT` | PostgreSQL 19.0, `fsync=on`, 16 clients | **`−0.2%`** (within noise) |
+| Durable-disk 10,000-row bulk `INSERT` | PostgreSQL 19.0, `fsync=on`, 16 clients | **`60.5 ms` (`+3.8 µs/row`)** |
+| `tmpfs` bulk `INSERT` / `DELETE` | PostgreSQL 19.0, `tmpfs` | **`211k–213k rows/s`** (statement-level transition tables) |
+| `tmpfs` 10,000-row bulk `UPDATE` | PostgreSQL 19.0, `tmpfs` | **`~15k rows/s`** (`665 ms`, `+64.5 µs/row`; row-by-row by design so primary-key updates are not split) |
+| `tmpfs` excluded-column no-op `UPDATE` | PostgreSQL 19.0, `tmpfs` | **`208k tps`** with **`0`** audit rows written |
+| Pooled concurrency & actor isolation | PgBouncer 1.26.1, 8× oversubscription | **`2,407,659`** pooled transactions, **`0`** actor leaks; `comment` **`1.8×–2.4×`** faster than `set_config` |
+| 500k-row CLI `export` & lookup | PostgreSQL 19.0, 500,000 history rows | **`29.3k events/s`** JSONL / **`28.8k events/s`** redacted (`−1.8%`); **`0.101 ms`** partial hash lookup (**`157k`** concurrent QPS) |
+
 ## Experiments
 
-PostgreSQL 16.15, Node 22.23, 4 vCPUs, local socket. pgbench ran 4 clients for 12 to 15 seconds per scenario.
+*Historical pre-release prototype spikes (2026-11-24, before ADR-0008 and `#102`):* PostgreSQL 16.15, Node 22.23, 4 vCPUs, local socket. pgbench ran 4 clients for 12 to 15 seconds per scenario.
 
 | Test | Result | Changed in the handbook |
 | --- | --- | --- |

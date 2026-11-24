@@ -2,13 +2,14 @@
 
 The auditstream organization holds one repository per deliverable, and the engine repository owns the contract every other repository depends on.
 
-| Repository | Holds | Publishes | When |
+| Repository | Holds | Publishes | Status |
 | --- | --- | --- | --- |
-| auditstream | Rust engine and CLI, the contract in `spec/`, architecture docs, ADRs and the shared contribution standards | Binaries through dist: npm `auditstream`, Homebrew, shell installer, `ghcr.io/auditstream/auditstream`. Crates go to crates.io once the event schema is stable | Created, private |
-| auditstream-js | TypeScript adapters | npm `@auditstream/node`, `@auditstream/prisma`, `@auditstream/drizzle` | Created, private |
-| homebrew-tap | Homebrew formula written by the release pipeline | Homebrew tap `auditstream/tap` | First release |
-| .github | Organization profile and shared community files | None | When the code goes public |
-| auditstream-python, -go, -ruby | Language adapters | PyPI `auditstream`, Go module | When users ask |
+| [`auditstream/auditstream`](https://github.com/auditstream/auditstream) | Rust engine and CLI, the contract in `spec/`, architecture docs, ADRs and the shared contribution standards | Binaries through dist: npm `auditstream`, Homebrew, shell installer, `ghcr.io/auditstream/auditstream`. Crates go to crates.io once the event schema is stable | Live, public |
+| [`auditstream/auditstream-js`](https://github.com/auditstream/auditstream-js) | TypeScript adapters | npm `@auditstream/node`, `@auditstream/prisma`, `@auditstream/drizzle` | Live, public |
+| [`auditstream/site`](https://github.com/auditstream/site) | Documentation and marketing site (`auditstream.dev`) | `https://auditstream.dev` | Live, public |
+| [`auditstream/homebrew-tap`](https://github.com/auditstream/homebrew-tap) | Homebrew formula written by the release pipeline | Homebrew tap `auditstream/tap` | Live, public |
+| [`auditstream/.github`](https://github.com/auditstream/.github) | Organization profile, reusable workflows, and shared community files | None | Live, public |
+| `auditstream-python`, `-go`, `-ruby` | Language adapters | PyPI `auditstream`, Go module | Planned (when users ask) |
 
 Ownership rules:
 

@@ -62,13 +62,12 @@ Run [`auditstream verify`](../reference/cli/verify.md) in CI and on a schedule t
 
 ## Write overhead
 
-The worst case is a stream of small single-row updates:
+Measured on 2026-11-24 against PostgreSQL 19.0 and PgBouncer 1.26.1 ([full benchmark evidence](https://auditstream.dev/docs/evidence); see also [Evidence](../handbook/evidence.md)):
 
-- Trailing SQL comment: **40% lower throughput** (11,105 down to 6,630 transactions per second on PostgreSQL 16).
-- Transaction-local `set_config`: **48% lower throughput** on the same workload.
-
-Bulk writes cost much less per row because `INSERT` and `DELETE` triggers fire once per statement.
-Full measurements live in [Evidence](../handbook/evidence.md).
+- **Durable disk (`fsync=on`, 16 clients):** single-row `UPDATE` adds **`+3.2%` (`+5.1 µs/row`)**, single-row `INSERT` measures **`−0.2%`** (within noise), and a 10,000-row bulk `INSERT` completes in **`60.5 ms` (`+3.8 µs/row`)**.
+- **`tmpfs` ceiling:** statement-level bulk `INSERT` and `DELETE` sustain **`211k–213k rows/s`**, and excluded-column no-op updates sustain **`208k tps`** with **`0`** audit rows written.
+- **Single-statement bulk `UPDATE` (~15k rows/s):** updating 10,000 rows in one SQL statement runs row-by-row (`665 ms`, `+64.5 µs/row`) by design because statement-level `UPDATE` transition tables split primary-key changes into two half-events.
+- **PgBouncer 1.26.1:** trailing SQL comments run **`1.8×–2.4×`** faster than transaction-local `set_config` under pooled concurrency (`2,407,659` pooled transactions at 8× oversubscription with `0` actor leaks).
 
 ## Where Auditstream does not run
 

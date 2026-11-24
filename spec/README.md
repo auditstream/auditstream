@@ -33,17 +33,17 @@ All prose outside normative requirements — including sections labeled *(Inform
 
 ## Specification files
 
-| File | Defines | Issue |
-| --- | --- | --- |
-| [spec/README.md](README.md) | Scope, RFC 2119 / RFC 8174 wording, versioning rules | #13 (B1) |
-| [spec/compliance.md](compliance.md) | Feature support matrix across implementations | #13 (B1) |
-| [spec/CHANGELOG.md](CHANGELOG.md) | Independent spec release history | #13 (B1) |
-| [spec/AGENTS.md](AGENTS.md) | *(Informative)* Agent contribution rules for `spec/` | #10 (A3) |
-| [spec/actor.md](actor.md) and [spec/schemas/actor.schema.json](schemas/actor.schema.json) | Actor and context object schemas and constraints | #14 (B2) |
-| [spec/transport.md](transport.md) | Comment transport, `set_config` transport, precedence, size limit, prepared statement rule | #15 (B3) |
-| [spec/history-table.md](history-table.md) | History table columns, `log_event` function, generated SQL guarantees | #16 (B4) |
-| [spec/export.md](export.md) and [spec/schemas/event.schema.json](schemas/event.schema.json) | Export record format in JSON Lines and CSV | #17 (B5) |
-| [spec/conformance/](conformance/README.md) | Language-neutral conformance fixture format and test cases | #18 (B6) |
+| File | Defines |
+| --- | --- |
+| [spec/README.md](README.md) | Scope, RFC 2119 / RFC 8174 wording, versioning rules |
+| [spec/compliance.md](compliance.md) | Feature support matrix across implementations |
+| [spec/CHANGELOG.md](CHANGELOG.md) | Independent spec release history |
+| [spec/AGENTS.md](AGENTS.md) | *(Informative)* Agent contribution rules for `spec/` |
+| [spec/actor.md](actor.md) and [spec/schemas/actor.schema.json](schemas/actor.schema.json) | Actor and context object schemas and constraints |
+| [spec/transport.md](transport.md) | Comment transport, `set_config` transport, precedence, size limit, prepared statement rule |
+| [spec/history-table.md](history-table.md) | History table columns, `log_event` function, generated SQL guarantees |
+| [spec/export.md](export.md) and [spec/schemas/event.schema.json](schemas/event.schema.json) | Export record format in JSON Lines and CSV |
+| [spec/conformance/](conformance/README.md) | Language-neutral conformance fixture format and test cases |
 
 ## Versioning
 
