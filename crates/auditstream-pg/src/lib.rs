@@ -1,11 +1,10 @@
 //! Postgres introspection, DDL and trigger generation, migration writers and history reader.
 
 pub mod ddl;
+pub mod introspect;
 pub mod reader;
 pub mod triggers;
 
-use sqlx as _;
-use thiserror as _;
 use tokio as _;
 
 /// Crate identifier retained for workspace smoke checks.

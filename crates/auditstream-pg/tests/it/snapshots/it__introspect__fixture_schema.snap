@@ -1,0 +1,214 @@
+---
+source: crates/auditstream-pg/tests/it/introspect.rs
+expression: normalized
+---
+[
+    TableInfo {
+        oid: 0,
+        schema: "fixture",
+        name: "MixedCase",
+        kind: Ordinary,
+        columns: [
+            ColumnInfo {
+                name: "UserId",
+                data_type: "integer",
+                nullable: false,
+                identity: Some(
+                    ByDefault,
+                ),
+                generated: None,
+            },
+            ColumnInfo {
+                name: "DisplayName",
+                data_type: "character varying(120)",
+                nullable: true,
+                identity: None,
+                generated: None,
+            },
+        ],
+        primary_key: [
+            "UserId",
+        ],
+        partitions: [],
+    },
+    TableInfo {
+        oid: 0,
+        schema: "fixture",
+        name: "Order Items",
+        kind: Ordinary,
+        columns: [
+            ColumnInfo {
+                name: "seq_no",
+                data_type: "integer",
+                nullable: false,
+                identity: None,
+                generated: None,
+            },
+            ColumnInfo {
+                name: "tenant_id",
+                data_type: "uuid",
+                nullable: false,
+                identity: None,
+                generated: None,
+            },
+            ColumnInfo {
+                name: "Unit Price",
+                data_type: "numeric(10,2)",
+                nullable: false,
+                identity: None,
+                generated: None,
+            },
+        ],
+        primary_key: [
+            "tenant_id",
+            "seq_no",
+        ],
+        partitions: [],
+    },
+    TableInfo {
+        oid: 0,
+        schema: "fixture",
+        name: "event_notes",
+        kind: Ordinary,
+        columns: [
+            ColumnInfo {
+                name: "body",
+                data_type: "text",
+                nullable: false,
+                identity: None,
+                generated: None,
+            },
+            ColumnInfo {
+                name: "created_at",
+                data_type: "timestamp with time zone",
+                nullable: true,
+                identity: None,
+                generated: None,
+            },
+        ],
+        primary_key: [],
+        partitions: [],
+    },
+    TableInfo {
+        oid: 0,
+        schema: "fixture",
+        name: "invoice",
+        kind: Ordinary,
+        columns: [
+            ColumnInfo {
+                name: "id",
+                data_type: "bigint",
+                nullable: false,
+                identity: Some(
+                    Always,
+                ),
+                generated: None,
+            },
+            ColumnInfo {
+                name: "status",
+                data_type: "text",
+                nullable: false,
+                identity: None,
+                generated: None,
+            },
+            ColumnInfo {
+                name: "subtotal",
+                data_type: "numeric(12,2)",
+                nullable: false,
+                identity: None,
+                generated: None,
+            },
+            ColumnInfo {
+                name: "tax",
+                data_type: "numeric(12,2)",
+                nullable: false,
+                identity: None,
+                generated: None,
+            },
+            ColumnInfo {
+                name: "total",
+                data_type: "numeric(12,2)",
+                nullable: true,
+                identity: None,
+                generated: Some(
+                    Stored,
+                ),
+            },
+            ColumnInfo {
+                name: "notes",
+                data_type: "text",
+                nullable: true,
+                identity: None,
+                generated: None,
+            },
+        ],
+        primary_key: [
+            "id",
+        ],
+        partitions: [],
+    },
+    TableInfo {
+        oid: 0,
+        schema: "fixture",
+        name: "ledger",
+        kind: Partitioned,
+        columns: [
+            ColumnInfo {
+                name: "region",
+                data_type: "text",
+                nullable: false,
+                identity: None,
+                generated: None,
+            },
+            ColumnInfo {
+                name: "ym",
+                data_type: "integer",
+                nullable: false,
+                identity: None,
+                generated: None,
+            },
+            ColumnInfo {
+                name: "amount",
+                data_type: "numeric",
+                nullable: false,
+                identity: None,
+                generated: None,
+            },
+        ],
+        primary_key: [
+            "region",
+            "ym",
+        ],
+        partitions: [
+            PartitionInfo {
+                oid: 0,
+                schema: "fixture",
+                name: "ledger_default",
+                kind: Ordinary,
+                partitions: [],
+            },
+            PartitionInfo {
+                oid: 0,
+                schema: "fixture",
+                name: "ledger_eu",
+                kind: Ordinary,
+                partitions: [],
+            },
+            PartitionInfo {
+                oid: 0,
+                schema: "fixture",
+                name: "ledger_us",
+                kind: Partitioned,
+                partitions: [
+                    PartitionInfo {
+                        oid: 0,
+                        schema: "fixture",
+                        name: "ledger_us_2026",
+                        kind: Ordinary,
+                        partitions: [],
+                    },
+                ],
+            },
+        ],
+    },
+]
