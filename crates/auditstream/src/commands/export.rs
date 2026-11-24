@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
 
+use crate::commands::common::{connect_database, require_database_url, run_async};
 use crate::config::Config;
 use crate::exit::{Exit, ExitCodeExt};
 
@@ -396,12 +397,7 @@ pub(crate) fn run(args: &Args, config: &Config) -> anyhow::Result<()> {
     if args.filters.actor.as_ref().is_some_and(String::is_empty) {
         return Err(anyhow!("--actor must not be empty")).exit_code(Exit::Usage);
     }
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to start async runtime")
-        .exit_code(Exit::Internal)?
-        .block_on(export(args, config))
+    run_async(export(args, config))
 }
 
 struct OpenedCheckpoint {
@@ -514,15 +510,8 @@ async fn run_pipeline<S: EventSource, K: Sink>(
 }
 
 async fn export(args: &Args, config: &Config) -> anyhow::Result<()> {
-    let url = config
-        .database_url
-        .as_ref()
-        .context("missing database URL: pass --database-url or set AUDITSTREAM_DATABASE_URL / DATABASE_URL")
-        .exit_code(Exit::Usage)?;
-    let pool = auditstream_pg::connect(url.expose())
-        .await
-        .with_context(|| format!("could not connect to database {}", url.redacted()))
-        .exit_code(Exit::Database)?;
+    let url = require_database_url(config)?;
+    let pool = connect_database(url).await?;
     let result = export_with_pool(args, config, pool.clone()).await;
     pool.close().await;
     result

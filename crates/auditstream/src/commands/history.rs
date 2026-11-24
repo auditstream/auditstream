@@ -16,6 +16,7 @@ use serde_json::value::RawValue;
 use time::format_description::well_known::Rfc3339;
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset};
 
+use crate::commands::common::{connect_database, parse_table_ref, require_database_url, run_async};
 use crate::config::Config;
 use crate::exit::{Exit, ExitCodeExt, write_stdout};
 
@@ -83,25 +84,10 @@ pub(crate) struct Args {
 /// Runs the `history` command.
 pub(crate) fn run(args: &Args, config: &Config) -> anyhow::Result<()> {
     let query = build_query(args)?;
+    let db_url = require_database_url(config)?;
 
-    let Some(db_url) = config.database_url.as_ref() else {
-        return Err(anyhow!(
-            "missing database URL: pass --database-url or set AUDITSTREAM_DATABASE_URL / DATABASE_URL"
-        ))
-        .exit_code(Exit::Usage);
-    };
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| anyhow!("failed to start async runtime: {err}"))
-        .exit_code(Exit::Internal)?;
-
-    let events = runtime.block_on(async {
-        let pool = auditstream_pg::connect(db_url.expose())
-            .await
-            .map_err(|err| anyhow!("could not connect to database {}: {err}", db_url.redacted()))
-            .exit_code(Exit::Database)?;
+    let events = run_async(async {
+        let pool = connect_database(db_url).await?;
 
         let result = reader::lookup(&pool, &config.schema, &query)
             .await
@@ -150,7 +136,7 @@ fn build_query(args: &Args) -> anyhow::Result<HistoryQuery> {
 
     let (schema_name, table) = match args.table.as_deref() {
         Some(raw) => {
-            let (schema, tbl) = parse_table_spec(raw)?;
+            let (schema, tbl) = parse_table_ref(raw, "--table")?;
             (Some(schema), Some(tbl))
         }
         None => (None, None),
@@ -199,23 +185,6 @@ fn build_query(args: &Args) -> anyhow::Result<HistoryQuery> {
         source: None,
         limit: args.limit,
     })
-}
-
-fn parse_table_spec(raw: &str) -> anyhow::Result<(String, String)> {
-    let mut parts = raw.split('.');
-    let (Some(schema), Some(table), None) = (parts.next(), parts.next(), parts.next()) else {
-        return Err(anyhow!(
-            "invalid --table `{raw}`: expected `<schema>.<table>`"
-        ))
-        .exit_code(Exit::Usage);
-    };
-    if schema.is_empty() || table.is_empty() {
-        return Err(anyhow!(
-            "invalid --table `{raw}`: expected `<schema>.<table>`"
-        ))
-        .exit_code(Exit::Usage);
-    }
-    Ok((schema.to_owned(), table.to_owned()))
 }
 
 fn parse_record_id_filter(raw: &str) -> anyhow::Result<RecordIdFilter> {

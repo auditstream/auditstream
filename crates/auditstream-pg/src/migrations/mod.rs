@@ -356,6 +356,121 @@ pub(crate) fn format_timestamp(dt: OffsetDateTime) -> String {
     )
 }
 
+/// Planned migration state after comparing the current options against the newest existing
+/// Auditstream migration on disk.
+pub(crate) enum PlannedMigration {
+    /// Existing migration already matches the requested selection.
+    UpToDate { existing: PathBuf },
+    /// A new migration must be rendered with these statements.
+    Changed {
+        manifest: Manifest,
+        dropped_tables: Vec<(String, String)>,
+        statements: Vec<String>,
+    },
+}
+
+pub(crate) fn plan_migration(
+    options: &MigrationOptions,
+    newest: Option<(PathBuf, Manifest)>,
+) -> PlannedMigration {
+    let current = build_manifest(options);
+    let prev_manifest = match newest {
+        Some((existing, prev))
+            if prev.canonical_json == current.canonical_json
+                && options.removed_tables.is_empty() =>
+        {
+            return PlannedMigration::UpToDate { existing };
+        }
+        Some((_, prev)) => Some(prev),
+        None => None,
+    };
+
+    let dropped_tables =
+        compute_dropped_tables(prev_manifest.as_ref(), &current, &options.removed_tables);
+    let statements = compose_statements(options, &dropped_tables);
+    PlannedMigration::Changed {
+        manifest: current,
+        dropped_tables,
+        statements,
+    }
+}
+
+pub(crate) fn preview_with(
+    options: &MigrationOptions,
+    newest: Option<(PathBuf, Manifest)>,
+    render: impl FnOnce(&Manifest, &[String]) -> String,
+) -> PreviewOutcome {
+    match plan_migration(options, newest) {
+        PlannedMigration::UpToDate { existing } => PreviewOutcome::UpToDate { existing },
+        PlannedMigration::Changed {
+            manifest,
+            dropped_tables,
+            statements,
+        } => PreviewOutcome::Sql {
+            sql: render(&manifest, &statements),
+            dropped_tables,
+        },
+    }
+}
+
+/// Scans `<out_dir>/<name>/migration.sql` folders (Prisma and Drizzle 1.x layouts) and returns
+/// the lexicographically newest folder containing an Auditstream manifest comment.
+pub(crate) fn find_newest_folder_migration(
+    out_dir: &Path,
+) -> Result<Option<(PathBuf, Manifest)>, MigrationError> {
+    if !out_dir.exists() {
+        return Ok(None);
+    }
+
+    let mut dirs: Vec<(String, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(out_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let migration_sql = path.join("migration.sql");
+        if migration_sql.is_file() {
+            dirs.push((name, migration_sql));
+        }
+    }
+
+    dirs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (_, sql_path) in dirs.into_iter().rev() {
+        if let Some(manifest) = parse_manifest_from_file(&sql_path)? {
+            return Ok(Some((sql_path, manifest)));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Creates a new `<out_dir>/<YYYYMMDDHHMMSS>_auditstream/migration.sql` folder and writes
+/// `rendered` SQL into it.
+pub(crate) fn write_folder_migration(
+    options: &MigrationOptions,
+    rendered: &str,
+    dropped_tables: Vec<(String, String)>,
+) -> Result<WriteOutcome, MigrationError> {
+    fs::create_dir_all(&options.out_dir)?;
+    let ts = next_unique_timestamp(options.now, |ts| {
+        options.out_dir.join(format!("{ts}_auditstream")).exists()
+    });
+    let folder = options.out_dir.join(format!("{ts}_auditstream"));
+    fs::create_dir(&folder)?;
+    let file_path = folder.join("migration.sql");
+    fs::write(&file_path, rendered)?;
+
+    Ok(WriteOutcome::Written {
+        files: vec![file_path],
+        dropped_tables,
+    })
+}
+
 /// Finds a unique timestamp prefix `YYYYMMDDHHMMSS` strictly greater than any existing name
 /// colliding with `format_name(ts)`.
 pub(crate) fn next_unique_timestamp(

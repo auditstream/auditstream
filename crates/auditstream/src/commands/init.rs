@@ -15,11 +15,14 @@ use auditstream_pg::introspect::{self, IntrospectError, IntrospectOptions, Table
 use auditstream_pg::migrations::{
     self, MigrationFormat as PgMigrationFormat, MigrationOptions, PreviewOutcome, WriteOutcome,
 };
-use auditstream_pg::triggers::TableTriggerSpec;
 use clap::Args as ClapArgs;
 use time::OffsetDateTime;
 use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
 
+use crate::commands::common::{
+    connect_database, parse_exclude_refs, parse_table_refs, require_database_url,
+    run_async as run_command_async, table_trigger_spec,
+};
 use crate::config::{Config, MigrationFormat};
 use crate::exit::{Exit, ExitCodeExt, write_stdout};
 
@@ -49,32 +52,18 @@ pub(crate) struct Args {
 
 /// Runs the `init` command.
 pub(crate) fn run(args: &Args, config: &Config) -> anyhow::Result<()> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| anyhow!("failed to start async runtime: {err}"))
-        .exit_code(Exit::Internal)?;
-
-    runtime.block_on(run_async(args, config))
+    run_command_async(run_async(args, config))
 }
 
 #[allow(clippy::too_many_lines)]
 async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
-    let Some(db_url) = config.database_url.as_ref() else {
-        return Err(anyhow!(
-            "missing database URL: pass --database-url or set AUDITSTREAM_DATABASE_URL / DATABASE_URL"
-        ))
-        .exit_code(Exit::Usage);
-    };
+    let db_url = require_database_url(config)?;
 
     // Parse table and exclusion specs up front so syntax mistakes exit 2 immediately.
-    let parsed_tables = parse_table_refs(&config.capture.tables)?;
-    let parsed_excludes = parse_exclude_refs(&config.capture.exclude)?;
+    let parsed_tables = parse_table_refs(&config.capture.tables, false)?;
+    let parsed_excludes = parse_exclude_refs(&config.capture.exclude, false)?;
 
-    let pool = auditstream_pg::connect(db_url.expose())
-        .await
-        .map_err(|err| anyhow!("could not connect to database {}: {err}", db_url.redacted()))
-        .exit_code(Exit::Database)?;
+    let pool = connect_database(db_url).await?;
 
     let introspect_opts = IntrospectOptions::with_audit_schema(&config.schema);
 
@@ -196,16 +185,13 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
             canonical_excludes.push(format!("{schema}.{table}.{col}"));
         }
 
-        let mut spec = TableTriggerSpec::new(
+        trigger_specs.push(table_trigger_spec(
             schema.clone(),
             table.clone(),
             info.primary_key.clone(),
             excluded_cols,
-        );
-        if info.kind == TableKind::Partitioned {
-            spec = spec.partitioned();
-        }
-        trigger_specs.push(spec);
+            info.kind == TableKind::Partitioned,
+        ));
     }
 
     let out_dir = config
@@ -272,50 +258,6 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-fn parse_table_refs(raw: &[String]) -> anyhow::Result<Vec<(String, String)>> {
-    let mut parsed = Vec::with_capacity(raw.len());
-    for entry in raw {
-        let mut parts = entry.split('.');
-        let (Some(schema), Some(table), None) = (parts.next(), parts.next(), parts.next()) else {
-            return Err(anyhow!(
-                "invalid table specifier `{entry}`: expected `<schema>.<table>`"
-            ))
-            .exit_code(Exit::Usage);
-        };
-        if schema.is_empty() || table.is_empty() {
-            return Err(anyhow!(
-                "invalid table specifier `{entry}`: expected `<schema>.<table>`"
-            ))
-            .exit_code(Exit::Usage);
-        }
-        parsed.push((schema.to_owned(), table.to_owned()));
-    }
-    Ok(parsed)
-}
-
-fn parse_exclude_refs(raw: &[String]) -> anyhow::Result<Vec<(String, String, String)>> {
-    let mut parsed = Vec::with_capacity(raw.len());
-    for entry in raw {
-        let mut parts = entry.split('.');
-        let (Some(schema), Some(table), Some(column), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            return Err(anyhow!(
-                "invalid excluded column specifier `{entry}`: expected `<schema>.<table>.<column>`"
-            ))
-            .exit_code(Exit::Usage);
-        };
-        if schema.is_empty() || table.is_empty() || column.is_empty() {
-            return Err(anyhow!(
-                "invalid excluded column specifier `{entry}`: expected `<schema>.<table>.<column>`"
-            ))
-            .exit_code(Exit::Usage);
-        }
-        parsed.push((schema.to_owned(), table.to_owned(), column.to_owned()));
-    }
-    Ok(parsed)
 }
 
 const fn default_out_dir(format: MigrationFormat) -> &'static str {

@@ -11,65 +11,53 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use super::{
-    DrizzleLayout, Manifest, MigrationError, MigrationOptions, PreviewOutcome, WriteOutcome,
-    build_manifest, compose_statements, compute_dropped_tables, header_comment,
-    next_unique_timestamp, parse_manifest_from_file,
+    DrizzleLayout, Manifest, MigrationError, MigrationOptions, PlannedMigration, PreviewOutcome,
+    WriteOutcome, find_newest_folder_migration, header_comment, parse_manifest_from_file,
+    plan_migration, preview_with, write_folder_migration,
 };
 
 pub(crate) fn preview(options: &MigrationOptions) -> Result<PreviewOutcome, MigrationError> {
     let layout = options
         .drizzle_layout
         .unwrap_or_else(|| detect_layout(&options.out_dir));
-    let current = build_manifest(options);
     let newest = match layout {
         DrizzleLayout::V045 => find_newest_v045_migration(&options.out_dir)?,
-        DrizzleLayout::V1 => find_newest_v1_migration(&options.out_dir)?,
+        DrizzleLayout::V1 => find_newest_folder_migration(&options.out_dir)?,
     };
 
-    if let Some((ref existing_path, ref prev_manifest)) = newest
-        && prev_manifest.canonical_json == current.canonical_json
-        && options.removed_tables.is_empty()
-    {
-        return Ok(PreviewOutcome::UpToDate {
-            existing: existing_path.clone(),
-        });
-    }
-
-    let dropped_tables = compute_dropped_tables(
-        newest.as_ref().map(|(_, m)| m),
-        &current,
-        &options.removed_tables,
-    );
-    let statements = compose_statements(options, &dropped_tables);
-    Ok(PreviewOutcome::Sql {
-        sql: render_drizzle_sql(&current, &statements),
-        dropped_tables,
-    })
+    Ok(preview_with(options, newest, render_drizzle_sql))
 }
 
-fn find_newest_v045_migration(
-    out_dir: &Path,
-) -> Result<Option<(PathBuf, Manifest)>, MigrationError> {
-    let journal_path = out_dir.join("meta").join("_journal.json");
-    if !journal_path.is_file() {
-        return Ok(None);
-    }
-    let raw = fs::read_to_string(&journal_path)?;
-    let journal: Value = serde_json::from_str(&raw).map_err(|err| {
+fn read_journal_json(journal_path: &Path) -> Result<Value, MigrationError> {
+    let raw = fs::read_to_string(journal_path)?;
+    serde_json::from_str(&raw).map_err(|err| {
         MigrationError::InvalidMetadata(format!(
             "invalid Drizzle journal {}: {err}",
             journal_path.display()
         ))
-    })?;
-    let entries = journal
+    })
+}
+
+fn journal_entries<'a>(
+    journal: &'a Value,
+    journal_path: &Path,
+) -> Result<&'a [Value], MigrationError> {
+    journal
         .get("entries")
         .and_then(Value::as_array)
+        .map(Vec::as_slice)
         .ok_or_else(|| {
             MigrationError::InvalidMetadata(format!(
                 "Drizzle journal {} is missing an `entries` array",
                 journal_path.display()
             ))
-        })?;
+        })
+}
+
+fn find_newest_v045_in_entries(
+    out_dir: &Path,
+    entries: &[Value],
+) -> Result<Option<(PathBuf, Manifest)>, MigrationError> {
     for entry in entries.iter().rev() {
         if let Some(tag) = entry.get("tag").and_then(Value::as_str) {
             let sql_path = out_dir.join(format!("{tag}.sql"));
@@ -81,6 +69,18 @@ fn find_newest_v045_migration(
         }
     }
     Ok(None)
+}
+
+fn find_newest_v045_migration(
+    out_dir: &Path,
+) -> Result<Option<(PathBuf, Manifest)>, MigrationError> {
+    let journal_path = out_dir.join("meta").join("_journal.json");
+    if !journal_path.is_file() {
+        return Ok(None);
+    }
+    let journal = read_journal_json(&journal_path)?;
+    let entries = journal_entries(&journal, &journal_path)?;
+    find_newest_v045_in_entries(out_dir, entries)
 }
 
 /// Statement separator recognized by both Drizzle 0.45 and Drizzle 1.x migrators.
@@ -108,18 +108,11 @@ pub(crate) fn write(options: &MigrationOptions) -> Result<WriteOutcome, Migratio
 }
 
 fn write_v045(options: &MigrationOptions) -> Result<WriteOutcome, MigrationError> {
-    let current = build_manifest(options);
     let meta_dir = options.out_dir.join("meta");
     let journal_path = meta_dir.join("_journal.json");
 
     let mut journal: Value = if journal_path.is_file() {
-        let raw = fs::read_to_string(&journal_path)?;
-        serde_json::from_str(&raw).map_err(|err| {
-            MigrationError::InvalidMetadata(format!(
-                "invalid Drizzle journal {}: {err}",
-                journal_path.display()
-            ))
-        })?
+        read_journal_json(&journal_path)?
     } else {
         json!({
             "version": "7",
@@ -128,17 +121,7 @@ fn write_v045(options: &MigrationOptions) -> Result<WriteOutcome, MigrationError
         })
     };
 
-    let entries = journal
-        .get("entries")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            MigrationError::InvalidMetadata(format!(
-                "Drizzle journal {} is missing an `entries` array",
-                journal_path.display()
-            ))
-        })?;
-
-    let mut newest: Option<(PathBuf, Manifest)> = None;
+    let entries = journal_entries(&journal, &journal_path)?;
     let mut max_idx: Option<u64> = None;
     let mut max_when: Option<i64> = None;
 
@@ -151,34 +134,15 @@ fn write_v045(options: &MigrationOptions) -> Result<WriteOutcome, MigrationError
         }
     }
 
-    for entry in entries.iter().rev() {
-        if let Some(tag) = entry.get("tag").and_then(Value::as_str) {
-            let sql_path = options.out_dir.join(format!("{tag}.sql"));
-            if sql_path.is_file()
-                && let Some(manifest) = parse_manifest_from_file(&sql_path)?
-            {
-                newest = Some((sql_path, manifest));
-                break;
-            }
-        }
-    }
-
-    if let Some((ref existing_path, ref prev_manifest)) = newest
-        && prev_manifest.canonical_json == current.canonical_json
-        && options.removed_tables.is_empty()
-    {
-        return Ok(WriteOutcome::UpToDate {
-            existing: existing_path.clone(),
-        });
-    }
-
-    let dropped_tables = compute_dropped_tables(
-        newest.as_ref().map(|(_, m)| m),
-        &current,
-        &options.removed_tables,
-    );
-    let statements = compose_statements(options, &dropped_tables);
-    let rendered = render_drizzle_sql(&current, &statements);
+    let newest = find_newest_v045_in_entries(&options.out_dir, entries)?;
+    let (rendered, dropped_tables) = match plan_migration(options, newest) {
+        PlannedMigration::UpToDate { existing } => return Ok(WriteOutcome::UpToDate { existing }),
+        PlannedMigration::Changed {
+            manifest,
+            dropped_tables,
+            statements,
+        } => (render_drizzle_sql(&manifest, &statements), dropped_tables),
+    };
 
     let next_idx = max_idx.map_or(0, |m| m + 1);
     let now_millis = i64::try_from(options.now.unix_timestamp_nanos() / 1_000_000).unwrap_or(0);
@@ -213,39 +177,18 @@ fn write_v045(options: &MigrationOptions) -> Result<WriteOutcome, MigrationError
 }
 
 fn write_v1(options: &MigrationOptions) -> Result<WriteOutcome, MigrationError> {
-    let current = build_manifest(options);
-    let newest = find_newest_v1_migration(&options.out_dir)?;
-
-    if let Some((ref existing_path, ref prev_manifest)) = newest
-        && prev_manifest.canonical_json == current.canonical_json
-        && options.removed_tables.is_empty()
-    {
-        return Ok(WriteOutcome::UpToDate {
-            existing: existing_path.clone(),
-        });
+    let newest = find_newest_folder_migration(&options.out_dir)?;
+    match plan_migration(options, newest) {
+        PlannedMigration::UpToDate { existing } => Ok(WriteOutcome::UpToDate { existing }),
+        PlannedMigration::Changed {
+            manifest,
+            dropped_tables,
+            statements,
+        } => {
+            let rendered = render_drizzle_sql(&manifest, &statements);
+            write_folder_migration(options, &rendered, dropped_tables)
+        }
     }
-
-    let dropped_tables = compute_dropped_tables(
-        newest.as_ref().map(|(_, m)| m),
-        &current,
-        &options.removed_tables,
-    );
-    let statements = compose_statements(options, &dropped_tables);
-    let rendered = render_drizzle_sql(&current, &statements);
-
-    fs::create_dir_all(&options.out_dir)?;
-    let ts = next_unique_timestamp(options.now, |ts| {
-        options.out_dir.join(format!("{ts}_auditstream")).exists()
-    });
-    let folder = options.out_dir.join(format!("{ts}_auditstream"));
-    fs::create_dir(&folder)?;
-    let file_path = folder.join("migration.sql");
-    fs::write(&file_path, rendered)?;
-
-    Ok(WriteOutcome::Written {
-        files: vec![file_path],
-        dropped_tables,
-    })
 }
 
 pub(crate) fn render_drizzle_sql(manifest: &Manifest, statements: &[String]) -> String {
@@ -263,36 +206,4 @@ pub(crate) fn render_drizzle_sql(manifest: &Manifest, statements: &[String]) -> 
     }
     out.push('\n');
     out
-}
-
-fn find_newest_v1_migration(out_dir: &Path) -> Result<Option<(PathBuf, Manifest)>, MigrationError> {
-    if !out_dir.exists() {
-        return Ok(None);
-    }
-
-    let mut dirs: Vec<(String, PathBuf)> = Vec::new();
-    for entry in fs::read_dir(out_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let migration_sql = path.join("migration.sql");
-        if migration_sql.is_file() {
-            dirs.push((name, migration_sql));
-        }
-    }
-
-    dirs.sort_by(|a, b| a.0.cmp(&b.0));
-
-    for (_, sql_path) in dirs.into_iter().rev() {
-        if let Some(manifest) = parse_manifest_from_file(&sql_path)? {
-            return Ok(Some((sql_path, manifest)));
-        }
-    }
-
-    Ok(None)
 }

@@ -1,5 +1,6 @@
 //! CLI subcommand dispatch and stub modules.
 
+pub(crate) mod common;
 pub(crate) mod export;
 pub(crate) mod history;
 pub(crate) mod init;

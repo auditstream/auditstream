@@ -5,11 +5,45 @@ pub mod error;
 pub mod jsonl;
 pub mod pipeline;
 
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use auditstream_core::{Batch, Sink, SinkError};
 use serde::{Deserialize, Serialize};
 use tokio as _;
+
+pub(crate) fn open_append_file(path: &Path) -> io::Result<std::fs::File> {
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
+macro_rules! impl_opened_sink {
+    ($ty:ty) => {
+        impl ::auditstream_core::Sink for $ty {
+            async fn write(
+                &mut self,
+                batch: &::auditstream_core::Batch,
+            ) -> Result<(), ::auditstream_core::SinkError> {
+                match self {
+                    Self::Stdout(sink) => sink.write(batch).await,
+                    Self::File(sink) => sink.write(batch).await,
+                }
+            }
+
+            async fn flush(&mut self) -> Result<(), ::auditstream_core::SinkError> {
+                match self {
+                    Self::Stdout(sink) => sink.flush().await,
+                    Self::File(sink) => {
+                        sink.flush().await?;
+                        sink.get_mut().sync_data().await?;
+                        Ok(())
+                    }
+                }
+            }
+        }
+    };
+}
+pub(crate) use impl_opened_sink;
 
 pub use crate::csv::{CSV_HEADERS, CsvSink, OpenedCsvSink};
 pub use crate::error::ExportError;
