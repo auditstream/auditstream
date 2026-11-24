@@ -40,8 +40,9 @@ github-attestations = true
 "actions/download-artifact" = "9000827ccba6bdab643e8b6fd33ac0654aef8333"
 "actions/attest" = "1e69f48acb82d1966a394da916b4c1698aa569d6"
 
-# Grant publish-image minimal permissions to check out Dockerfile and push to ghcr.io
+# Grant publish-image minimal permissions to check out Dockerfile, push to ghcr.io, and attest image provenance
 [dist.github-custom-job-permissions.publish-image]
+attestations = "write"
 contents = "read"
 id-token = "write"
 packages = "write"
