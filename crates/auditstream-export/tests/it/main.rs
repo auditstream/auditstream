@@ -2,3 +2,4 @@
 
 mod csv;
 mod jsonl;
+mod pipeline;

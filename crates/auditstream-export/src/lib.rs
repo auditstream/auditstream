@@ -1,17 +1,20 @@
 //! Export sinks (JSON Lines, CSV), closed sink configuration, and batch export pipeline.
 
 pub mod csv;
+pub mod error;
 pub mod jsonl;
+pub mod pipeline;
 
 use std::path::PathBuf;
 
 use auditstream_core::{Batch, Sink, SinkError};
 use serde::{Deserialize, Serialize};
-use thiserror as _;
 use tokio as _;
 
 pub use crate::csv::{CSV_HEADERS, CsvSink, OpenedCsvSink};
+pub use crate::error::ExportError;
 pub use crate::jsonl::{JsonLinesSink, OpenedJsonLinesSink};
+pub use crate::pipeline::{DEFAULT_BATCH_SIZE, Options, Report, run};
 
 /// Crate identifier retained for workspace smoke checks.
 pub const CRATE_NAME: &str = "auditstream-export";
