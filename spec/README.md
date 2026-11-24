@@ -1,6 +1,6 @@
 # Auditstream Specification
 
-**Version:** 0.1.0 (unreleased)
+**Version:** 0.1.0 (tag: `spec-v0.1.0`)
 
 This folder defines the normative Auditstream contract. Every engine and language adapter implementation MUST conform to the requirements here for the version it declares.
 
@@ -33,23 +33,21 @@ All prose outside normative requirements — including sections labeled *(Inform
 
 ## Specification files
 
-Files not yet written appear as inline code rather than links.
-
 | File | Defines | Issue |
 | --- | --- | --- |
 | [spec/README.md](README.md) | Scope, RFC 2119 / RFC 8174 wording, versioning rules | #13 (B1) |
 | [spec/compliance.md](compliance.md) | Feature support matrix across implementations | #13 (B1) |
 | [spec/CHANGELOG.md](CHANGELOG.md) | Independent spec release history | #13 (B1) |
 | [spec/AGENTS.md](AGENTS.md) | *(Informative)* Agent contribution rules for `spec/` | #10 (A3) |
-| `spec/actor.md` and `spec/schemas/actor.schema.json` | Actor and context object schemas and constraints | #14 (B2) |
-| `spec/transport.md` | Comment transport, `set_config` transport, precedence, size limit, prepared statement rule | #15 (B3) |
-| `spec/history-table.md` | History table columns, `log_event` function, generated SQL guarantees | #16 (B4) |
-| `spec/export.md` and `spec/schemas/event.schema.json` | Export record format in JSON Lines and CSV | #17 (B5) |
-| `spec/conformance/` | Language-neutral conformance fixture format and test cases | #18 (B6) |
+| [spec/actor.md](actor.md) and [spec/schemas/actor.schema.json](schemas/actor.schema.json) | Actor and context object schemas and constraints | #14 (B2) |
+| [spec/transport.md](transport.md) | Comment transport, `set_config` transport, precedence, size limit, prepared statement rule | #15 (B3) |
+| [spec/history-table.md](history-table.md) | History table columns, `log_event` function, generated SQL guarantees | #16 (B4) |
+| [spec/export.md](export.md) and [spec/schemas/event.schema.json](schemas/event.schema.json) | Export record format in JSON Lines and CSV | #17 (B5) |
+| [spec/conformance/](conformance/README.md) | Language-neutral conformance fixture format and test cases | #18 (B6) |
 
 ## Versioning
 
-The specification follows Semantic Versioning 2.0.0 starting at `0.1.0`, versioned independently from the engine and from every adapter repository. Spec `0.1.0` remains unreleased until conformance fixtures are tagged in `#18` (B6) as `spec-v0.1.0`.
+The specification follows Semantic Versioning 2.0.0 starting at `0.1.0`, versioned independently from the engine and from every adapter repository. Spec `0.1.0` is released at tag `spec-v0.1.0` with the conformance fixture archive `auditstream-spec-0.1.0.tar.gz`.
 
 - **Patch (`0.x.Y` / `X.Y.Z`):** editorial clarifications, typo fixes, or informative examples that do not alter required behavior.
 - **Minor (`0.X.0` / `X.Y.0`):** additive fields or backwards-compatible extensions that existing conforming implementations continue to accept.
