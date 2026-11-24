@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Aligned database trigger readers (`resolve_actor()`) and `spec/schemas/event.schema.json` with encoder validation: `actor.type` and `onBehalfOf.type` MUST be one of the 5 enum values (`user`, `api_key`, `ai_agent`, `service`, `system`), `tenant` MUST be a non-empty string, `onBehalfOf` MUST be an object at max depth 1, and `context` MUST be an object whose known fields (`requestId`, `source`, `ip`, `userAgent`) are non-empty strings.
+- Clarified `request.jwt.claims` handling: non-object JSON or non-null invalid `sub` yields `actor_source = 'invalid'`, while a valid JSON object without `sub` (or `sub: null`) yields `NULL`.
+- Hardened `auditstream.log_event()` validation: `target` and `data` MUST be JSON objects or `NULL` (`SQLSTATE 22023`), and reserved DML action checks apply to `upper(btrim(action))`.
+- Fixed the Reference DDL in `spec/history-table.md` (`IS DISTINCT FROM` instead of `<>`, pure-string comment extraction, and table `CHECK` constraints) and added conformance cases to `spec/conformance/transport/decode.json` and `precedence.json`.
+
 ## [0.1.0] - 2026-11-24
 
 Tag: `spec-v0.1.0` (`auditstream-spec-0.1.0.tar.gz`).

@@ -43,7 +43,12 @@ CREATE TABLE IF NOT EXISTS "auditstream".changes (
   actor_source text,
   db_user text NOT NULL DEFAULT session_user,
   schema_version smallint NOT NULL DEFAULT 1,
-  PRIMARY KEY (id, occurred_at)
+  PRIMARY KEY (id, occurred_at),
+  CONSTRAINT changes_source_check CHECK (source IN ('db', 'app')),
+  CONSTRAINT changes_actor_source_check CHECK (
+    actor_source IS NULL OR actor_source IN ('set_config', 'comment', 'jwt', 'invalid')
+  ),
+  CONSTRAINT changes_schema_version_check CHECK (schema_version >= 1)
 ) PARTITION BY RANGE (occurred_at);
 
 ALTER TABLE "auditstream".changes OWNER TO "auditstream_owner";
@@ -111,8 +116,20 @@ BEGIN
   IF action IS NULL
      OR pg_catalog.char_length(pg_catalog.btrim(action)) < 1
      OR pg_catalog.char_length(action) > 64
-     OR pg_catalog.upper(action) IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE') THEN
+     OR pg_catalog.upper(pg_catalog.btrim(action)) IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE') THEN
     RAISE EXCEPTION 'auditstream.log_event: invalid action %', action
+      USING ERRCODE = '22023';
+  END IF;
+
+  IF target IS NOT NULL
+     AND pg_catalog.jsonb_typeof(target) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'auditstream.log_event: target must be a JSON object or NULL'
+      USING ERRCODE = '22023';
+  END IF;
+
+  IF data IS NOT NULL
+     AND pg_catalog.jsonb_typeof(data) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'auditstream.log_event: data must be a JSON object or NULL'
       USING ERRCODE = '22023';
   END IF;
 

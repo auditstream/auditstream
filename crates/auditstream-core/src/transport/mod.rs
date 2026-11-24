@@ -84,19 +84,25 @@ pub fn resolve_precedence(
                 actor_source: Some(ActorSource::Invalid),
             };
         };
-        if let Some(sub) = claims
-            .get("sub")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        {
-            let mut actor = Map::new();
-            actor.insert("type".to_owned(), Value::String("user".to_owned()));
-            actor.insert("id".to_owned(), Value::String(sub.to_owned()));
-            return ResolvedActor {
-                actor: Some(Value::Object(actor)),
-                context: None,
-                actor_source: Some(ActorSource::Jwt),
-            };
+        match claims.get("sub") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(sub)) if !sub.is_empty() => {
+                let mut actor = Map::new();
+                actor.insert("type".to_owned(), Value::String("user".to_owned()));
+                actor.insert("id".to_owned(), Value::String(sub.clone()));
+                return ResolvedActor {
+                    actor: Some(Value::Object(actor)),
+                    context: None,
+                    actor_source: Some(ActorSource::Jwt),
+                };
+            }
+            Some(_) => {
+                return ResolvedActor {
+                    actor: None,
+                    context: None,
+                    actor_source: Some(ActorSource::Invalid),
+                };
+            }
         }
     }
 

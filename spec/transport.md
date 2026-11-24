@@ -92,8 +92,9 @@ Database readers MUST resolve the actor in the following strict precedence order
 | 1 (malformed) | `set_config` | `nullif(current_setting('auditstream.actor', true), '')` is non-NULL and malformed | `NULL` | `'invalid'` (MUST NOT fall through) |
 | 2 | `comment` | Trailing comment in `right(current_query(), 4096)` has key `auditstream` and valid payload | Decoded JSON object | `'comment'` |
 | 2 (malformed) | `comment` | Trailing comment in `right(current_query(), 4096)` has key `auditstream` and malformed payload | `NULL` | `'invalid'` (MUST NOT fall through) |
-| 3 | `jwt` | `nullif(current_setting('request.jwt.claims', true), '')` is valid JSON object with non-empty string `sub` | `{"type":"user","id":"<sub>"}` | `'jwt'` |
-| 3 (malformed) | `jwt` | `nullif(current_setting('request.jwt.claims', true), '')` is invalid JSON | `NULL` | `'invalid'` |
+| 3 | `jwt` | `nullif(current_setting('request.jwt.claims', true), '')` is a valid JSON object with non-empty string `sub` | `{"type":"user","id":"<sub>"}` | `'jwt'` |
+| 3 (absent `sub`) | `jwt` | `nullif(current_setting('request.jwt.claims', true), '')` is a valid JSON object with no `sub` key (or `sub: null`) | `NULL` | `NULL` |
+| 3 (malformed) | `jwt` | `nullif(current_setting('request.jwt.claims', true), '')` is invalid JSON, a non-object JSON value, or has a non-null `sub` that is not a non-empty string | `NULL` | `'invalid'` |
 | 4 | none | None of the above produced an actor | `NULL` | `NULL` |
 
 In all cases — including when `actor` is `NULL` — the trigger MUST still write the history row with `db_user` set to `session_user`.
@@ -128,17 +129,23 @@ To avoid scanning arbitrarily large SQL statements and to work within PostgreSQL
 - **Encoders** MUST reject any payload exceeding 512 UTF-8 bytes (or 683 unpadded base64url characters) with an error and MUST NOT truncate or send it.
 - **Database readers** MUST check the length outside the regex (because PostgreSQL caps regex repetition counts at 255) and treat any `set_config` value over 512 UTF-8 bytes or any `auditstream` comment value over 683 characters (or decoding to over 512 UTF-8 bytes) as malformed (`actor = NULL`, `actor_source = 'invalid'`).
 
-## Malformed inputs and validation split
+## Malformed inputs and validation parity
 
-A malformed actor payload MUST NEVER abort the application's SQL write. Any of the following inputs count as malformed and MUST yield `actor = NULL` and `actor_source = 'invalid'`:
+A malformed actor payload MUST NEVER abort the application's SQL write. Any of the following inputs count as malformed and MUST yield `actor = NULL`, `context = NULL`, and `actor_source = 'invalid'`:
 
 - Invalid JSON syntax in `auditstream.actor`, decoded comment payload, or `request.jwt.claims`.
-- Non-object JSON (for example a JSON string, number, array, boolean, or `null`).
-- Missing or non-string (or empty string) `type` or `id`.
+- Non-object JSON (for example a JSON string, number, array, boolean, or `null`) in `auditstream.actor`, decoded comment payload, or `request.jwt.claims`.
+- Missing, non-string, or invalid `type` (not one of `user`, `api_key`, `ai_agent`, `service`, `system`), or missing/non-string/empty `id`.
+- Present `tenant` that is not a non-empty string.
+- Present `onBehalfOf` that is not a JSON object, lacks a valid `type` (same 5-value enum) or non-empty string `id`, has a non-string or empty `tenant`, or contains a nested `onBehalfOf` key (even `null`; max nesting depth is 1).
+- Present `context` that is not a JSON object, or contains any known context key (`requestId`, `source`, `ip`, `userAgent`) whose value is not a non-empty string. (Non-object `context` MUST yield `actor_source = 'invalid'` rather than being silently dropped.)
+- Present non-null `sub` in `request.jwt.claims` that is not a non-empty string.
 - `auditstream` comment value that is empty (`auditstream=''`), contains characters outside `[A-Za-z0-9_-]` (for example `auditstream='!!!notbase64'`), has invalid base64url length (`length % 4 = 1`), or decodes to invalid UTF-8.
 - Payload exceeding 512 UTF-8 bytes or encoded comment value exceeding 683 characters.
 
-### Validation split between encoders and database readers
+### Validation parity between encoders and database readers
 
-- **Encoders** MUST validate the complete actor and context schema (`spec/actor.md`, including allowed `type` enum values, one-level `onBehalfOf`, and `context` field types) and the 512-byte limit before sending.
-- **Database trigger readers** MUST validate JSON syntax, the size limit, and that `type` and `id` are non-empty strings. They MAY omit full enum and nested-field schema validation to keep trigger overhead minimal on the write path.
+Both **encoders** and **database trigger readers** MUST enforce the full `spec/actor.md` actor and context schema — including the 5-value `type` enum, one-level `onBehalfOf`, non-empty string `tenant`, and `context` object/field types — plus the 512-byte limit. Unknown keys in `actor`, `onBehalfOf`, and `context` MUST remain permitted so additive fields stay backwards-compatible.
+
+- **Encoders** MUST reject invalid payloads with an error before sending SQL.
+- **Database trigger readers** MUST never abort the write; they MUST record `actor = NULL`, `context = NULL`, and `actor_source = 'invalid'` instead, guaranteeing that every stored actor with `actor_source IN ('set_config', 'comment', 'jwt')` conforms to `spec/schemas/event.schema.json`.

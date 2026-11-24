@@ -73,7 +73,7 @@ Additional capture rules:
 - **Excluded columns:** configured excluded columns MUST NEVER appear in `before`, `after`, or `changed`.
 - **`record_id`:** MUST be a JSON object mapping each primary key column name to its value (taken from `after` on `INSERT`/`UPDATE` and from `before` on `DELETE`, supporting single and composite primary keys), and MUST be `NULL` for tables without a primary key and for `TRUNCATE`.
 - **Partitioned user tables:** statement-level triggers (`auditstream_insert`, `auditstream_delete`, `auditstream_truncate`) attach to the parent partitioned table. A SQL statement that targets a child partition directly does not fire statement triggers attached to the parent, so `auditstream verify` MUST report audited partitioned tables and warn about direct partition writes.
-- **Error behavior:** malformed actor payloads MUST NEVER abort the write (per [spec/transport.md](transport.md#malformed-inputs-and-validation-split)). Any other trigger error aborts the user's transaction so audit gaps are not silently ignored.
+- **Error behavior:** malformed actor payloads MUST NEVER abort the write (per [spec/transport.md](transport.md#malformed-inputs-and-validation-parity)). Any other trigger error aborts the user's transaction so audit gaps are not silently ignored.
 
 ## Application events (`auditstream.log_event`)
 
@@ -85,7 +85,11 @@ auditstream.log_event(action text, target jsonb DEFAULT NULL, data jsonb DEFAULT
 
 Requirements:
 
-- **Validation:** `action` MUST be non-NULL, MUST have trimmed length between **1 and 64 characters** inclusive, and MUST NOT be `'INSERT'`, `'UPDATE'`, `'DELETE'`, or `'TRUNCATE'` (case-insensitive). Invalid actions MUST raise an exception (`22023` / `invalid_parameter_value`).
+- **Validation:**
+  - `action` MUST be non-NULL, MUST have trimmed length between **1 and 64 characters** inclusive, MUST have total length at most **64 characters**, and `upper(btrim(action))` MUST NOT be `'INSERT'`, `'UPDATE'`, `'DELETE'`, or `'TRUNCATE'`.
+  - `target`, when non-NULL, MUST be a JSON object (`jsonb_typeof(target) = 'object'`).
+  - `data`, when non-NULL, MUST be a JSON object (`jsonb_typeof(data) = 'object'`).
+  - Any invalid parameter MUST raise an exception (`22023` / `invalid_parameter_value`).
 - **Columns written:** `source = 'app'`, `op = action`, `record_id = target`, `after = data`, `schema_name = NULL`, `table_name = NULL`, `table_oid = NULL`, `before = NULL`, `changed = NULL`, `actor` / `context` / `actor_source` from `auditstream.resolve_actor()`, `db_user = session_user`, `schema_version = 1`.
 - **Return value:** MUST return the generated `event_id` (`uuid`).
 - **Grants:** application roles MUST receive `EXECUTE` on `auditstream.log_event(text, jsonb, jsonb)` while keeping no write grants on `auditstream.changes`.
@@ -167,7 +171,12 @@ CREATE TABLE IF NOT EXISTS auditstream.changes (
   actor_source text,
   db_user text NOT NULL DEFAULT session_user,
   schema_version smallint NOT NULL DEFAULT 1,
-  PRIMARY KEY (id, occurred_at)
+  PRIMARY KEY (id, occurred_at),
+  CONSTRAINT changes_source_check CHECK (source IN ('db', 'app')),
+  CONSTRAINT changes_actor_source_check CHECK (
+    actor_source IS NULL OR actor_source IN ('set_config', 'comment', 'jwt', 'invalid')
+  ),
+  CONSTRAINT changes_schema_version_check CHECK (schema_version >= 1)
 ) PARTITION BY RANGE (occurred_at);
 
 ALTER TABLE auditstream.changes OWNER TO auditstream_owner;
@@ -211,13 +220,23 @@ SET search_path = pg_catalog, pg_temp
 AS $fn$
 DECLARE
   raw_setting text;
-  body text[];
-  matched text[];
+  q_tail text;
+  q_len integer;
+  prefix text;
+  slash_rev integer;
+  open_pos integer;
+  comment_body text;
+  key_pos integer;
+  quote_pos integer;
+  has_tag boolean := false;
   raw_b64 text;
+  b64_len integer;
   decoded_bytes bytea;
   payload jsonb;
+  v_source text;
+  obo jsonb;
+  ctx jsonb;
   claims jsonb;
-  sub_val text;
 BEGIN
   raw_setting := NULLIF(pg_catalog.current_setting('auditstream.actor', true), '');
   IF raw_setting IS NOT NULL THEN
@@ -229,39 +248,57 @@ BEGIN
     EXCEPTION WHEN others THEN
       actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;
     END;
-    IF pg_catalog.jsonb_typeof(payload) <> 'object'
-       OR pg_catalog.jsonb_typeof(payload->'type') <> 'string'
-       OR pg_catalog.jsonb_typeof(payload->'id') <> 'string'
-       OR pg_catalog.length(payload->>'type') = 0
-       OR pg_catalog.length(payload->>'id') = 0 THEN
-      actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;
+    v_source := 'set_config';
+  ELSE
+    q_tail := pg_catalog.rtrim(
+      pg_catalog.right(pg_catalog.current_query(), 4096),
+      E' \t\n\r\f\v;'
+    );
+    q_len := pg_catalog.length(q_tail);
+    IF q_len >= 4
+       AND pg_catalog.right(q_tail, 2) = '*/'
+       AND pg_catalog.strpos(q_tail, 'auditstream=''') > 0 THEN
+      prefix := pg_catalog.left(q_tail, q_len - 2);
+      slash_rev := pg_catalog.strpos(pg_catalog.reverse(prefix), '/');
+      IF slash_rev > 0 THEN
+        open_pos := q_len - 1 - slash_rev;
+        IF pg_catalog.substr(prefix, open_pos, 2) = '/*' THEN
+          comment_body := pg_catalog.substr(prefix, open_pos + 2);
+          IF pg_catalog.left(comment_body, 13) = 'auditstream=''' THEN
+            quote_pos := pg_catalog.strpos(pg_catalog.substr(comment_body, 14), '''');
+            IF quote_pos > 0 THEN
+              raw_b64 := pg_catalog.substr(comment_body, 14, quote_pos - 1);
+              has_tag := true;
+            END IF;
+          ELSE
+            key_pos := pg_catalog.strpos(comment_body, ',auditstream=''');
+            IF key_pos > 0 THEN
+              quote_pos := pg_catalog.strpos(pg_catalog.substr(comment_body, key_pos + 14), '''');
+              IF quote_pos > 0 THEN
+                raw_b64 := pg_catalog.substr(comment_body, key_pos + 14, quote_pos - 1);
+                has_tag := true;
+              END IF;
+            END IF;
+          END IF;
+        END IF;
+      END IF;
     END IF;
-    IF pg_catalog.jsonb_typeof(payload->'context') = 'object' THEN
-      context := payload->'context';
-    END IF;
-    actor := payload - 'context';
-    actor_source := 'set_config';
-    RETURN;
-  END IF;
 
-  body := pg_catalog.regexp_match(
-    pg_catalog.right(pg_catalog.current_query(), 4096),
-    '/\*([^/]*)\*/[\s;]*$'
-  );
-  IF body IS NOT NULL THEN
-    matched := pg_catalog.regexp_match(body[1], '(?:^|,)auditstream=''([^'']*)''');
-    IF matched IS NOT NULL THEN
-      raw_b64 := matched[1];
-      IF pg_catalog.length(raw_b64) < 1
-         OR pg_catalog.length(raw_b64) > 683
-         OR pg_catalog.length(raw_b64) % 4 = 1
-         OR raw_b64 !~ '^[A-Za-z0-9_-]+$' THEN
+    IF has_tag THEN
+      b64_len := pg_catalog.length(raw_b64);
+      IF b64_len < 1
+         OR b64_len > 683
+         OR b64_len % 4 = 1
+         OR pg_catalog.ltrim(
+              raw_b64,
+              'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-'
+            ) <> '' THEN
         actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;
       END IF;
       BEGIN
         decoded_bytes := pg_catalog.decode(
           pg_catalog.translate(raw_b64, '-_', '+/')
-            || pg_catalog.repeat('=', (4 - pg_catalog.length(raw_b64) % 4) % 4),
+            || pg_catalog.repeat('=', (4 - b64_len % 4) % 4),
           'base64'
         );
         IF pg_catalog.octet_length(decoded_bytes) > 512 THEN
@@ -271,20 +308,71 @@ BEGIN
       EXCEPTION WHEN others THEN
         actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;
       END;
-      IF pg_catalog.jsonb_typeof(payload) <> 'object'
-         OR pg_catalog.jsonb_typeof(payload->'type') <> 'string'
-         OR pg_catalog.jsonb_typeof(payload->'id') <> 'string'
-         OR pg_catalog.length(payload->>'type') = 0
-         OR pg_catalog.length(payload->>'id') = 0 THEN
+      v_source := 'comment';
+    END IF;
+  END IF;
+
+  IF v_source IS NOT NULL THEN
+    IF pg_catalog.jsonb_typeof(payload) IS DISTINCT FROM 'object'
+       OR pg_catalog.jsonb_typeof(payload->'type') IS DISTINCT FROM 'string'
+       OR payload->>'type' NOT IN ('user', 'api_key', 'ai_agent', 'service', 'system')
+       OR pg_catalog.jsonb_typeof(payload->'id') IS DISTINCT FROM 'string'
+       OR pg_catalog.length(payload->>'id') = 0 THEN
+      actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;
+    END IF;
+    IF pg_catalog.jsonb_exists(payload, 'tenant')
+       AND (
+         pg_catalog.jsonb_typeof(payload->'tenant') IS DISTINCT FROM 'string'
+         OR pg_catalog.length(payload->>'tenant') = 0
+       ) THEN
+      actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;
+    END IF;
+    IF pg_catalog.jsonb_exists(payload, 'onBehalfOf') THEN
+      obo := payload->'onBehalfOf';
+      IF pg_catalog.jsonb_typeof(obo) IS DISTINCT FROM 'object'
+         OR pg_catalog.jsonb_typeof(obo->'type') IS DISTINCT FROM 'string'
+         OR obo->>'type' NOT IN ('user', 'api_key', 'ai_agent', 'service', 'system')
+         OR pg_catalog.jsonb_typeof(obo->'id') IS DISTINCT FROM 'string'
+         OR pg_catalog.length(obo->>'id') = 0
+         OR pg_catalog.jsonb_exists(obo, 'onBehalfOf')
+         OR (
+           pg_catalog.jsonb_exists(obo, 'tenant')
+           AND (
+             pg_catalog.jsonb_typeof(obo->'tenant') IS DISTINCT FROM 'string'
+             OR pg_catalog.length(obo->>'tenant') = 0
+           )
+         ) THEN
         actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;
       END IF;
-      IF pg_catalog.jsonb_typeof(payload->'context') = 'object' THEN
-        context := payload->'context';
-      END IF;
-      actor := payload - 'context';
-      actor_source := 'comment';
-      RETURN;
     END IF;
+    IF pg_catalog.jsonb_exists(payload, 'context') THEN
+      ctx := payload->'context';
+      IF pg_catalog.jsonb_typeof(ctx) IS DISTINCT FROM 'object'
+         OR (
+           pg_catalog.jsonb_exists(ctx, 'requestId')
+           AND (pg_catalog.jsonb_typeof(ctx->'requestId') IS DISTINCT FROM 'string' OR pg_catalog.length(ctx->>'requestId') = 0)
+         )
+         OR (
+           pg_catalog.jsonb_exists(ctx, 'source')
+           AND (pg_catalog.jsonb_typeof(ctx->'source') IS DISTINCT FROM 'string' OR pg_catalog.length(ctx->>'source') = 0)
+         )
+         OR (
+           pg_catalog.jsonb_exists(ctx, 'ip')
+           AND (pg_catalog.jsonb_typeof(ctx->'ip') IS DISTINCT FROM 'string' OR pg_catalog.length(ctx->>'ip') = 0)
+         )
+         OR (
+           pg_catalog.jsonb_exists(ctx, 'userAgent')
+           AND (pg_catalog.jsonb_typeof(ctx->'userAgent') IS DISTINCT FROM 'string' OR pg_catalog.length(ctx->>'userAgent') = 0)
+         ) THEN
+        actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;
+      END IF;
+      context := ctx;
+      actor := payload - 'context';
+    ELSE
+      actor := payload;
+    END IF;
+    actor_source := v_source;
+    RETURN;
   END IF;
 
   raw_setting := NULLIF(pg_catalog.current_setting('request.jwt.claims', true), '');
@@ -294,15 +382,19 @@ BEGIN
     EXCEPTION WHEN others THEN
       actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;
     END;
-    IF pg_catalog.jsonb_typeof(claims) = 'object'
-       AND pg_catalog.jsonb_typeof(claims->'sub') = 'string' THEN
-      sub_val := claims->>'sub';
-      IF pg_catalog.length(sub_val) > 0 THEN
-        actor := pg_catalog.jsonb_build_object('type', 'user', 'id', sub_val);
-        context := NULL;
-        actor_source := 'jwt';
-        RETURN;
+    IF pg_catalog.jsonb_typeof(claims) IS DISTINCT FROM 'object' THEN
+      actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;
+    END IF;
+    IF pg_catalog.jsonb_exists(claims, 'sub')
+       AND pg_catalog.jsonb_typeof(claims->'sub') IS DISTINCT FROM 'null' THEN
+      IF pg_catalog.jsonb_typeof(claims->'sub') IS DISTINCT FROM 'string'
+         OR pg_catalog.length(claims->>'sub') = 0 THEN
+        actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;
       END IF;
+      actor := pg_catalog.jsonb_build_object('type', 'user', 'id', claims->>'sub');
+      context := NULL;
+      actor_source := 'jwt';
+      RETURN;
     END IF;
   END IF;
 
@@ -331,8 +423,20 @@ BEGIN
   IF action IS NULL
      OR pg_catalog.char_length(pg_catalog.btrim(action)) < 1
      OR pg_catalog.char_length(action) > 64
-     OR pg_catalog.upper(action) IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE') THEN
+     OR pg_catalog.upper(pg_catalog.btrim(action)) IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE') THEN
     RAISE EXCEPTION 'auditstream.log_event: invalid action %', action
+      USING ERRCODE = '22023';
+  END IF;
+
+  IF target IS NOT NULL
+     AND pg_catalog.jsonb_typeof(target) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'auditstream.log_event: target must be a JSON object or NULL'
+      USING ERRCODE = '22023';
+  END IF;
+
+  IF data IS NOT NULL
+     AND pg_catalog.jsonb_typeof(data) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'auditstream.log_event: data must be a JSON object or NULL'
       USING ERRCODE = '22023';
   END IF;
 
