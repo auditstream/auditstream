@@ -160,6 +160,15 @@ fn validation_errors_exit_2_without_connecting() {
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains("--until"));
 
+    // Empty --tenant
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .args(["history", "--tenant", ""])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("--tenant"));
+
     // Invalid timestamp
     auditstream_cmd()
         .current_dir(dir.path())
@@ -575,4 +584,40 @@ async fn history_broken_pipe_exits_0_without_panic() {
             "expected no panic or error on stderr ({format})"
         );
     }
+}
+
+#[tokio::test]
+async fn history_tenant_filter_matches_direct_and_on_behalf_of() {
+    let db = TestDb::new().await.expect("create TestDb");
+    install_history_schema(&db).await;
+
+    db.execute(
+        "INSERT INTO auditstream.changes \
+         (occurred_at, source, schema_name, table_name, op, record_id, actor, actor_source, db_user, schema_version) VALUES \
+         ('2026-06-15T10:00:00Z'::timestamptz, 'db', 'public', 'invoice', 'INSERT', '{\"id\":1}'::jsonb, \
+          '{\"type\":\"user\",\"id\":\"u_1\",\"tenant\":\"org_acme\"}'::jsonb, 'set_config', 'app_owner', 1), \
+         ('2026-06-15T11:00:00Z'::timestamptz, 'db', 'public', 'invoice', 'UPDATE', '{\"id\":1}'::jsonb, \
+          '{\"type\":\"ai_agent\",\"id\":\"bot_1\",\"onBehalfOf\":{\"type\":\"user\",\"id\":\"u_1\",\"tenant\":\"org_acme\"}}'::jsonb, 'comment', 'app_owner', 1), \
+         ('2026-06-15T12:00:00Z'::timestamptz, 'db', 'public', 'invoice', 'INSERT', '{\"id\":2}'::jsonb, \
+          '{\"type\":\"user\",\"id\":\"u_2\",\"tenant\":\"org_beta\"}'::jsonb, 'set_config', 'app_owner', 1), \
+         ('2026-06-15T13:00:00Z'::timestamptz, 'db', 'public', 'invoice', 'INSERT', '{\"id\":3}'::jsonb, \
+          NULL, NULL, 'app_owner', 1)",
+    )
+    .await
+    .expect("seed tenant rows");
+
+    let dir = tempdir().expect("tempdir");
+    let out = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["history", "--tenant", "org_acme", "--format", "json"])
+        .output()
+        .expect("run history --tenant");
+    assert!(out.status.success());
+    let rows = parse_json_lines(&out.stdout);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["actor"]["id"], "bot_1");
+    assert_eq!(rows[0]["actor"]["onBehalfOf"]["tenant"], "org_acme");
+    assert_eq!(rows[1]["actor"]["id"], "u_1");
+    assert_eq!(rows[1]["actor"]["tenant"], "org_acme");
 }

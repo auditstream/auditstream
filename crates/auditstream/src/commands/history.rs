@@ -59,6 +59,10 @@ pub(crate) struct Args {
     #[arg(long, value_name = "ID")]
     pub(crate) actor: Option<String>,
 
+    /// Filter by tenant identifier (matches `actor.tenant` or `actor.onBehalfOf.tenant`).
+    #[arg(long, value_name = "ID")]
+    pub(crate) tenant: Option<String>,
+
     /// Inclusive lower bound on `occurred_at` (RFC 3339 timestamp or `YYYY-MM-DD` UTC).
     #[arg(long, value_name = "TIME")]
     pub(crate) since: Option<String>,
@@ -156,6 +160,15 @@ fn build_query(args: &Args) -> anyhow::Result<HistoryQuery> {
         None => None,
     };
 
+    let tenant_or_on_behalf_of = match args.tenant.as_deref() {
+        Some("") => {
+            return Err(anyhow!("invalid --tenant: identifier must not be empty"))
+                .exit_code(Exit::Usage);
+        }
+        Some(id) => Some(id.to_owned()),
+        None => None,
+    };
+
     let from = match args.since.as_deref() {
         Some(raw) => Some(parse_time_flag("--since", raw)?),
         None => None,
@@ -179,6 +192,8 @@ fn build_query(args: &Args) -> anyhow::Result<HistoryQuery> {
         record_id_filter,
         actor_id: None,
         actor_or_on_behalf_of,
+        tenant: None,
+        tenant_or_on_behalf_of,
         from,
         to: None,
         until,
@@ -437,6 +452,7 @@ mod tests {
             table: None,
             record_id: None,
             actor: None,
+            tenant: None,
             since: None,
             until: None,
             limit: DEFAULT_LIMIT,
@@ -521,6 +537,19 @@ mod tests {
             exit_code_for(&build_query(&reversed_bounds).unwrap_err()),
             Exit::Usage
         );
+
+        let mut empty_tenant = base_args();
+        empty_tenant.tenant = Some(String::new());
+        assert_eq!(
+            exit_code_for(&build_query(&empty_tenant).unwrap_err()),
+            Exit::Usage
+        );
+
+        let mut with_tenant = base_args();
+        with_tenant.tenant = Some("org_acme".to_owned());
+        let query = build_query(&with_tenant).unwrap();
+        assert_eq!(query.tenant, None);
+        assert_eq!(query.tenant_or_on_behalf_of.as_deref(), Some("org_acme"));
     }
 
     #[test]

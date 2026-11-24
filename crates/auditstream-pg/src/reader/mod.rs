@@ -158,6 +158,10 @@ pub struct ExportFilter {
     pub actor_id: Option<String>,
     /// Filter matching `actor->>'id'` OR `actor->'onBehalfOf'->>'id'` (used by CLI `--actor`).
     pub actor_or_on_behalf_of: Option<String>,
+    /// Filter matching `actor->>'tenant'` only.
+    pub tenant: Option<String>,
+    /// Filter matching `actor->>'tenant'` OR `actor->'onBehalfOf'->>'tenant'` (used by CLI `--tenant`).
+    pub tenant_or_on_behalf_of: Option<String>,
     /// Filter matching `source` (`db` or `app`).
     pub source: Option<Source>,
 }
@@ -177,6 +181,10 @@ pub struct HistoryQuery {
     pub actor_id: Option<String>,
     /// Optional actor identifier matching `actor->>'id'` OR `actor->'onBehalfOf'->>'id'`.
     pub actor_or_on_behalf_of: Option<String>,
+    /// Optional tenant identifier (`actor->>'tenant'` only).
+    pub tenant: Option<String>,
+    /// Optional tenant identifier matching `actor->>'tenant'` OR `actor->'onBehalfOf'->>'tenant'`.
+    pub tenant_or_on_behalf_of: Option<String>,
     /// Inclusive lower bound on `occurred_at` (`occurred_at >= from`).
     pub from: Option<OffsetDateTime>,
     /// Inclusive upper bound on `occurred_at` (`occurred_at <= to`).
@@ -198,6 +206,8 @@ impl Default for HistoryQuery {
             record_id_filter: None,
             actor_id: None,
             actor_or_on_behalf_of: None,
+            tenant: None,
+            tenant_or_on_behalf_of: None,
             from: None,
             to: None,
             until: None,
@@ -334,17 +344,13 @@ impl PgEventSource {
             qb.push_bind(format_rfc3339_utc(until));
             qb.push("::timestamptz");
         }
-        if let Some(ref actor_id) = self.filter.actor_id {
-            qb.push(" AND actor->>'id' = ");
-            qb.push_bind(actor_id.clone());
-        }
-        if let Some(ref actor_any) = self.filter.actor_or_on_behalf_of {
-            qb.push(" AND (actor->>'id' = ");
-            qb.push_bind(actor_any.clone());
-            qb.push(" OR actor->'onBehalfOf'->>'id' = ");
-            qb.push_bind(actor_any.clone());
-            qb.push(")");
-        }
+        push_actor_and_tenant_filters(
+            &mut qb,
+            self.filter.actor_id.as_deref(),
+            self.filter.actor_or_on_behalf_of.as_deref(),
+            self.filter.tenant.as_deref(),
+            self.filter.tenant_or_on_behalf_of.as_deref(),
+        );
         if let Some(source) = self.filter.source {
             qb.push(" AND source = ");
             qb.push_bind(source_as_str(source));
@@ -505,17 +511,13 @@ pub async fn lookup(
             }
         }
     }
-    if let Some(ref actor_id) = query.actor_id {
-        qb.push(" AND actor->>'id' = ");
-        qb.push_bind(actor_id.clone());
-    }
-    if let Some(ref actor_any) = query.actor_or_on_behalf_of {
-        qb.push(" AND (actor->>'id' = ");
-        qb.push_bind(actor_any.clone());
-        qb.push(" OR actor->'onBehalfOf'->>'id' = ");
-        qb.push_bind(actor_any.clone());
-        qb.push(")");
-    }
+    push_actor_and_tenant_filters(
+        &mut qb,
+        query.actor_id.as_deref(),
+        query.actor_or_on_behalf_of.as_deref(),
+        query.tenant.as_deref(),
+        query.tenant_or_on_behalf_of.as_deref(),
+    );
     if let Some(from) = query.from {
         qb.push(" AND occurred_at >= ");
         qb.push_bind(format_rfc3339_utc(from));
@@ -688,6 +690,37 @@ fn format_rfc3339_utc(dt: OffsetDateTime) -> String {
         utc.second(),
         utc.microsecond(),
     )
+}
+
+fn push_actor_and_tenant_filters(
+    qb: &mut QueryBuilder<Postgres>,
+    actor_id: Option<&str>,
+    actor_or_on_behalf_of: Option<&str>,
+    tenant: Option<&str>,
+    tenant_or_on_behalf_of: Option<&str>,
+) {
+    if let Some(id) = actor_id {
+        qb.push(" AND actor->>'id' = ");
+        qb.push_bind(id.to_owned());
+    }
+    if let Some(id) = actor_or_on_behalf_of {
+        qb.push(" AND (actor->>'id' = ");
+        qb.push_bind(id.to_owned());
+        qb.push(" OR actor->'onBehalfOf'->>'id' = ");
+        qb.push_bind(id.to_owned());
+        qb.push(")");
+    }
+    if let Some(id) = tenant {
+        qb.push(" AND actor->>'tenant' = ");
+        qb.push_bind(id.to_owned());
+    }
+    if let Some(id) = tenant_or_on_behalf_of {
+        qb.push(" AND (actor->>'tenant' = ");
+        qb.push_bind(id.to_owned());
+        qb.push(" OR actor->'onBehalfOf'->>'tenant' = ");
+        qb.push_bind(id.to_owned());
+        qb.push(")");
+    }
 }
 
 fn source_as_str(source: Source) -> &'static str {

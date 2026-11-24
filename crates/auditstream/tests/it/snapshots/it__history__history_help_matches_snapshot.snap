@@ -38,14 +38,17 @@ Options:
           
           [env: AUDITSTREAM_SCHEMA=]
 
-      --since <TIME>
-          Inclusive lower bound on `occurred_at` (RFC 3339 timestamp or `YYYY-MM-DD` UTC)
+      --tenant <ID>
+          Filter by tenant identifier (matches `actor.tenant` or `actor.onBehalfOf.tenant`)
 
   -v, --verbose...
           Increase log verbosity (`-v` info, `-vv` debug)
 
   -q, --quiet
           Silence warnings and info logs (errors only)
+
+      --since <TIME>
+          Inclusive lower bound on `occurred_at` (RFC 3339 timestamp or `YYYY-MM-DD` UTC)
 
       --until <TIME>
           Exclusive upper bound on `occurred_at` (RFC 3339 timestamp or `YYYY-MM-DD` UTC)

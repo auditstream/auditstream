@@ -29,6 +29,8 @@ fn export_requires_a_database_after_parsing_filters() {
             "2027-01-01T00:00:00Z",
             "--actor",
             "user-1",
+            "--tenant",
+            "org_acme",
             "--source",
             "db",
         ])
@@ -62,6 +64,7 @@ fn invalid_export_options_exit_usage_without_writing() {
             "2026-01-02T00:00:00Z",
         ],
         vec!["--actor", ""],
+        vec!["--tenant", ""],
     ] {
         auditstream_cmd()
             .current_dir(dir.path())
@@ -969,4 +972,92 @@ mode = "remove"
     assert!(updated.contains("[[export.redaction.rules]]"));
     assert!(updated.contains("recipient_email"));
     assert!(updated.contains("tables = [\"public.invoice\"]"));
+}
+
+#[tokio::test]
+async fn export_tenant_filter_matches_direct_delegated_advances_cursor_and_checks_resume() {
+    let db = export_db().await;
+    db.execute(
+        "INSERT INTO auditstream.changes (occurred_at, source, op, actor, actor_source) VALUES \
+         ('2020-01-01T00:00:00Z', 'app', 'acme.direct', \
+          '{\"type\":\"user\",\"id\":\"u_1\",\"tenant\":\"org_acme\"}', 'set_config'), \
+         ('2020-01-02T00:00:00Z', 'app', 'acme.delegated', \
+          '{\"type\":\"ai_agent\",\"id\":\"bot_1\",\"onBehalfOf\":{\"type\":\"user\",\"id\":\"u_2\",\"tenant\":\"org_acme\"}}', 'comment'), \
+         ('2020-01-03T00:00:00Z', 'app', 'other.tenant', \
+          '{\"type\":\"user\",\"id\":\"u_3\",\"tenant\":\"org_beta\"}', 'set_config'), \
+         ('2020-01-04T00:00:00Z', 'db', 'INSERT', NULL, NULL)",
+    )
+    .await
+    .expect("seed tenant events");
+
+    let dir = tempdir().expect("tempdir");
+    let args = [
+        "--tenant",
+        "org_acme",
+        "--cursor-file",
+        "cursor.json",
+        "--output",
+        "events.jsonl",
+    ];
+    let events = export_file_until(&db, dir.path(), &args, 2).await;
+    let ops: BTreeSet<_> = events
+        .iter()
+        .map(|e| e["op"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        ops,
+        BTreeSet::from(["acme.direct".to_owned(), "acme.delegated".to_owned()])
+    );
+
+    // Filtered-out rows for another tenant advance the saved cursor past them without emitting output.
+    let before_cursor: Value =
+        serde_json::from_slice(&fs::read(dir.path().join("cursor.json")).unwrap())
+            .expect("parse cursor before");
+    let before_xact = before_cursor["cursor"]["xact_id"].as_u64().unwrap();
+    db.execute(
+        "INSERT INTO auditstream.changes (occurred_at, source, op, actor, actor_source) VALUES \
+         ('2020-01-05T00:00:00Z', 'app', 'beta.only', \
+          '{\"type\":\"user\",\"id\":\"u_4\",\"tenant\":\"org_beta\"}', 'set_config')",
+    )
+    .await
+    .expect("seed non-matching tenant event");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        run_export(&db, dir.path(), &args);
+        let updated: Value =
+            serde_json::from_slice(&fs::read(dir.path().join("cursor.json")).unwrap())
+                .expect("parse cursor after");
+        if updated["cursor"]["xact_id"].as_u64().unwrap() > before_xact {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "filtered cursor advance timed out"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        json_events(&fs::read(dir.path().join("events.jsonl")).unwrap()).len(),
+        2,
+        "non-matching tenant event must not be written to output"
+    );
+
+    // Resuming with a different --tenant must fail with exit code 2 naming --tenant and --from-start.
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args([
+            "export",
+            "--tenant",
+            "org_beta",
+            "--cursor-file",
+            "cursor.json",
+            "--output",
+            "events.jsonl",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--tenant"))
+        .stderr(predicate::str::contains("--from-start"));
 }

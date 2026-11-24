@@ -60,6 +60,10 @@ struct Filters {
     /// Match an actor ID directly or through onBehalfOf.
     #[arg(long, value_name = "ID")]
     actor: Option<String>,
+    /// Match a tenant ID directly or through onBehalfOf.
+    #[arg(long, value_name = "ID")]
+    #[serde(default)]
+    tenant: Option<String>,
     /// Select database changes or application events.
     #[arg(long, value_name = "db|app", value_parser = parse_source)]
     source: Option<Source>,
@@ -90,6 +94,7 @@ impl Filters {
             from: self.since,
             until: self.until,
             actor_or_on_behalf_of: self.actor.clone(),
+            tenant_or_on_behalf_of: self.tenant.clone(),
             source: self.source,
             ..ExportFilter::default()
         }
@@ -181,6 +186,7 @@ impl Checkpoint {
             (self.filters.since != request.filters.since, "--since"),
             (self.filters.until != request.filters.until, "--until"),
             (self.filters.actor != request.filters.actor, "--actor"),
+            (self.filters.tenant != request.filters.tenant, "--tenant"),
             (self.filters.source != request.filters.source, "--source"),
             (self.schema != request.schema, "--schema"),
             (self.database != request.database, "database"),
@@ -410,6 +416,9 @@ pub(crate) fn run(args: &Args, config: &Config) -> anyhow::Result<()> {
     }
     if args.filters.actor.as_ref().is_some_and(String::is_empty) {
         return Err(anyhow!("--actor must not be empty")).exit_code(Exit::Usage);
+    }
+    if args.filters.tenant.as_ref().is_some_and(String::is_empty) {
+        return Err(anyhow!("--tenant must not be empty")).exit_code(Exit::Usage);
     }
     run_async(export(args, config))
 }
@@ -842,6 +851,20 @@ mod tests {
         let err = saved.check_resume(&diff_format).expect_err("must reject");
         assert_eq!(exit_code_for(&err), Exit::Usage);
         assert!(err.to_string().contains("--format"), "{err}");
+
+        // Legacy v0.1 checkpoint missing `tenant` deserializes with `tenant: None`
+        // and rejects resuming with `--tenant`.
+        let legacy_filters: Filters =
+            serde_json::from_str(r#"{"since":null,"until":null,"actor":null,"source":null}"#)
+                .expect("legacy filters without tenant");
+        assert_eq!(legacy_filters.tenant, None);
+
+        let mut with_tenant = saved.clone();
+        with_tenant.filters.tenant = Some("org_acme".to_owned());
+        let err = saved.check_resume(&with_tenant).expect_err("must reject");
+        assert_eq!(exit_code_for(&err), Exit::Usage);
+        assert!(err.to_string().contains("--tenant"), "{err}");
+        assert!(err.to_string().contains("--from-start"), "{err}");
     }
 
     #[tokio::test]
