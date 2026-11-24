@@ -18,7 +18,7 @@ fn help_output_matches_snapshot() {
 #[test]
 fn all_subcommand_stubs_exit_5_with_stderr_only() {
     let dir = tempdir().unwrap();
-    for sub in ["init", "status", "verify", "history", "export"] {
+    for sub in ["status", "verify", "history", "export"] {
         auditstream_cmd()
             .current_dir(dir.path())
             .args(["-vv", sub])

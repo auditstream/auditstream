@@ -1,0 +1,61 @@
+---
+source: crates/auditstream/tests/it/init.rs
+info:
+  program: auditstream
+  args:
+    - init
+    - "--help"
+---
+success: true
+exit_code: 0
+----- stdout -----
+Generate audit schema and trigger migrations
+
+Usage: auditstream init [OPTIONS]
+
+Options:
+      --config <PATH>
+          Path to the configuration file (defaults to ./auditstream.toml if present)
+          
+          [env: AUDITSTREAM_CONFIG=]
+
+      --table <SCHEMA.TABLE>
+          Table to audit (`schema.table`), repeatable
+
+      --database-url <URL>
+          Postgres connection URL (also reads `DATABASE_URL` as fallback)
+          
+          [env: AUDITSTREAM_DATABASE_URL]
+
+      --exclude <SCHEMA.TABLE.COLUMN>
+          Column to exclude from row images (`schema.table.column`), repeatable
+
+      --migrations <MIGRATIONS>
+          Migration format to generate (`prisma`, `drizzle`, or `sql`)
+
+          Possible values:
+          - prisma:  Prisma SQL migration directory
+          - drizzle: Drizzle SQL migration directory
+          - sql:     Plain SQL migration files
+
+      --schema <SCHEMA>
+          Audit schema name (defaults to `auditstream`)
+          
+          [env: AUDITSTREAM_SCHEMA=]
+
+      --out <DIR>
+          Output directory for generated migration files (defaults per format)
+
+  -v, --verbose...
+          Increase log verbosity (`-v` info, `-vv` debug)
+
+      --dry-run
+          Print generated migration SQL to stdout without writing any files or updating config
+
+  -q, --quiet
+          Silence warnings and info logs (errors only)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+----- stderr -----
