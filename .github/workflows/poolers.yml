@@ -1,0 +1,95 @@
+name: Poolers
+
+on:
+  pull_request:
+    paths:
+      - "crates/auditstream-pg/src/**"
+      - "crates/auditstream-pg/examples/pooler_schema.rs"
+      - "bench/poolers/**"
+      - ".github/workflows/poolers.yml"
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  pgbouncer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: pg
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      pgbouncer:
+        image: edoburu/pgbouncer:v1.26.1-p0
+        env:
+          DB_HOST: postgres
+          DB_PORT: 5432
+          DB_USER: app_user
+          DB_PASSWORD: app
+          LISTEN_PORT: 6432
+          POOL_MODE: transaction
+          DEFAULT_POOL_SIZE: 4
+          MAX_PREPARED_STATEMENTS: 200
+          MAX_CLIENT_CONN: 200
+          AUTH_TYPE: scram-sha-256
+          IGNORE_STARTUP_PARAMETERS: extra_float_digits,options
+        ports:
+          - 6432:6432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -p 6432"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "1.100.0"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Verify PgBouncer 1.26 version from service container
+        run: |
+          PGB_CID=$(docker ps --filter "ancestor=edoburu/pgbouncer:v1.26.1-p0" --format "{{.ID}}" | head -n 1)
+          if [ -z "$PGB_CID" ]; then
+            echo "FAIL: PgBouncer service container not found" >&2
+            exit 1
+          fi
+          VERSION=$(docker exec "$PGB_CID" pgbouncer --version)
+          echo "$VERSION"
+          if ! grep -q "PgBouncer 1\.26" <<<"$VERSION"; then
+            echo "FAIL: expected PgBouncer 1.26.x, got: $VERSION" >&2
+            exit 1
+          fi
+      - name: Install PostgreSQL client tools (psql and pgbench)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client
+          psql --version
+          pgbench --version
+      - name: Run pooler capture and pgbench leak suite through PgBouncer 1.26
+        env:
+          ADMIN_URL: postgres://postgres:pg@127.0.0.1:5432/postgres
+          APP_URL: postgres://app_user:app@127.0.0.1:6432/postgres
+          APP_PW: app
+          POOLER_LABEL: pgbouncer-1.26
+          BENCH_CLIENTS: "16"
+          BENCH_SECONDS: "5"
+        run: bench/poolers/run.sh

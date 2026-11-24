@@ -1,0 +1,17 @@
+invoice|INSERT|1|user|usr_42|comment|false
+invoice|INSERT|2|user|usr_42|comment|false
+invoice|INSERT|3|user|usr_42|comment|false
+line_item|INSERT|10|user|usr_42|comment|false
+line_item|INSERT|11|user|usr_42|comment|false
+invoice|UPDATE|1|{status}|system|nightly-job|set_config|false
+invoice|UPDATE|2|{total}|user|auth0|abc|jwt|false
+invoice|UPDATE|3|{status}|false
+invoice|UPDATE|3|{status}|false
+invoice|UPDATE|2|{total}|invalid|false
+invoice|UPDATE|2|{total}|invalid|false
+invoice|UPDATE|2|{status}|ai_agent|billing-agent|usr_42|comment|false
+invoice|UPDATE|3|{status}|ai_agent|billing-agent|usr_42|comment|false
+invoice|DELETE|1|ai_agent|billing-agent|usr_42|comment
+line_item|DELETE|10|ai_agent|billing-agent|usr_42|comment
+line_item|DELETE|11|ai_agent|billing-agent|usr_42|comment
+line_item|TRUNCATE|user|usr_42|comment
