@@ -5,7 +5,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
-use auditstream_core::{Batch, Cursor, EventSource, Sink, SinkError, Source, SourceError};
+use auditstream_core::{
+    Batch, Cursor, EventSource, Redaction, Sink, SinkError, Source, SourceError,
+};
 use auditstream_export::{AnySink, ExportError, Options, SinkConfig};
 use auditstream_pg::reader::{self, DatabaseIdentity, ExportFilter, PgEventSource};
 use clap::{Args as ClapArgs, ValueEnum};
@@ -103,6 +105,8 @@ struct Checkpoint {
     filters: Filters,
     sink: SinkConfig,
     output_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Redaction::is_empty")]
+    redaction: Redaction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,6 +169,13 @@ fn sync_parent(path: &Path) -> io::Result<()> {
 }
 
 impl Checkpoint {
+    fn redaction_differs(&self, request: &Self) -> bool {
+        match (self.redaction.compile(), request.redaction.compile()) {
+            (Ok(saved), Ok(requested)) => saved != requested,
+            _ => self.redaction != request.redaction,
+        }
+    }
+
     fn check_resume(&self, request: &Self) -> anyhow::Result<()> {
         for (changed, flag) in [
             (self.filters.since != request.filters.since, "--since"),
@@ -181,6 +192,7 @@ impl Checkpoint {
                 sink_path(&self.sink) != sink_path(&request.sink),
                 "--output",
             ),
+            (self.redaction_differs(request), "export.redaction"),
         ] {
             if changed {
                 return Err(anyhow!(
@@ -420,6 +432,7 @@ fn open_checkpoint(
         filters: args.filters.clone(),
         sink: config.export.sink.clone(),
         output_len: None,
+        redaction: config.export.redaction.clone(),
     };
     let Some(path) = &config.export.cursor_file else {
         return Ok(OpenedCheckpoint {
@@ -504,6 +517,7 @@ async fn run_pipeline<S: EventSource, K: Sink>(
                 ExportError::Source(_) => Exit::Database,
                 ExportError::Ack(_) | ExportError::Sink(_) => Exit::Io,
                 ExportError::InvalidOptions(_) => Exit::Usage,
+                // Fail-closed redaction (`ExportError::Redact`) and future non-exhaustive variants exit Internal (5).
                 _ => Exit::Internal,
             };
             Err(err).exit_code(exit)
@@ -559,7 +573,8 @@ async fn export_with_pool(
         checkpoint: opened.checkpoint,
         save_initial: !had_saved,
     };
-    let options = Options::with_batch_size(config.export.batch_size);
+    let options = Options::with_batch_size(config.export.batch_size)
+        .with_redaction(config.export.compiled_redaction.clone());
     let Some(report) = run_pipeline(&mut source, &mut sink, &options).await? else {
         return Ok(());
     };
@@ -591,7 +606,10 @@ mod tests {
     use std::io;
     use std::path::PathBuf;
 
-    use auditstream_core::{Batch, Cursor, Event, EventSource, Sink, SinkError, SourceError};
+    use auditstream_core::{
+        Batch, CompiledRedaction, Cursor, Event, EventSource, Redaction, RedactionMode,
+        RedactionRule, Sink, SinkError, SourceError,
+    };
     use auditstream_export::{Options, SinkConfig};
     use auditstream_pg::reader::ExportFilter;
     use tempfile::tempdir;
@@ -674,7 +692,109 @@ mod tests {
             filters: Filters::default(),
             sink,
             output_len,
+            redaction: Redaction::default(),
         }
+    }
+
+    #[test]
+    fn v0_1_checkpoint_without_redaction_field_deserializes_and_checks_drift() {
+        let legacy_json = r#"{
+            "cursor": {"xact_id": 10, "id": 1},
+            "database": {"system_identifier": "7123456789012345678", "name": "audit_test", "oid": 16384, "history_table_oid": 24576},
+            "schema": "auditstream",
+            "filters": {"since": null, "until": null, "actor": null, "source": null},
+            "sink": {"type": "jsonl", "path": "/tmp/a.jsonl"},
+            "output_len": 128
+        }"#;
+        let saved: Checkpoint =
+            serde_json::from_str(legacy_json).expect("v0.1 cursor without redaction must parse");
+        assert!(saved.redaction.is_empty());
+
+        let unredacted = sample_checkpoint(
+            SinkConfig::Jsonl {
+                path: Some(PathBuf::from("/tmp/a.jsonl")),
+            },
+            Cursor::new(0, 0),
+            None,
+        );
+        saved
+            .check_resume(&unredacted)
+            .expect("unredacted resume matches legacy checkpoint");
+
+        let mut with_rules = unredacted.clone();
+        with_rules.redaction = Redaction::new(vec![RedactionRule::for_table(
+            "invoice",
+            ["ssn"],
+            RedactionMode::Mask,
+        )]);
+        let err = saved
+            .check_resume(&with_rules)
+            .expect_err("adding redaction rules must invalidate legacy checkpoint");
+        assert_eq!(exit_code_for(&err), Exit::Usage);
+        assert!(err.to_string().contains("export.redaction"), "{err}");
+        assert!(err.to_string().contains("--from-start"), "{err}");
+
+        // Equivalent rules in a different order compile identically and resume cleanly.
+        let mut reordered = unredacted;
+        reordered.redaction = Redaction::new(vec![RedactionRule::for_table(
+            "invoice",
+            ["tax_id", "ssn"],
+            RedactionMode::Mask,
+        )]);
+        let mut saved_two = reordered.clone();
+        saved_two.redaction = Redaction::new(vec![
+            RedactionRule::for_table("invoice", ["ssn"], RedactionMode::Mask),
+            RedactionRule::for_table("invoice", ["tax_id"], RedactionMode::Mask),
+        ]);
+        saved_two
+            .check_resume(&reordered)
+            .expect("equivalent compiled redaction policy resumes cleanly");
+    }
+
+    #[tokio::test]
+    async fn run_pipeline_maps_fail_closed_redaction_error_to_internal_without_advancing_cursor() {
+        let dir = tempdir().expect("tempdir");
+        let cursor_path = dir.path().join("cursor.json");
+        let sink_cfg = SinkConfig::Jsonl { path: None };
+        let cursor_file = CursorFile::lock(&cursor_path).expect("lock");
+
+        let mut bad_event = sample_event();
+        bad_event.after = Some(
+            serde_json::value::RawValue::from_string(r#"[{"ssn":"123"}]"#.to_owned())
+                .expect("array payload"),
+        );
+
+        let mut source = ExportSource {
+            reader: StaticSource {
+                batches: [Ok(Batch::new(vec![bad_event], Some(Cursor::new(50, 1))))]
+                    .into_iter()
+                    .collect(),
+            },
+            file: Some(cursor_file),
+            checkpoint: sample_checkpoint(sink_cfg, Cursor::new(0, 0), None),
+            save_initial: false,
+        };
+        let mut sink = FailingSink {
+            kind: io::ErrorKind::Other,
+        };
+        let compiled =
+            CompiledRedaction::compile(&Redaction::new(vec![RedactionRule::for_app_action(
+                "test.event",
+                ["ssn"],
+                RedactionMode::Mask,
+            )]))
+            .expect("compile");
+
+        let err = run_pipeline(
+            &mut source,
+            &mut sink,
+            &Options::with_batch_size(1).with_redaction(compiled),
+        )
+        .await
+        .expect_err("non-object app payload must fail closed");
+        assert_eq!(exit_code_for(&err), Exit::Internal);
+        assert_eq!(source.checkpoint.cursor, Cursor::new(0, 0));
+        assert!(!cursor_path.exists());
     }
 
     #[test]

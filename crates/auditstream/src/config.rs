@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
+use auditstream_core::{CompiledRedaction, Redaction};
 use auditstream_export::SinkConfig;
 use clap::ValueEnum;
 use serde::Deserialize;
@@ -137,6 +138,10 @@ pub(crate) struct ExportConfig {
     pub(crate) batch_size: usize,
     /// Built-in sink format and optional output path (defaults to JSON Lines on stdout).
     pub(crate) sink: SinkConfig,
+    /// Raw export redaction policy from `auditstream.toml` (bound into export checkpoints).
+    pub(crate) redaction: Redaction,
+    /// Pre-validated, pre-compiled redaction rules applied before `sink.write`.
+    pub(crate) compiled_redaction: CompiledRedaction,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -174,6 +179,8 @@ struct ExportFileConfig {
     cursor_file: Option<PathBuf>,
     batch_size: Option<usize>,
     sink: Option<SinkConfig>,
+    #[serde(default)]
+    redaction: Redaction,
 }
 
 impl Config {
@@ -216,10 +223,19 @@ impl Config {
             format: file.migrations.format,
             dir: file.migrations.dir,
         };
+        let compiled_redaction = file
+            .export
+            .redaction
+            .compile()
+            .map_err(|err| anyhow!("invalid export.redaction config: {err}"))
+            .exit_code(Exit::Usage)?;
+
         let mut export = ExportConfig {
             cursor_file: file.export.cursor_file,
             batch_size: file.export.batch_size.unwrap_or(DEFAULT_BATCH_SIZE),
             sink: file.export.sink.unwrap_or(SinkConfig::Jsonl { path: None }),
+            redaction: file.export.redaction,
+            compiled_redaction,
         };
 
         match &cli.command {
@@ -527,5 +543,62 @@ batch_size = 250
         assert!(!display.contains(&secret));
         assert!(!debug.contains(&secret));
         assert!(display.contains("postgresql://app_user:***@db.example.com:5432/prod"));
+    }
+
+    #[test]
+    fn loads_and_validates_export_redaction_rules() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("auditstream.toml"),
+            r#"
+[[export.redaction.rules]]
+table = "public.invoice"
+columns = ["ssn", "tax_id"]
+mode = "mask"
+
+[[export.redaction.rules]]
+action = "invoice.exported"
+columns = ["recipient_email"]
+mode = "remove"
+"#,
+        )
+        .unwrap();
+
+        let cli = Cli::try_parse_from(["auditstream", "export"]).unwrap();
+        let cfg = Config::load_with_fallback_env(&cli, dir.path(), None).unwrap();
+        assert_eq!(cfg.export.redaction.rules.len(), 2);
+        assert!(!cfg.export.compiled_redaction.is_empty());
+
+        for (toml_snippet, expected_msg) in [
+            (
+                "[[export.redaction.rules]]\ntable = \"invoice\"\ncolumns = []\n",
+                "at least one column",
+            ),
+            (
+                "[[export.redaction.rules]]\ntable = \"invoice\"\ncolumns = [\"metadata.ssn\"]\n",
+                "nested JSON path",
+            ),
+            (
+                "[[export.redaction.rules]]\ntable = \"invoice\"\naction = \"invoice.sent\"\ncolumns = [\"ssn\"]\n",
+                "both `table` and `action`",
+            ),
+            (
+                "[[export.redaction.rules]]\ncolumns = [\"ssn\"]\n",
+                "must set either `table`",
+            ),
+            (
+                "[[export.redaction.rules]]\ntable = \"invoice\"\ncolumns = [\"ssn\"]\nunknown_field = true\n",
+                "unknown_field",
+            ),
+        ] {
+            fs::write(dir.path().join("auditstream.toml"), toml_snippet).unwrap();
+            let cli = Cli::try_parse_from(["auditstream", "export"]).unwrap();
+            let err = Config::load_with_fallback_env(&cli, dir.path(), None).unwrap_err();
+            assert_eq!(exit_code_for(&err), Exit::Usage, "{toml_snippet}");
+            assert!(
+                err.to_string().contains(expected_msg),
+                "expected {expected_msg:?} in {err}"
+            );
+        }
     }
 }
