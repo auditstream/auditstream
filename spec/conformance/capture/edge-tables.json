@@ -410,6 +410,69 @@
           }
         ]
       }
+    },
+    {
+      "name": "json-column-updates",
+      "description": "UPDATE capture works on columns whose type has no equality operator: an UPDATE to an equivalent json value writes no history row, and a changed value lists the column in changed.",
+      "input": {
+        "schema_sql": "CREATE TABLE document (id int PRIMARY KEY, body json);",
+        "excluded_columns": {
+          "document": []
+        },
+        "steps": [
+          {
+            "sql": "INSERT INTO document VALUES (1, '{\"n\": 1}');",
+            "role": "admin"
+          },
+          {
+            "sql": "UPDATE document SET body = '{ \"n\" : 1 }' WHERE id = 1;",
+            "role": "app"
+          },
+          {
+            "sql": "UPDATE document SET body = '{\"n\": 2}' WHERE id = 1;",
+            "role": "app"
+          }
+        ]
+      },
+      "expected": {
+        "rows": [
+          {
+            "table_name": "document",
+            "op": "INSERT",
+            "record_id": {
+              "id": 1
+            },
+            "changed": null,
+            "actor": null,
+            "actor_source": null,
+            "before_keys": null,
+            "after_keys": [
+              "body",
+              "id"
+            ]
+          },
+          {
+            "table_name": "document",
+            "op": "UPDATE",
+            "record_id": {
+              "id": 1
+            },
+            "changed": [
+              "body"
+            ],
+            "actor": null,
+            "actor_source": null,
+            "before_keys": [
+              "body",
+              "id"
+            ],
+            "after_keys": [
+              "body",
+              "id"
+            ]
+          }
+        ]
+      }
     }
   ]
 }

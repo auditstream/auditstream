@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- `auditstream_update` MUST NOT have a `WHEN` clause; `capture()` compares the JSONB row images after removing excluded columns and writes no history row when they are equal. `UPDATE` capture now works on tables with `json`, `xml`, or `point` columns and records changes that type equality ignores, such as a case-only change in a `citext` column. Added the `json-column-updates` capture conformance case.
+
 ## [0.1.1] - 2026-11-24
 
 Tag: `spec-v0.1.1` (`auditstream-spec-0.1.1.tar.gz`).
