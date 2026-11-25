@@ -2,7 +2,7 @@
 
 Parallel work stays conflict-free when each issue owns its own paths and contract changes land before the code that uses them.
 
-- **Claim by assignment.** Assign the issue before starting. For an agent, assign the human who runs it. An unassigned issue is free.
+- **Claim before starting.** Maintainers assign themselves (or the human running an agent) before starting. External contributors without triage permissions comment on an unassigned issue to claim it, or open small standalone docs/bug-fix PRs directly (see [CONTRIBUTING.md](../../CONTRIBUTING.md)). An unassigned issue with no claim comment is free.
 - **Disjoint paths.** Each issue lists its in-scope paths. Two issues in progress never share a path, except the shared files below.
 - **Contract first.** A spec change merges in the engine repository, then each repository gets its own sub-issue to implement it.
 - **Interfaces before implementations.** Types and traits in `auditstream-core` land first, with stub implementations. Work on each crate then fans out against those types.

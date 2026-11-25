@@ -13,7 +13,7 @@ During v0.x development, security fixes apply to the latest 0.x release (current
 
 Please do **not** open a public GitHub issue for security vulnerabilities.
 
-Report vulnerabilities privately by emailing **security@auditstream.dev**. We aim to acknowledge every report within **3 business days** and coordinate disclosure with you once a fix is ready.
+Report vulnerabilities privately via **[GitHub Private Vulnerability Reporting](https://github.com/auditstream/auditstream/security/advisories/new)** or by emailing **security@auditstream.dev**. We aim to acknowledge every report within **3 business days** and coordinate disclosure with you once a fix is ready.
 
 Include in your report:
 
