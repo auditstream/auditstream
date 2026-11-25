@@ -8,7 +8,7 @@ Each repository ships its own security, ownership, and community files so contri
 | `SECURITY.md` | Repo-specific supported versions, GitHub Private Vulnerability Reporting + `security@auditstream.dev`, 3 business day acknowledgment target, and verified reproducer rule for AI-found reports | Done |
 | `CODE_OF_CONDUCT.md` | Contributor Covenant 3.0, with Gabriel and Cleisson as enforcement contacts at `conduct@auditstream.dev` | Done |
 | `SUPPORT.md` | Questions go to GitHub Discussions, bugs to Issues, security reports to Private Vulnerability Reporting | Done |
-| `.github/CODEOWNERS` | Per repository (GitHub cannot inherit `CODEOWNERS`); names `@gabrielrbl @cleissonom` (switchable to `@auditstream/maintainers` once an org team is created) | Done |
+| `.github/CODEOWNERS` | Per repository (GitHub cannot inherit `CODEOWNERS`); `* @auditstream/maintainers` (organization team with Gabriel and Cleisson) | Done |
 | `.github/VULNERABILITY_REPORT.yml` | Custom GitHub Private Vulnerability Reporting form tailored to engine/SQL/CLI reports | Done |
 
 Why per repository: GitHub cannot inherit `LICENSE` or `.github/CODEOWNERS` from an organization `.github` repository, `SECURITY.md` and `.github/VULNERABILITY_REPORT.yml` carry repository-specific version and component details, and keeping `CODE_OF_CONDUCT.md` and `SUPPORT.md` in the repository ensures every local clone and coding agent can read them directly.

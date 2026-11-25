@@ -55,7 +55,7 @@ Labels are defined in `.github/labels.yml` in each repository and synced by a wo
 - One human approval. Changes to `spec/` and `.github/workflows/` need both maintainers.
 - CI green, conversations resolved, squash merge only. The default squash message is set to "Pull request title and description"; otherwise a one-commit pull request lands with that commit's message. The branch is deleted after merge.
 - Nobody approves their own pull request, and agents never approve or merge.
-- A ruleset on `main` enforces changes only through pull requests, at least one human approval, green CI, resolved conversations, and squash merge, with no bypass for agents. `.github/CODEOWNERS` auto-requests both maintainers (`@gabrielrbl @cleissonom`); because GitHub CODEOWNERS requires approval from any single listed owner on a rule, the two-maintainer requirement for external or bot pull requests touching `spec/` and `.github/workflows/` is upheld by maintainer review policy.
+- A ruleset on `main` enforces changes only through pull requests, at least one human approval, green CI, resolved conversations, and squash merge, with no bypass for agents. `.github/CODEOWNERS` auto-requests `@auditstream/maintainers`; because GitHub CODEOWNERS requires approval from any single member of the team, the two-maintainer requirement for external or bot pull requests touching `spec/` and `.github/workflows/` is upheld by maintainer review policy.
 
 ## Definition of done
 

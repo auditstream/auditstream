@@ -1,8 +1,7 @@
 # Default code owners for auditstream/auditstream.
-# Explicit maintainer handles are listed directly until an `@auditstream/maintainers`
-# organization team is created. GitHub CODEOWNERS auto-requests both maintainers and
-# enforces approval from at least one listed owner via branch rulesets; for external
-# or bot PRs touching `/spec/` or `/.github/workflows/`, review from both maintainers
-# is enforced by maintainer review policy per CONTRIBUTING.md.
+# GitHub CODEOWNERS auto-requests `@auditstream/maintainers` and enforces approval
+# from at least one team member via branch rulesets; for external or bot PRs
+# touching `/spec/` or `/.github/workflows/`, review from both maintainers is
+# enforced by maintainer review policy per CONTRIBUTING.md.
 
-* @gabrielrbl @cleissonom
+* @auditstream/maintainers
