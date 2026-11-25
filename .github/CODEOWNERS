@@ -1,8 +1,8 @@
 # Default code owners for auditstream/auditstream.
 # Explicit maintainer handles are listed directly until an `@auditstream/maintainers`
-# organization team is created. Changes to `/spec/` and `/.github/workflows/` require
-# review from both maintainers per CONTRIBUTING.md.
+# organization team is created. GitHub CODEOWNERS auto-requests both maintainers and
+# enforces approval from at least one listed owner via branch rulesets; for external
+# or bot PRs touching `/spec/` or `/.github/workflows/`, review from both maintainers
+# is enforced by maintainer review policy per CONTRIBUTING.md.
 
 * @gabrielrbl @cleissonom
-/spec/ @gabrielrbl @cleissonom
-/.github/workflows/ @gabrielrbl @cleissonom
