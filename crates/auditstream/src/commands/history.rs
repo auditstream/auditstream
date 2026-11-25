@@ -2,7 +2,8 @@
 //!
 //! Queries recorded audit changes from `{schema}.changes` via [`auditstream_pg::reader::lookup`]
 //! (newest first, ordered by `occurred_at DESC, id DESC`) and renders them as an aligned table
-//! (omitting `before`/`after`) or as newline-delimited JSON matching `spec/schemas/event.schema.json`.
+//! (omitting `before`/`after`), field-level `--diff` blocks, or newline-delimited JSON matching
+//! `spec/schemas/event.schema.json`.
 
 use std::ffi::OsStr;
 use std::fmt::Write as _;
@@ -348,7 +349,11 @@ fn event_to_table_row(event: &Event) -> [String; 7] {
     let actor = format_actor(event.actor.as_deref());
     let actor_source = actor_source_str(event.actor_source).to_owned();
     let changed = match event.changed.as_deref() {
-        Some(cols) if !cols.is_empty() => sanitize_terminal(&cols.join(",")),
+        Some(cols) if !cols.is_empty() => cols
+            .iter()
+            .map(|col| sanitize_terminal(col))
+            .collect::<Vec<_>>()
+            .join(","),
         _ => "-".to_owned(),
     };
 
@@ -365,17 +370,22 @@ fn event_to_table_row(event: &Event) -> [String; 7] {
 
 fn format_event_table(event: &Event) -> String {
     match (&event.schema_name, &event.table_name) {
-        (Some(schema), Some(table)) => sanitize_terminal(&format!("{schema}.{table}")),
+        (Some(schema), Some(table)) => {
+            format!("{}.{}", sanitize_terminal(schema), sanitize_terminal(table))
+        }
         (None, Some(table)) => sanitize_terminal(table),
         _ => "-".to_owned(),
     }
 }
 
 fn format_event_record_id(event: &Event) -> String {
-    event
-        .record_id
-        .as_deref()
-        .map_or_else(|| "-".to_owned(), |raw| sanitize_terminal(raw.get()))
+    event.record_id.as_deref().map_or_else(
+        || "-".to_owned(),
+        |raw| match serde_json::from_str::<Value>(raw.get()) {
+            Ok(val) => format_diff_value(&val),
+            Err(_) => sanitize_terminal(raw.get()),
+        },
+    )
 }
 
 fn should_use_color() -> bool {
@@ -584,16 +594,19 @@ fn format_actor(raw: Option<&RawValue>) -> String {
     };
 
     if let Ok(actor) = serde_json::from_str::<Actor>(raw.get()) {
-        let base = format!("{}:{}", actor_type_str(actor.actor_type), actor.id);
-        let full = match actor.on_behalf_of {
+        let base = format!(
+            "{}:{}",
+            actor_type_str(actor.actor_type),
+            sanitize_terminal(&actor.id)
+        );
+        return match actor.on_behalf_of {
             Some(nested) => format!(
                 "{base} for {}:{}",
                 actor_type_str(nested.actor_type),
-                nested.id
+                sanitize_terminal(&nested.id)
             ),
             None => base,
         };
-        return sanitize_terminal(&full);
     }
 
     if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(raw.get())
@@ -602,19 +615,30 @@ fn format_actor(raw: Option<&RawValue>) -> String {
             map.get("id").and_then(Value::as_str),
         )
     {
-        let base = format!("{actor_type}:{actor_id}");
+        let base = format!(
+            "{}:{}",
+            sanitize_terminal(actor_type),
+            sanitize_terminal(actor_id)
+        );
         if let Some(Value::Object(nested)) = map.get("onBehalfOf")
             && let (Some(nt), Some(ni)) = (
                 nested.get("type").and_then(Value::as_str),
                 nested.get("id").and_then(Value::as_str),
             )
         {
-            return sanitize_terminal(&format!("{base} for {nt}:{ni}"));
+            return format!(
+                "{base} for {}:{}",
+                sanitize_terminal(nt),
+                sanitize_terminal(ni)
+            );
         }
-        return sanitize_terminal(&base);
+        return base;
     }
 
-    sanitize_terminal(raw.get())
+    match serde_json::from_str::<Value>(raw.get()) {
+        Ok(val) => format_diff_value(&val),
+        Err(_) => sanitize_terminal(raw.get()),
+    }
 }
 
 fn actor_type_str(actor_type: ActorType) -> &'static str {
@@ -965,5 +989,54 @@ mod tests {
             assert!(output.contains("public.invoice"), "{label}: {output:?}");
             assert!(output.contains("user:adminx"), "{label}: {output:?}");
         }
+    }
+
+    #[test]
+    fn unterminated_escapes_do_not_swallow_sibling_fields() {
+        let hostile = event_from_json(
+            r#"{
+                "event_id": "00000000-0000-4000-8000-000000000010",
+                "occurred_at": "2026-06-15T00:00:00.000000Z",
+                "source": "db",
+                "schema_name": "pub\u001b]52;c;unterminated",
+                "table_name": "invoice",
+                "op": "UPDATE",
+                "record_id": {"a": "x\u009d52;c;unterminated", "b": 42, "c": "end\u009b"},
+                "before": {"a": "old", "status": "draft"},
+                "after": {"a": "new", "status": "sent"},
+                "changed": ["a\u001b]52;c;unterminated", "status"],
+                "actor": {
+                    "type": "ai_agent",
+                    "id": "bot\u001b]0;hide",
+                    "onBehalfOf": {"type": "user", "id": "alice"}
+                },
+                "context": null,
+                "actor_source": "set_config",
+                "db_user": "postgres",
+                "schema_version": 1
+            }"#,
+        );
+
+        let table_out = render_table_lines(std::slice::from_ref(&hostile)).join("");
+        let diff_out = render_diff_lines(&[hostile], false).join("");
+
+        for (label, output) in [("table", &table_out), ("diff", &diff_out)] {
+            assert!(
+                output.contains("pub.invoice"),
+                "{label} swallowed table name: {output:?}"
+            );
+            assert!(
+                output.contains(r#"{"a":"x","b":42,"c":"end"}"#),
+                "{label} corrupted composite record_id: {output:?}"
+            );
+            assert!(
+                output.contains("ai_agent:bot for user:alice"),
+                "{label} erased onBehalfOf attribution: {output:?}"
+            );
+        }
+        assert!(
+            table_out.contains("a,status"),
+            "table swallowed sibling changed column: {table_out:?}"
+        );
     }
 }

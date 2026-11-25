@@ -108,7 +108,7 @@ Prints each event header followed by field-level changes:
 Color output is enabled automatically only when stdout is a TTY, `NO_COLOR` is unset or empty, and `TERM` is not `dumb`.
 Passing `--diff` together with `--format json` exits with code `2` (JSON output already includes `before` and `after`).
 
-All human-readable terminal output (`--format table` and `--diff`) strips ANSI CSI/OSC/DCS/ESC sequences, C0/C1 control characters, and Unicode BiDi overrides (`U+202A`–`U+202E`, `U+2066`–`U+2069`), and maps `\n`, `\r`, and `\t` to spaces.
+All human-readable terminal output (`--format table` and `--diff`) strips ANSI CSI/OSC/DCS/ESC sequences, C0/C1 control characters, and Unicode BiDi overrides (`U+202A`–`U+202E`, `U+2066`–`U+2069`), and maps `\n`, `\r`, `\t`, and Unicode line/paragraph separators (`U+2028`, `U+2029`) to spaces.
 
 ### JSON output (`--format json`)
 

@@ -83,12 +83,10 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
     let parsed_tables = parse_table_refs(&config.capture.tables, args.table.is_empty())?;
     let parsed_excludes = parse_exclude_refs(&config.capture.exclude, args.exclude.is_empty())?;
 
-    let pool = connect_database(db_url).await?;
-
-    let introspect_opts = IntrospectOptions::with_audit_schema(&config.schema);
-
     // When no tables are selected, introspect all user schemas, list them on stderr, and exit 2.
     if parsed_tables.is_empty() {
+        let pool = connect_database(db_url).await?;
+        let introspect_opts = IntrospectOptions::with_audit_schema(&config.schema);
         let schemas = introspect::user_schemas(&pool, &introspect_opts)
             .await
             .map_err(|err| anyhow!("failed to list database schemas: {err}"))
@@ -122,19 +120,18 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
         .exit_code(Exit::Usage);
     }
 
-    let format = match config.migrations.format {
-        Some(format) => format,
-        None => match detect_migration_format(Path::new(".")) {
-            Ok(detected) => {
-                eprintln!("detected migration format: {}", format_name(detected));
-                detected
-            }
-            Err(err) => {
-                pool.close().await;
-                return Err(err);
-            }
-        },
+    // Resolve or autodetect the migration format offline before opening a database connection
+    // so missing or ambiguous layouts exit 2 immediately without requiring a live Postgres instance.
+    let (format, autodetected) = match config.migrations.format {
+        Some(format) => (format, false),
+        None => (detect_migration_format(Path::new("."))?, true),
     };
+
+    let pool = connect_database(db_url).await?;
+    if autodetected {
+        eprintln!("detected migration format: {}", format_name(format));
+    }
+    let introspect_opts = IntrospectOptions::with_audit_schema(&config.schema);
 
     // Collect every unique schema referenced by --table or --exclude.
     let mut referenced_schemas: BTreeSet<&str> = BTreeSet::new();
@@ -252,7 +249,10 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
                 }
             }
             PreviewOutcome::UpToDate { existing } => {
-                eprintln!("up to date ({})", existing.display());
+                eprintln!(
+                    "up to date ({})",
+                    sanitize_terminal(&existing.display().to_string())
+                );
             }
         }
         return Ok(());
@@ -260,7 +260,10 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
 
     match migrations::write(&migration_opts).exit_code(Exit::Io)? {
         WriteOutcome::UpToDate { existing } => {
-            eprintln!("up to date ({})", existing.display());
+            eprintln!(
+                "up to date ({})",
+                sanitize_terminal(&existing.display().to_string())
+            );
         }
         WriteOutcome::Written { files, .. } => {
             update_config_file(

@@ -531,3 +531,30 @@ async fn unqualified_table_autodetects_prisma_and_drizzle_and_normalizes_config(
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains("in config"));
 }
+
+#[test]
+fn missing_or_ambiguous_migration_layout_exits_2_without_connecting() {
+    let unreachable_url = "postgresql://postgres:secret@127.0.0.1:1/nope";
+
+    let empty_dir = tempdir().expect("empty tempdir");
+    auditstream_cmd()
+        .current_dir(empty_dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", unreachable_url)
+        .args(["init", "--table", "invoice"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("missing migration format"));
+
+    let both_dir = tempdir().expect("both tempdir");
+    fs::create_dir(both_dir.path().join("prisma")).expect("create prisma dir");
+    fs::write(both_dir.path().join("drizzle.config.ts"), "").expect("write drizzle.config.ts");
+    auditstream_cmd()
+        .current_dir(both_dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", unreachable_url)
+        .args(["init", "--table", "invoice"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("multiple migration layouts"));
+}

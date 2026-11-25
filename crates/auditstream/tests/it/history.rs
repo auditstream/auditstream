@@ -555,11 +555,15 @@ async fn history_broken_pipe_exits_0_without_panic() {
 
     let dir = tempdir().expect("tempdir");
 
-    for format in ["json", "table"] {
+    for (label, args) in [
+        ("json", vec!["history", "--format", "json"]),
+        ("table", vec!["history", "--format", "table"]),
+        ("diff", vec!["history", "--diff"]),
+    ] {
         let mut child = auditstream_std_cmd()
             .current_dir(dir.path())
             .env("AUDITSTREAM_DATABASE_URL", db.url())
-            .args(["history", "--format", format])
+            .args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -571,12 +575,19 @@ async fn history_broken_pipe_exits_0_without_panic() {
         let mut reader = BufReader::new(stdout);
         let mut first_line = String::new();
         let bytes_read = reader.read_line(&mut first_line).expect("read first line");
-        assert!(bytes_read > 0, "expected at least one line for {format}");
-        if format == "json" {
-            let _: serde_json::Value =
-                serde_json::from_str(&first_line).expect("first JSON line parses");
-        } else {
-            assert!(first_line.starts_with("OCCURRED_AT"));
+        assert!(bytes_read > 0, "expected at least one line for {label}");
+        match label {
+            "json" => {
+                let _: serde_json::Value =
+                    serde_json::from_str(&first_line).expect("first JSON line parses");
+            }
+            "table" => {
+                assert!(first_line.starts_with("OCCURRED_AT"));
+            }
+            "diff" => {
+                assert!(first_line.contains("public.invoice"), "{first_line:?}");
+            }
+            _ => unreachable!(),
         }
 
         // Close the read end of the pipe immediately so subsequent writes hit BrokenPipe.
@@ -591,11 +602,11 @@ async fn history_broken_pipe_exits_0_without_panic() {
         assert_eq!(
             status.code(),
             Some(0),
-            "expected exit 0 on broken pipe ({format}), stderr={stderr_text:?}"
+            "expected exit 0 on broken pipe ({label}), stderr={stderr_text:?}"
         );
         assert_eq!(
             stderr_text, "",
-            "expected no panic or error on stderr ({format})"
+            "expected no panic or error on stderr ({label})"
         );
     }
 }

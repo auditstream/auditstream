@@ -60,6 +60,10 @@ struct StatusReport {
 #[derive(Debug, Clone, Serialize)]
 struct TableStatus {
     table: String,
+    #[serde(skip)]
+    schema: String,
+    #[serde(skip)]
+    name: String,
     captured: bool,
     configured: bool,
     trigger_state: &'static str,
@@ -205,6 +209,8 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
             };
             TableStatus {
                 table: format!("{}.{}", key.0, key.1),
+                schema: key.0,
+                name: key.1,
                 captured,
                 configured,
                 trigger_state,
@@ -297,13 +303,19 @@ fn render_text(report: &StatusReport) -> String {
                     .collect::<Vec<_>>()
                     .join(", ")
             };
+            let table_display = if tbl.schema.is_empty() && tbl.name.is_empty() {
+                sanitize_terminal(&tbl.table)
+            } else {
+                format!(
+                    "{}.{}",
+                    sanitize_terminal(&tbl.schema),
+                    sanitize_terminal(&tbl.name)
+                )
+            };
             let _ = writeln!(
                 out,
                 "  {}  {}  triggers={}  excluded={}",
-                sanitize_terminal(&tbl.table),
-                state_label,
-                tbl.trigger_state,
-                excl_display
+                table_display, state_label, tbl.trigger_state, excl_display
             );
         }
     }
@@ -374,7 +386,9 @@ mod tests {
         let report = StatusReport {
             schema: "audit\x1b[31mstream\x1b[0m".to_owned(),
             tables: vec![TableStatus {
-                table: "public.\x1b]52;c;YWJj\x07inv\u{202E}oice".to_owned(),
+                table: "public\x1b]52;c;unterminated.\x1b]52;c;YWJj\x07inv\u{202E}oice".to_owned(),
+                schema: "public\x1b]52;c;unterminated".to_owned(),
+                name: "\x1b]52;c;YWJj\x07inv\u{202E}oice".to_owned(),
                 captured: true,
                 configured: true,
                 trigger_state: "enabled",

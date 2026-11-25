@@ -103,6 +103,10 @@ const fn is_bidi_control(ch: char) -> bool {
     matches!(ch, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
+const fn is_unicode_line_separator(ch: char) -> bool {
+    matches!(ch, '\u{2028}' | '\u{2029}')
+}
+
 fn skip_csi_body(chars: &mut std::str::Chars<'_>) {
     while matches!(chars.as_str().chars().next(), Some('\x30'..='\x3F')) {
         let _ = chars.next();
@@ -168,9 +172,13 @@ fn skip_esc_sequence(chars: &mut std::str::Chars<'_>) {
 ///
 /// Strips ANSI CSI/OSC/DCS/SOS/PM/APC/ESC escape sequences (both 7-bit and 8-bit C1 forms),
 /// strips all other C0/C1 control characters and Unicode bidirectional override/isolate controls
-/// (`U+202A..=U+202E`, `U+2066..=U+2069`), and maps `\n`, `\r`, and `\t` to spaces.
+/// (`U+202A..=U+202E`, `U+2066..=U+2069`), and maps `\n`, `\r`, `\t`, and Unicode line/paragraph
+/// separators (`U+2028`, `U+2029`) to spaces.
 pub(crate) fn sanitize_terminal(raw: &str) -> String {
-    if !raw.chars().any(|ch| ch.is_control() || is_bidi_control(ch)) {
+    if !raw
+        .chars()
+        .any(|ch| ch.is_control() || is_bidi_control(ch) || is_unicode_line_separator(ch))
+    {
         return raw.to_owned();
     }
 
@@ -184,7 +192,7 @@ pub(crate) fn sanitize_terminal(raw: &str) -> String {
             '\u{0090}' | '\u{0098}' | '\u{009D}' | '\u{009E}' | '\u{009F}' => {
                 skip_string_sequence(&mut chars);
             }
-            '\n' | '\r' | '\t' => out.push(' '),
+            '\n' | '\r' | '\t' | '\u{2028}' | '\u{2029}' => out.push(' '),
             other if other.is_control() || is_bidi_control(other) => {}
             other => out.push(other),
         }
@@ -331,6 +339,7 @@ mod tests {
         assert_eq!(sanitize_terminal("\x1bP1$r\x1b\\dcs"), "dcs");
         assert_eq!(sanitize_terminal("\x1bcreset\x1b(Bdone\x1b"), "resetdone");
         assert_eq!(sanitize_terminal("a\rb\nc\td"), "a b c d");
+        assert_eq!(sanitize_terminal("a\u{2028}b\u{2029}c"), "a b c");
         assert_eq!(sanitize_terminal("ok\x08\x07\x00\x7f\u{0085}!"), "ok!");
         assert_eq!(
             sanitize_terminal(
