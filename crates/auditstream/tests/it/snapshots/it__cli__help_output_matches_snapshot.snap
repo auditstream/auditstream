@@ -8,7 +8,7 @@ info:
 success: true
 exit_code: 0
 ----- stdout -----
-Open-source Postgres audit trail engine and CLI
+Open-source database audit trail engine and CLI
 
 Usage: auditstream [OPTIONS] <COMMAND>
 
