@@ -18,7 +18,7 @@ use serde::Serialize;
 use crate::commands::common::{
     build_configured_verify_specs, build_installed_verify_specs, connect_database,
     group_excludes_by_table, parse_exclude_refs, parse_table_refs, require_database_url,
-    run_async as run_command_async,
+    run_async as run_command_async, sanitize_terminal,
 };
 use crate::config::Config;
 use crate::exit::{Exit, ExitCodeExt, write_stdout};
@@ -285,12 +285,58 @@ fn render_text(report: &VerifyJsonReport) -> String {
     }
 
     for finding in &report.findings {
-        let scope = finding.table.as_deref().unwrap_or(&finding.object);
+        let scope = sanitize_terminal(finding.table.as_deref().unwrap_or(&finding.object));
+        let detail = sanitize_terminal(&finding.detail);
+        let hint = sanitize_terminal(&finding.hint);
         let _ = writeln!(
             out,
             "[{}] {}  {}  {} — hint: {}",
-            finding.severity, scope, finding.kind, finding.detail, finding.hint
+            finding.severity, scope, finding.kind, detail, hint
         );
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VerifyFinding, VerifyJsonReport, render_text};
+
+    #[test]
+    fn render_text_sanitizes_control_ansi_and_bidi_sequences() {
+        let report = VerifyJsonReport {
+            ok: false,
+            schema: "auditstream".to_owned(),
+            months_covered_ahead: 3,
+            created_partitions: Vec::new(),
+            findings: vec![VerifyFinding {
+                severity: "error",
+                kind: "disabled",
+                table: Some("public.\x1b[31minv\u{202E}oice\x1b[0m".to_owned()),
+                object: "public.inv".to_owned(),
+                detail: "bad\x1b]52;c;YWJj\x07\x08detail\u{009B}2J".to_owned(),
+                hint: "fix\rnow\u{2066}please\u{2069}".to_owned(),
+            }],
+        };
+
+        let rendered = render_text(&report);
+        assert!(!rendered.contains('\x1b'), "ESC leaked: {rendered:?}");
+        assert!(!rendered.contains('\x07'), "BEL leaked: {rendered:?}");
+        assert!(!rendered.contains('\x08'), "BS leaked: {rendered:?}");
+        assert!(!rendered.contains('\r'), "CR leaked: {rendered:?}");
+        assert!(
+            !rendered.contains('\u{009B}'),
+            "8-bit CSI leaked: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\u{202E}'),
+            "BiDi RLO leaked: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\u{2066}'),
+            "BiDi LRI leaked: {rendered:?}"
+        );
+        assert!(rendered.contains("public.invoice"), "{rendered:?}");
+        assert!(rendered.contains("baddetail"), "{rendered:?}");
+        assert!(rendered.contains("fix nowplease"), "{rendered:?}");
+    }
 }

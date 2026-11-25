@@ -18,7 +18,7 @@ use serde::Serialize;
 use crate::commands::common::{
     build_configured_verify_specs, build_installed_verify_specs, connect_database,
     group_excludes_by_table, parse_exclude_refs, parse_table_refs, require_database_url,
-    run_async as run_command_async,
+    run_async as run_command_async, sanitize_terminal,
 };
 use crate::config::Config;
 use crate::exit::{Exit, ExitCodeExt, write_stdout};
@@ -60,6 +60,10 @@ struct StatusReport {
 #[derive(Debug, Clone, Serialize)]
 struct TableStatus {
     table: String,
+    #[serde(skip)]
+    schema: String,
+    #[serde(skip)]
+    name: String,
     captured: bool,
     configured: bool,
     trigger_state: &'static str,
@@ -205,6 +209,8 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
             };
             TableStatus {
                 table: format!("{}.{}", key.0, key.1),
+                schema: key.0,
+                name: key.1,
                 captured,
                 configured,
                 trigger_state,
@@ -291,28 +297,49 @@ fn render_text(report: &StatusReport) -> String {
             let excl_display = if tbl.excluded_columns.is_empty() {
                 "none".to_owned()
             } else {
-                tbl.excluded_columns.join(", ")
+                tbl.excluded_columns
+                    .iter()
+                    .map(|col| sanitize_terminal(col))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let table_display = if tbl.schema.is_empty() && tbl.name.is_empty() {
+                sanitize_terminal(&tbl.table)
+            } else {
+                format!(
+                    "{}.{}",
+                    sanitize_terminal(&tbl.schema),
+                    sanitize_terminal(&tbl.name)
+                )
             };
             let _ = writeln!(
                 out,
                 "  {}  {}  triggers={}  excluded={}",
-                tbl.table, state_label, tbl.trigger_state, excl_display
+                table_display, state_label, tbl.trigger_state, excl_display
             );
         }
     }
 
     let _ = writeln!(out);
-    let _ = writeln!(out, "History table ({}.changes):", report.schema);
+    let _ = writeln!(
+        out,
+        "History table ({}.changes):",
+        sanitize_terminal(&report.schema)
+    );
     if report.history.exists {
         let part_summary = match (
             report.history.partitions.first(),
             report.history.partitions.last(),
         ) {
-            (Some(first), Some(last)) if first == last => format!("1 monthly ({first})"),
+            (Some(first), Some(last)) if first == last => {
+                format!("1 monthly ({})", sanitize_terminal(first))
+            }
             (Some(first), Some(last)) => {
                 format!(
-                    "{} monthly ({first}..{last})",
-                    report.history.partitions.len()
+                    "{} monthly ({}..{})",
+                    report.history.partitions.len(),
+                    sanitize_terminal(first),
+                    sanitize_terminal(last)
                 )
             }
             _ => "0 monthly".to_owned(),
@@ -344,8 +371,60 @@ fn render_text(report: &StatusReport) -> String {
 
     if let Some(hint) = &report.hint {
         let _ = writeln!(out);
-        let _ = writeln!(out, "Hint: {hint}");
+        let _ = writeln!(out, "Hint: {}", sanitize_terminal(hint));
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HistoryStatus, StatusReport, TableStatus, render_text};
+
+    #[test]
+    fn render_text_sanitizes_control_ansi_and_bidi_sequences() {
+        let report = StatusReport {
+            schema: "audit\x1b[31mstream\x1b[0m".to_owned(),
+            tables: vec![TableStatus {
+                table: "public\x1b]52;c;unterminated.\x1b]52;c;YWJj\x07inv\u{202E}oice".to_owned(),
+                schema: "public\x1b]52;c;unterminated".to_owned(),
+                name: "\x1b]52;c;YWJj\x07inv\u{202E}oice".to_owned(),
+                captured: true,
+                configured: true,
+                trigger_state: "enabled",
+                excluded_columns: vec!["sec\x08ret\u{009B}31m".to_owned()],
+            }],
+            history: HistoryStatus {
+                exists: true,
+                partitions: vec!["changes_\r2026_11".to_owned()],
+                months_covered_ahead: 3,
+                default_has_rows: false,
+                estimated_rows: 0,
+                total_size_bytes: 0,
+            },
+            problems_found: 1,
+            hint: Some("check\u{2066}verify\u{2069}".to_owned()),
+        };
+
+        let rendered = render_text(&report);
+        assert!(!rendered.contains('\x1b'), "ESC leaked: {rendered:?}");
+        assert!(!rendered.contains('\x07'), "BEL leaked: {rendered:?}");
+        assert!(!rendered.contains('\x08'), "BS leaked: {rendered:?}");
+        assert!(!rendered.contains('\r'), "CR leaked: {rendered:?}");
+        assert!(
+            !rendered.contains('\u{009B}'),
+            "8-bit CSI leaked: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\u{202E}'),
+            "BiDi RLO leaked: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\u{2066}'),
+            "BiDi LRI leaked: {rendered:?}"
+        );
+        assert!(rendered.contains("public.invoice"), "{rendered:?}");
+        assert!(rendered.contains("excluded=secret"), "{rendered:?}");
+        assert!(rendered.contains("auditstream.changes"), "{rendered:?}");
+    }
 }

@@ -4,6 +4,8 @@ use std::fmt;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
+use crate::commands::common::sanitize_terminal;
+
 /// Documented CLI exit codes (public contract: `docs/reference/exit-codes.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -94,14 +96,14 @@ pub(crate) fn exit_code_for(err: &anyhow::Error) -> Exit {
     Exit::Internal
 }
 
-/// Formats an error and its cause chain into a single `error:` line.
+/// Formats an error and its cause chain into a single terminal-safe `error:` line.
 pub(crate) fn format_error_line(err: &anyhow::Error) -> String {
     let mut parts: Vec<String> = Vec::new();
     for cause in err.chain() {
         let cleaned = cause
             .to_string()
             .lines()
-            .map(str::trim)
+            .map(|line| sanitize_terminal(line).trim().to_owned())
             .filter(|line| !line.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
@@ -181,6 +183,20 @@ mod tests {
         let line = format_error_line(&err);
         assert_eq!(line, "error: failed to read config: no such file");
         assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn format_error_line_sanitizes_controls_ansi_and_bidi_per_cause() {
+        let root = io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad\x1b[31mvalue\x1b[0m\u{009B}2J\u{202E}ok",
+        );
+        let err = anyhow::Error::new(root).context("outer\x1b]52;c;unterminated");
+        let line = format_error_line(&err);
+        assert_eq!(line, "error: outer: badvalueok");
+        assert!(!line.contains('\x1b'));
+        assert!(!line.contains('\u{009B}'));
+        assert!(!line.contains('\u{202E}'));
     }
 
     #[test]

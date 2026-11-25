@@ -16,13 +16,25 @@ auditstream [GLOBAL OPTIONS] init [OPTIONS]
 
 | Flag | Value | Default | Description |
 | --- | --- | --- | --- |
-| `--migrations` | `prisma`, `drizzle`, or `sql` | `migrations.format` in config | Target migration format |
-| `--table` | `<schema.table>` | `capture.tables` in config | Table to audit (repeatable) |
+| `--migrations` | `prisma`, `drizzle`, or `sql` | `migrations.format` in config, or autodetected from workspace | Target migration format |
+| `--table` | `<[schema.]table>` | `capture.tables` in config | Table to audit (repeatable; unqualified names default to `public`) |
 | `--exclude` | `<schema.table.column>` | `capture.exclude` in config | Column omitted from `before` and `after` images (repeatable) |
 | `--out` | `<dir>` | Format default (below) | Output directory for generated migration files |
 | `--dry-run` | — | off | Print generated SQL on stdout without writing any files or changing config |
 
 Flags override the corresponding keys in `auditstream.toml`.
+Unqualified CLI `--table <name>` values resolve to `public.<name>` and are written normalized as `public.<name>` in `auditstream.toml`.
+Tables read from `auditstream.toml` (`capture.tables`) and `--exclude` entries require explicit schema qualification.
+
+## Migration layout autodetection
+
+When neither `--migrations` nor `migrations.format` in `auditstream.toml` is set, `init` inspects the current working directory:
+
+- `prisma/` directory or `prisma.config.{ts,js,mjs,cjs,mts,cts}` -> `prisma`
+- `drizzle/` directory or `drizzle.config.{ts,js,mjs,cjs,mts,cts,json}` -> `drizzle`
+- `migrations/` directory (when neither Prisma nor Drizzle markers exist) -> `sql`
+
+If both Prisma and Drizzle markers exist, or if no layout is detected, `init` exits with code `2` and prompts you to pass `--migrations prisma|drizzle|sql`.
 
 ## Default directories and file layouts
 

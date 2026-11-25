@@ -2,13 +2,15 @@
 //!
 //! Queries recorded audit changes from `{schema}.changes` via [`auditstream_pg::reader::lookup`]
 //! (newest first, ordered by `occurred_at DESC, id DESC`) and renders them as an aligned table
-//! (omitting `before`/`after`) or as newline-delimited JSON matching `spec/schemas/event.schema.json`.
+//! (omitting `before`/`after`), field-level `--diff` blocks, or newline-delimited JSON matching
+//! `spec/schemas/event.schema.json`.
 
+use std::ffi::OsStr;
 use std::fmt::Write as _;
-use std::io;
+use std::io::{self, IsTerminal as _};
 
 use anyhow::anyhow;
-use auditstream_core::{Actor, ActorSource, ActorType, Event};
+use auditstream_core::{Actor, ActorSource, ActorType, Event, diff};
 use auditstream_pg::reader::{self, HistoryQuery, MAX_LOOKUP_LIMIT, RecordIdFilter};
 use clap::{Args as ClapArgs, ValueEnum};
 use serde_json::Value;
@@ -16,7 +18,9 @@ use serde_json::value::RawValue;
 use time::format_description::well_known::Rfc3339;
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset};
 
-use crate::commands::common::{connect_database, parse_table_ref, require_database_url, run_async};
+use crate::commands::common::{
+    connect_database, parse_table_ref, require_database_url, run_async, sanitize_terminal,
+};
 use crate::config::Config;
 use crate::exit::{Exit, ExitCodeExt, write_stdout};
 
@@ -47,8 +51,8 @@ pub(crate) enum OutputFormat {
 /// Arguments for `auditstream history`.
 #[derive(Debug, ClapArgs)]
 pub(crate) struct Args {
-    /// Filter by audited table (`<schema>.<table>`).
-    #[arg(long, value_name = "SCHEMA.TABLE")]
+    /// Filter by audited table (`[schema.]table`, defaults to `public`).
+    #[arg(long, value_name = "[SCHEMA.]TABLE")]
     pub(crate) table: Option<String>,
 
     /// Filter by primary key value (requires `--table`; parsed as JSON first, else string).
@@ -83,6 +87,10 @@ pub(crate) struct Args {
     /// Output format (`table` or `json`).
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub(crate) format: OutputFormat,
+
+    /// Show field-level `before -> after` diffs (`--format table` only).
+    #[arg(long)]
+    pub(crate) diff: bool,
 }
 
 /// Runs the `history` command.
@@ -109,6 +117,14 @@ pub(crate) fn run(args: &Args, config: &Config) -> anyhow::Result<()> {
 
     let mut out = io::stdout().lock();
     match args.format {
+        OutputFormat::Table if args.diff => {
+            let use_color = should_use_color();
+            for line in render_diff_lines(&events, use_color) {
+                if !write_stdout(&mut out, line.as_bytes())? {
+                    break;
+                }
+            }
+        }
         OutputFormat::Table => {
             for line in render_table_lines(&events) {
                 if !write_stdout(&mut out, line.as_bytes())? {
@@ -133,8 +149,15 @@ pub(crate) fn run(args: &Args, config: &Config) -> anyhow::Result<()> {
 }
 
 fn build_query(args: &Args) -> anyhow::Result<HistoryQuery> {
+    if args.diff && args.format == OutputFormat::Json {
+        return Err(anyhow!(
+            "--diff is only supported with --format table (JSON output already includes before and after)"
+        ))
+        .exit_code(Exit::Usage);
+    }
+
     if args.record_id.is_some() && args.table.is_none() {
-        return Err(anyhow!("--record-id requires --table <schema>.<table>"))
+        return Err(anyhow!("--record-id requires --table <[schema.]table>"))
             .exit_code(Exit::Usage);
     }
 
@@ -320,20 +343,17 @@ fn format_table_line(cells: &[&str; 7], widths: &[usize; 7]) -> String {
 
 fn event_to_table_row(event: &Event) -> [String; 7] {
     let occurred_at = format_utc_rfc3339(event.occurred_at);
-    let op = sanitize_cell(event.op.as_str());
-    let table = match (&event.schema_name, &event.table_name) {
-        (Some(schema), Some(table)) => sanitize_cell(&format!("{schema}.{table}")),
-        (None, Some(table)) => sanitize_cell(table),
-        _ => "-".to_owned(),
-    };
-    let record_id = event
-        .record_id
-        .as_deref()
-        .map_or_else(|| "-".to_owned(), |raw| sanitize_cell(raw.get()));
+    let op = sanitize_terminal(event.op.as_str());
+    let table = format_event_table(event);
+    let record_id = format_event_record_id(event);
     let actor = format_actor(event.actor.as_deref());
     let actor_source = actor_source_str(event.actor_source).to_owned();
     let changed = match event.changed.as_deref() {
-        Some(cols) if !cols.is_empty() => sanitize_cell(&cols.join(",")),
+        Some(cols) if !cols.is_empty() => cols
+            .iter()
+            .map(|col| sanitize_terminal(col))
+            .collect::<Vec<_>>()
+            .join(","),
         _ => "-".to_owned(),
     };
 
@@ -346,6 +366,209 @@ fn event_to_table_row(event: &Event) -> [String; 7] {
         actor_source,
         changed,
     ]
+}
+
+fn format_event_table(event: &Event) -> String {
+    match (&event.schema_name, &event.table_name) {
+        (Some(schema), Some(table)) => {
+            format!("{}.{}", sanitize_terminal(schema), sanitize_terminal(table))
+        }
+        (None, Some(table)) => sanitize_terminal(table),
+        _ => "-".to_owned(),
+    }
+}
+
+fn format_event_record_id(event: &Event) -> String {
+    event.record_id.as_deref().map_or_else(
+        || "-".to_owned(),
+        |raw| match serde_json::from_str::<Value>(raw.get()) {
+            Ok(val) => format_diff_value(&val),
+            Err(_) => sanitize_terminal(raw.get()),
+        },
+    )
+}
+
+fn should_use_color() -> bool {
+    should_use_color_with(
+        io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR").as_deref(),
+        std::env::var_os("TERM").as_deref(),
+    )
+}
+
+fn should_use_color_with(is_tty: bool, no_color: Option<&OsStr>, term: Option<&OsStr>) -> bool {
+    if !is_tty {
+        return false;
+    }
+    if no_color.is_some_and(|val| !val.is_empty()) {
+        return false;
+    }
+    if term.is_some_and(|val| val == "dumb") {
+        return false;
+    }
+    true
+}
+
+fn paint(text: &str, sgr: &str, use_color: bool) -> String {
+    if use_color {
+        format!("\x1b[{sgr}m{text}\x1b[0m")
+    } else {
+        text.to_owned()
+    }
+}
+
+fn render_diff_lines(events: &[Event], use_color: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (idx, event) in events.iter().enumerate() {
+        if idx > 0 {
+            lines.push("\n".to_owned());
+        }
+        lines.push(format_diff_header(event, use_color));
+        lines.extend(format_diff_body(event, use_color));
+    }
+    lines
+}
+
+fn format_diff_header(event: &Event, use_color: bool) -> String {
+    let occurred_at = format_utc_rfc3339(event.occurred_at);
+    let safe_op = sanitize_terminal(event.op.as_str());
+    let op_sgr = match safe_op.as_str() {
+        "INSERT" => "32",
+        "UPDATE" => "33",
+        "DELETE" | "TRUNCATE" => "31",
+        _ => "36",
+    };
+    let op = paint(&safe_op, op_sgr, use_color);
+    let table = format_event_table(event);
+    let record_id = format_event_record_id(event);
+    let actor = format_actor(event.actor.as_deref());
+    let actor_display = match event.actor_source {
+        Some(source) => format!("{actor} ({})", actor_source_str(Some(source))),
+        None => actor,
+    };
+
+    format!("{occurred_at}  {op}  {table}  {record_id}  {actor_display}\n")
+}
+
+fn format_diff_body(event: &Event, use_color: bool) -> Vec<String> {
+    let before = event
+        .before
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw.get()).ok());
+    let after = event
+        .after
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw.get()).ok());
+
+    match (before, after) {
+        (Some(Value::Object(before_map)), Some(Value::Object(after_map))) => {
+            let keys: Vec<String> = match event.changed.as_deref() {
+                Some(cols) if !cols.is_empty() => cols.to_vec(),
+                _ => diff::changed(event.before.as_deref(), event.after.as_deref())
+                    .unwrap_or_default(),
+            };
+            if keys.is_empty() {
+                return vec!["  (no column changes)\n".to_owned()];
+            }
+            keys.iter()
+                .map(|key| {
+                    let safe_key = sanitize_terminal(key);
+                    match (before_map.get(key), after_map.get(key)) {
+                        (Some(b), Some(a)) => format!(
+                            "  {} {safe_key}: {} -> {}\n",
+                            paint("~", "33", use_color),
+                            paint(&format_diff_value(b), "31", use_color),
+                            paint(&format_diff_value(a), "32", use_color),
+                        ),
+                        (None, Some(a)) => format!(
+                            "  {} {safe_key}: {}\n",
+                            paint("+", "32", use_color),
+                            paint(&format_diff_value(a), "32", use_color),
+                        ),
+                        (Some(b), None) => format!(
+                            "  {} {safe_key}: {}\n",
+                            paint("-", "31", use_color),
+                            paint(&format_diff_value(b), "31", use_color),
+                        ),
+                        (None, None) => format!(
+                            "  {} {safe_key}: (absent) -> (absent)\n",
+                            paint("~", "33", use_color),
+                        ),
+                    }
+                })
+                .collect()
+        }
+        (None, Some(Value::Object(after_map))) => {
+            if after_map.is_empty() {
+                return vec!["  (empty row)\n".to_owned()];
+            }
+            after_map
+                .iter()
+                .map(|(key, val)| {
+                    format!(
+                        "  {} {}: {}\n",
+                        paint("+", "32", use_color),
+                        sanitize_terminal(key),
+                        paint(&format_diff_value(val), "32", use_color),
+                    )
+                })
+                .collect()
+        }
+        (Some(Value::Object(before_map)), None) => {
+            if before_map.is_empty() {
+                return vec!["  (empty row)\n".to_owned()];
+            }
+            before_map
+                .iter()
+                .map(|(key, val)| {
+                    format!(
+                        "  {} {}: {}\n",
+                        paint("-", "31", use_color),
+                        sanitize_terminal(key),
+                        paint(&format_diff_value(val), "31", use_color),
+                    )
+                })
+                .collect()
+        }
+        (Some(b), Some(a)) => vec![format!(
+            "  {} (value): {} -> {}\n",
+            paint("~", "33", use_color),
+            paint(&format_diff_value(&b), "31", use_color),
+            paint(&format_diff_value(&a), "32", use_color),
+        )],
+        (None, Some(a)) => vec![format!(
+            "  {} (value): {}\n",
+            paint("+", "32", use_color),
+            paint(&format_diff_value(&a), "32", use_color),
+        )],
+        (Some(b), None) => vec![format!(
+            "  {} (value): {}\n",
+            paint("-", "31", use_color),
+            paint(&format_diff_value(&b), "31", use_color),
+        )],
+        (None, None) => vec!["  (no row image)\n".to_owned()],
+    }
+}
+
+fn sanitize_json_value(value: &Value) -> Value {
+    match value {
+        Value::Null => Value::Null,
+        Value::Bool(b) => Value::Bool(*b),
+        Value::Number(n) => Value::Number(n.clone()),
+        Value::String(s) => Value::String(sanitize_terminal(s)),
+        Value::Array(items) => Value::Array(items.iter().map(sanitize_json_value).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (sanitize_terminal(k), sanitize_json_value(v)))
+                .collect(),
+        ),
+    }
+}
+
+fn format_diff_value(value: &Value) -> String {
+    let clean = sanitize_json_value(value);
+    let rendered = serde_json::to_string(&clean).unwrap_or_else(|_| "<unserializable>".to_owned());
+    sanitize_terminal(&rendered)
 }
 
 fn format_utc_rfc3339(dt: OffsetDateTime) -> String {
@@ -371,16 +594,19 @@ fn format_actor(raw: Option<&RawValue>) -> String {
     };
 
     if let Ok(actor) = serde_json::from_str::<Actor>(raw.get()) {
-        let base = format!("{}:{}", actor_type_str(actor.actor_type), actor.id);
-        let full = match actor.on_behalf_of {
+        let base = format!(
+            "{}:{}",
+            actor_type_str(actor.actor_type),
+            sanitize_terminal(&actor.id)
+        );
+        return match actor.on_behalf_of {
             Some(nested) => format!(
                 "{base} for {}:{}",
                 actor_type_str(nested.actor_type),
-                nested.id
+                sanitize_terminal(&nested.id)
             ),
             None => base,
         };
-        return sanitize_cell(&full);
     }
 
     if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(raw.get())
@@ -389,19 +615,30 @@ fn format_actor(raw: Option<&RawValue>) -> String {
             map.get("id").and_then(Value::as_str),
         )
     {
-        let base = format!("{actor_type}:{actor_id}");
+        let base = format!(
+            "{}:{}",
+            sanitize_terminal(actor_type),
+            sanitize_terminal(actor_id)
+        );
         if let Some(Value::Object(nested)) = map.get("onBehalfOf")
             && let (Some(nt), Some(ni)) = (
                 nested.get("type").and_then(Value::as_str),
                 nested.get("id").and_then(Value::as_str),
             )
         {
-            return sanitize_cell(&format!("{base} for {nt}:{ni}"));
+            return format!(
+                "{base} for {}:{}",
+                sanitize_terminal(nt),
+                sanitize_terminal(ni)
+            );
         }
-        return sanitize_cell(&base);
+        return base;
     }
 
-    sanitize_cell(raw.get())
+    match serde_json::from_str::<Value>(raw.get()) {
+        Ok(val) => format_diff_value(&val),
+        Err(_) => sanitize_terminal(raw.get()),
+    }
 }
 
 fn actor_type_str(actor_type: ActorType) -> &'static str {
@@ -424,27 +661,20 @@ fn actor_source_str(source: Option<ActorSource>) -> &'static str {
     }
 }
 
-fn sanitize_cell(raw: &str) -> String {
-    if !raw.contains(['\n', '\r', '\t']) {
-        return raw.to_owned();
-    }
-    raw.chars()
-        .map(|ch| match ch {
-            '\n' | '\r' | '\t' => ' ',
-            other => other,
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+
+    use auditstream_core::Event;
     use auditstream_pg::reader::RecordIdFilter;
     use serde_json::value::RawValue;
 
     use super::{
         Args, DEFAULT_LIMIT, OutputFormat, build_query, format_actor, format_utc_rfc3339,
-        parse_record_id_filter, parse_time_flag,
+        parse_record_id_filter, parse_time_flag, render_diff_lines, render_table_lines,
+        should_use_color_with,
     };
+    use crate::commands::common::sanitize_terminal;
     use crate::exit::{Exit, exit_code_for};
 
     fn base_args() -> Args {
@@ -457,7 +687,12 @@ mod tests {
             until: None,
             limit: DEFAULT_LIMIT,
             format: OutputFormat::Table,
+            diff: false,
         }
+    }
+
+    fn event_from_json(raw: &str) -> Event {
+        serde_json::from_str(raw).expect("valid test event JSON")
     }
 
     #[test]
@@ -515,10 +750,27 @@ mod tests {
             Exit::Usage
         );
 
-        let mut bad_table = base_args();
-        bad_table.table = Some("invoice".to_owned());
+        let mut unqualified_table = base_args();
+        unqualified_table.table = Some("invoice".to_owned());
+        let unqualified_query = build_query(&unqualified_table).unwrap();
+        assert_eq!(unqualified_query.schema_name.as_deref(), Some("public"));
+        assert_eq!(unqualified_query.table.as_deref(), Some("invoice"));
+
+        for bad in ["", ".invoice", "public.", "a.b.c"] {
+            let mut bad_table = base_args();
+            bad_table.table = Some(bad.to_owned());
+            assert_eq!(
+                exit_code_for(&build_query(&bad_table).unwrap_err()),
+                Exit::Usage,
+                "bad={bad:?}"
+            );
+        }
+
+        let mut diff_json = base_args();
+        diff_json.format = OutputFormat::Json;
+        diff_json.diff = true;
         assert_eq!(
-            exit_code_for(&build_query(&bad_table).unwrap_err()),
+            exit_code_for(&build_query(&diff_json).unwrap_err()),
             Exit::Usage
         );
 
@@ -567,6 +819,224 @@ mod tests {
         assert_eq!(
             format_actor(Some(&delegated)),
             "ai_agent:bot_7 for user:usr_42"
+        );
+    }
+
+    #[test]
+    fn sanitize_cell_neutralizes_ansi_osc_c0_c1_and_bidi_controls() {
+        assert_eq!(sanitize_terminal("\x1b[31mred\x1b[0m"), "red");
+        assert_eq!(sanitize_terminal("\x1b]52;c;YWJj\x07safe"), "safe");
+        assert_eq!(
+            sanitize_terminal("\x1b]8;;https://evil.example\x1b\\link\x1b]8;;\x1b\\"),
+            "link"
+        );
+        assert_eq!(sanitize_terminal("\u{009B}31mcsi8\u{009B}0m"), "csi8");
+        assert_eq!(sanitize_terminal("ok\x08\x07\x00\x7f\u{0085}!"), "ok!");
+        assert_eq!(sanitize_terminal("a\rb\nc\td"), "a b c d");
+        assert_eq!(
+            sanitize_terminal("user\u{202E}nimda\u{202C}\u{2066}x\u{2069}"),
+            "usernimdax"
+        );
+    }
+
+    #[test]
+    fn color_detection_respects_tty_no_color_and_dumb_term() {
+        assert!(should_use_color_with(
+            true,
+            None,
+            Some(OsStr::new("xterm-256color"))
+        ));
+        assert!(should_use_color_with(true, Some(OsStr::new("")), None));
+        assert!(!should_use_color_with(true, Some(OsStr::new("1")), None));
+        assert!(!should_use_color_with(
+            false,
+            None,
+            Some(OsStr::new("xterm-256color"))
+        ));
+        assert!(!should_use_color_with(true, None, Some(OsStr::new("dumb"))));
+    }
+
+    #[test]
+    fn render_diff_lines_formats_update_insert_delete_and_truncate() {
+        let update = event_from_json(
+            r#"{
+                "event_id": "00000000-0000-4000-8000-000000000001",
+                "occurred_at": "2026-06-15T00:00:00.000000Z",
+                "source": "db",
+                "schema_name": "public",
+                "table_name": "invoice",
+                "op": "UPDATE",
+                "record_id": {"id": 1},
+                "before": {"id": 1, "amount": 10.50, "status": "draft", "removed_col": "old"},
+                "after": {"id": 1, "amount": 12345678901234567890.123456789, "status": "sent", "added_col": "new"},
+                "changed": ["amount", "status", "added_col", "removed_col"],
+                "actor": {"type": "user", "id": "usr_1"},
+                "context": null,
+                "actor_source": "set_config",
+                "db_user": "postgres",
+                "schema_version": 1
+            }"#,
+        );
+        let insert = event_from_json(
+            r#"{
+                "event_id": "00000000-0000-4000-8000-000000000002",
+                "occurred_at": "2026-06-14T23:59:59.000000Z",
+                "source": "db",
+                "schema_name": "public",
+                "table_name": "invoice",
+                "op": "INSERT",
+                "record_id": {"id": 1},
+                "before": null,
+                "after": {"id": 1, "status": "draft"},
+                "changed": null,
+                "actor": null,
+                "context": null,
+                "actor_source": null,
+                "db_user": "postgres",
+                "schema_version": 1
+            }"#,
+        );
+        let delete = event_from_json(
+            r#"{
+                "event_id": "00000000-0000-4000-8000-000000000003",
+                "occurred_at": "2026-06-14T23:00:00.000000Z",
+                "source": "db",
+                "schema_name": "public",
+                "table_name": "invoice",
+                "op": "DELETE",
+                "record_id": {"id": 2},
+                "before": {"id": 2, "status": "void"},
+                "after": null,
+                "changed": null,
+                "actor": {"type": "user", "id": "usr_2"},
+                "context": null,
+                "actor_source": "comment",
+                "db_user": "postgres",
+                "schema_version": 1
+            }"#,
+        );
+        let truncate = event_from_json(
+            r#"{
+                "event_id": "00000000-0000-4000-8000-000000000004",
+                "occurred_at": "2026-06-14T22:00:00.000000Z",
+                "source": "db",
+                "schema_name": "public",
+                "table_name": "invoice",
+                "op": "TRUNCATE",
+                "record_id": null,
+                "before": null,
+                "after": null,
+                "changed": null,
+                "actor": null,
+                "context": null,
+                "actor_source": null,
+                "db_user": "postgres",
+                "schema_version": 1
+            }"#,
+        );
+
+        let plain = render_diff_lines(&[update.clone(), insert, delete, truncate], false).join("");
+        assert!(
+            !plain.contains('\x1b'),
+            "plain diff must emit zero ESC: {plain:?}"
+        );
+        assert!(plain.contains("~ amount: 10.50 -> 12345678901234567890.123456789\n"));
+        assert!(plain.contains("~ status: \"draft\" -> \"sent\"\n"));
+        assert!(plain.contains("+ added_col: \"new\"\n"));
+        assert!(plain.contains("- removed_col: \"old\"\n"));
+        assert!(plain.contains("+ id: 1\n"));
+        assert!(plain.contains("+ status: \"draft\"\n"));
+        assert!(plain.contains("- id: 2\n"));
+        assert!(plain.contains("- status: \"void\"\n"));
+        assert!(plain.contains("(no row image)\n"));
+
+        let colored = render_diff_lines(&[update], true).join("");
+        assert!(colored.contains("\x1b[33mUPDATE\x1b[0m"));
+        assert!(colored.contains("\x1b[31m\"draft\"\x1b[0m -> \x1b[32m\"sent\"\x1b[0m"));
+    }
+
+    #[test]
+    fn table_and_diff_outputs_neutralize_malicious_payloads() {
+        let hostile = event_from_json(
+            r#"{
+                "event_id": "00000000-0000-4000-8000-000000000009",
+                "occurred_at": "2026-06-15T00:00:00.000000Z",
+                "source": "db",
+                "schema_name": "public",
+                "table_name": "inv\u001b[31moice\u001b[0m",
+                "op": "UPDATE",
+                "record_id": {"id": "1\u009b31m\u202e"},
+                "before": {"note": "\u001b[31mred\u001b[0m\u0008old"},
+                "after": {"note": "\u001b]52;c;YWJj\u0007new\u009b2J\u202e\r\nline2"},
+                "changed": ["note"],
+                "actor": {"type": "user", "id": "\u001b]52;c;YWJj\u0007admin\u2066x\u2069"},
+                "context": null,
+                "actor_source": "set_config",
+                "db_user": "postgres",
+                "schema_version": 1
+            }"#,
+        );
+
+        let table_out = render_table_lines(std::slice::from_ref(&hostile)).join("");
+        let diff_out = render_diff_lines(&[hostile], false).join("");
+
+        for (label, output) in [("table", table_out), ("diff", diff_out)] {
+            assert!(
+                !output.chars().any(|ch| (ch.is_control() && ch != '\n')
+                    || matches!(ch, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')),
+                "{label} output leaked control or BiDi char: {output:?}"
+            );
+            assert!(output.contains("public.invoice"), "{label}: {output:?}");
+            assert!(output.contains("user:adminx"), "{label}: {output:?}");
+        }
+    }
+
+    #[test]
+    fn unterminated_escapes_do_not_swallow_sibling_fields() {
+        let hostile = event_from_json(
+            r#"{
+                "event_id": "00000000-0000-4000-8000-000000000010",
+                "occurred_at": "2026-06-15T00:00:00.000000Z",
+                "source": "db",
+                "schema_name": "pub\u001b]52;c;unterminated",
+                "table_name": "invoice",
+                "op": "UPDATE",
+                "record_id": {"a": "x\u009d52;c;unterminated", "b": 42, "c": "end\u009b"},
+                "before": {"a": "old", "status": "draft"},
+                "after": {"a": "new", "status": "sent"},
+                "changed": ["a\u001b]52;c;unterminated", "status"],
+                "actor": {
+                    "type": "ai_agent",
+                    "id": "bot\u001b]0;hide",
+                    "onBehalfOf": {"type": "user", "id": "alice"}
+                },
+                "context": null,
+                "actor_source": "set_config",
+                "db_user": "postgres",
+                "schema_version": 1
+            }"#,
+        );
+
+        let table_out = render_table_lines(std::slice::from_ref(&hostile)).join("");
+        let diff_out = render_diff_lines(&[hostile], false).join("");
+
+        for (label, output) in [("table", &table_out), ("diff", &diff_out)] {
+            assert!(
+                output.contains("pub.invoice"),
+                "{label} swallowed table name: {output:?}"
+            );
+            assert!(
+                output.contains(r#"{"a":"x","b":42,"c":"end"}"#),
+                "{label} corrupted composite record_id: {output:?}"
+            );
+            assert!(
+                output.contains("ai_agent:bot for user:alice"),
+                "{label} erased onBehalfOf attribution: {output:?}"
+            );
+        }
+        assert!(
+            table_out.contains("a,status"),
+            "table swallowed sibling changed column: {table_out:?}"
         );
     }
 }

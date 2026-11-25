@@ -128,14 +128,25 @@ fn validation_errors_exit_2_without_connecting() {
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains("--table"));
 
-    // Invalid --table format
+    // Invalid --table formats
+    for bad_table in ["a.b.c", ".invoice", "public."] {
+        auditstream_cmd()
+            .current_dir(dir.path())
+            .args(["history", "--table", bad_table])
+            .assert()
+            .code(2)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::contains("<schema>.<table>"));
+    }
+
+    // --diff cannot be combined with --format json
     auditstream_cmd()
         .current_dir(dir.path())
-        .args(["history", "--table", "invoice"])
+        .args(["history", "--diff", "--format", "json"])
         .assert()
         .code(2)
         .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains("<schema>.<table>"));
+        .stderr(predicate::str::contains("--diff"));
 
     // --until equal to --since
     auditstream_cmd()
@@ -319,17 +330,19 @@ async fn history_filters_ordering_table_snapshot_and_json_schema() {
     assert_eq!(events[4]["before"]["status"], "draft");
     assert_eq!(events[4]["after"]["status"], "sent");
 
-    // 3. --table alone
-    let out = auditstream_cmd()
-        .current_dir(dir.path())
-        .env("AUDITSTREAM_DATABASE_URL", db.url())
-        .args(["history", "--table", "public.invoice", "--format", "json"])
-        .output()
-        .expect("run --table");
-    assert!(out.status.success());
-    let rows = parse_json_lines(&out.stdout);
-    assert_eq!(rows.len(), 3);
-    assert!(rows.iter().all(|r| r["table_name"] == "invoice"));
+    // 3. --table alone (qualified and unqualified defaulting to `public`)
+    for table_arg in ["public.invoice", "invoice"] {
+        let out = auditstream_cmd()
+            .current_dir(dir.path())
+            .env("AUDITSTREAM_DATABASE_URL", db.url())
+            .args(["history", "--table", table_arg, "--format", "json"])
+            .output()
+            .expect("run --table");
+        assert!(out.status.success());
+        let rows = parse_json_lines(&out.stdout);
+        assert_eq!(rows.len(), 3, "table_arg={table_arg}");
+        assert!(rows.iter().all(|r| r["table_name"] == "invoice"));
+    }
 
     // 4. --record-id scalar int 1 vs string "1"
     let out_int = auditstream_cmd()
@@ -542,11 +555,15 @@ async fn history_broken_pipe_exits_0_without_panic() {
 
     let dir = tempdir().expect("tempdir");
 
-    for format in ["json", "table"] {
+    for (label, args) in [
+        ("json", vec!["history", "--format", "json"]),
+        ("table", vec!["history", "--format", "table"]),
+        ("diff", vec!["history", "--diff"]),
+    ] {
         let mut child = auditstream_std_cmd()
             .current_dir(dir.path())
             .env("AUDITSTREAM_DATABASE_URL", db.url())
-            .args(["history", "--format", format])
+            .args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -558,12 +575,19 @@ async fn history_broken_pipe_exits_0_without_panic() {
         let mut reader = BufReader::new(stdout);
         let mut first_line = String::new();
         let bytes_read = reader.read_line(&mut first_line).expect("read first line");
-        assert!(bytes_read > 0, "expected at least one line for {format}");
-        if format == "json" {
-            let _: serde_json::Value =
-                serde_json::from_str(&first_line).expect("first JSON line parses");
-        } else {
-            assert!(first_line.starts_with("OCCURRED_AT"));
+        assert!(bytes_read > 0, "expected at least one line for {label}");
+        match label {
+            "json" => {
+                let _: serde_json::Value =
+                    serde_json::from_str(&first_line).expect("first JSON line parses");
+            }
+            "table" => {
+                assert!(first_line.starts_with("OCCURRED_AT"));
+            }
+            "diff" => {
+                assert!(first_line.contains("public.invoice"), "{first_line:?}");
+            }
+            _ => unreachable!(),
         }
 
         // Close the read end of the pipe immediately so subsequent writes hit BrokenPipe.
@@ -578,11 +602,11 @@ async fn history_broken_pipe_exits_0_without_panic() {
         assert_eq!(
             status.code(),
             Some(0),
-            "expected exit 0 on broken pipe ({format}), stderr={stderr_text:?}"
+            "expected exit 0 on broken pipe ({label}), stderr={stderr_text:?}"
         );
         assert_eq!(
             stderr_text, "",
-            "expected no panic or error on stderr ({format})"
+            "expected no panic or error on stderr ({label})"
         );
     }
 }
@@ -621,4 +645,61 @@ async fn history_tenant_filter_matches_direct_and_on_behalf_of() {
     assert_eq!(rows[0]["actor"]["onBehalfOf"]["tenant"], "org_acme");
     assert_eq!(rows[1]["actor"]["id"], "u_1");
     assert_eq!(rows[1]["actor"]["tenant"], "org_acme");
+}
+
+#[tokio::test]
+async fn history_diff_renders_update_insert_delete_and_sanitizes_terminal_output() {
+    let db = TestDb::new().await.expect("create TestDb");
+    install_history_schema(&db).await;
+
+    db.execute(
+        r#"INSERT INTO auditstream.changes
+           (occurred_at, source, schema_name, table_name, op, record_id, before, after, changed, actor, actor_source, db_user, schema_version) VALUES
+           ('2026-06-15T10:00:00Z'::timestamptz, 'db', 'public', 'invoice', 'INSERT', '{"id":1}'::jsonb,
+            NULL, '{"id":1,"status":"draft","note":"ok"}'::jsonb, NULL,
+            '{"type":"user","id":"usr_1"}'::jsonb, 'set_config', 'app_owner', 1),
+           ('2026-06-15T11:00:00Z'::timestamptz, 'db', 'public', 'invoice', 'UPDATE', '{"id":1}'::jsonb,
+            '{"id":1,"status":"draft","note":"ok"}'::jsonb,
+            jsonb_build_object('id', 1, 'status', 'sent', 'note', E'\x1b[31mred\x1b[0m' || E'\x1b]52;c;YWJj\x07' || U&'\009B' || '2J' || U&'\202E' || 'clean'),
+            ARRAY['note','status'],
+            jsonb_build_object('type', 'user', 'id', E'\x1b[31madmin\x1b[0m'),
+            'set_config', 'app_owner', 1),
+           ('2026-06-15T12:00:00Z'::timestamptz, 'db', 'public', 'invoice', 'DELETE', '{"id":1}'::jsonb,
+            '{"id":1,"status":"sent"}'::jsonb, NULL, NULL,
+            '{"type":"user","id":"usr_2"}'::jsonb, 'comment', 'app_owner', 1)"#,
+    )
+    .await
+    .expect("seed diff rows");
+
+    let dir = tempdir().expect("tempdir");
+    let out = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["history", "--table", "invoice", "--diff"])
+        .output()
+        .expect("run history --diff");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    assert!(
+        !stdout.chars().any(|ch| (ch.is_control() && ch != '\n')
+            || matches!(ch, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')),
+        "diff output leaked control or BiDi char: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("~ status: \"draft\" -> \"sent\"\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("~ note: \"ok\" -> \"redclean\"\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("+ status: \"draft\"\n"), "{stdout}");
+    assert!(stdout.contains("- status: \"sent\"\n"), "{stdout}");
+    assert!(stdout.contains("user:admin (set_config)"), "{stdout}");
 }

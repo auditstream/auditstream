@@ -19,8 +19,8 @@ Options:
           
           [env: AUDITSTREAM_CONFIG=]
 
-      --table <SCHEMA.TABLE>
-          Table to audit (`schema.table`), repeatable
+      --table <[SCHEMA.]TABLE>
+          Table to audit (`[schema.]table`, defaults to `public`), repeatable
 
       --database-url <URL>
           Postgres connection URL (also reads `DATABASE_URL` as fallback)
