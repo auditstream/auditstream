@@ -88,7 +88,7 @@ Measured on 2026-11-24 against PostgreSQL 19.0 and PgBouncer 1.26.1 ([full bench
 | Target | Status | Details |
 | --- | --- | --- |
 | PostgreSQL | Supported & tested | 15 to 19 (14 reached end of life on 2026-11-12) |
-| MySQL | Planned | Not supported yet — PostgreSQL is the only engine in v0.1 |
+| MySQL | Evaluating | Not supported yet — PostgreSQL is the only engine in v0.1 |
 | TypeScript SDK | Supported | Node.js 22.12+ (tested on 22, 24, and 26), `@prisma/client` 7.1+ (7.x; Prisma 8 after stable release), Drizzle 0.45 and 1.x |
 | Python SDK | Planned | No native SDK yet — works today via [`psycopg` and SQL comments](https://auditstream.dev/docs/python/) |
 | Plain SQL | Supported | Any language or driver (Go, Ruby, Java, `psql`) via [SQL comments or `set_config`](https://auditstream.dev/docs/plain-sql/) |

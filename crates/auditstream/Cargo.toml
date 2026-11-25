@@ -1,6 +1,6 @@
 [package]
 name = "auditstream"
-description = "CLI binary for the Auditstream Postgres audit trail engine"
+description = "CLI binary for the Auditstream database audit trail engine"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
