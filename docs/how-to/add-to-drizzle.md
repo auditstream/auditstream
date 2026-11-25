@@ -30,7 +30,7 @@ Every Drizzle file separates statements with `--> statement-breakpoint` comments
 
 ## 3. Apply and verify the migration
 
-Apply the new migration through Drizzle, then verify installed triggers and monthly partitions:
+Apply the new migration through Drizzle using a transactional migrator (`node-postgres`, `postgres.js`, or Neon WebSocket `neon-serverless` — not the stateless Neon HTTP migrator; see [Migration lock waits](../reference/cli/init.md#migration-lock-waits)), then verify installed triggers and monthly partitions:
 
 ```sh
 npx drizzle-kit migrate

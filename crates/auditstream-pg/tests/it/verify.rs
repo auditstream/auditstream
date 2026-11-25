@@ -206,16 +206,17 @@ async fn outdated_function_body_trigger_definition_and_excluded_columns_are_repo
         .await
         .expect("modify capture() body");
 
-    // 3. Replace auditstream_update dropping its WHEN clause -> Outdated naming WHEN clause.
+    // 3. Restore the v0.1.0 whole-row comparison, which breaks UPDATE on json columns.
     db.pool()
         .execute(
             "CREATE OR REPLACE TRIGGER auditstream_update \
                AFTER UPDATE ON public.invoice \
                FOR EACH ROW \
+               WHEN (OLD.* IS DISTINCT FROM NEW.*) \
                EXECUTE FUNCTION auditstream.capture('[\"id\"]', '[\"password_hash\"]')",
         )
         .await
-        .expect("replace update trigger without WHEN");
+        .expect("install legacy update trigger");
 
     let drift_report = verify::check(db.pool(), &installed_specs)
         .await

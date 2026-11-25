@@ -28,6 +28,9 @@ pub(crate) fn write(options: &MigrationOptions) -> Result<WriteOutcome, Migratio
     }
 }
 
+/// Prisma runs each file as one implicit transaction and then records the outcome in
+/// `_prisma_migrations` on the same connection. An explicit `BEGIN` would leave that connection
+/// in an aborted transaction after a failure, hiding the error and its log from Prisma.
 pub(crate) fn render_sql(manifest: &Manifest, statements: &[String]) -> String {
     let mut out = String::new();
     out.push_str(&header_comment(manifest));

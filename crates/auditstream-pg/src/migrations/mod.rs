@@ -5,6 +5,7 @@
 //! selection) into deterministic, re-runnable migration files that each ORM's own migrator
 //! executes unchanged.
 
+mod definition_digest;
 pub mod drizzle;
 pub mod prisma;
 pub mod sql;
@@ -25,6 +26,41 @@ use crate::triggers::{self, TableTriggerSpec, TriggerOptions};
 /// Prefix identifying the machine-readable manifest comment emitted at the top of every
 /// Auditstream-generated migration file.
 pub(crate) const MANIFEST_PREFIX: &str = "-- auditstream:manifest ";
+
+// Marks the enclosing transaction and bounds every lock wait when the connection has no timeout.
+// The fallback flag lets the last statement restore the setting for any later migration in the
+// same transaction, because Drizzle's transactional migrators apply pending migrations together.
+const SET_LOCK_TIMEOUT: &str = "DO $$
+BEGIN
+  PERFORM pg_catalog.set_config('auditstream._migration_tx', 'on', true);
+  IF pg_catalog.current_setting('lock_timeout') = '0' THEN
+    SET LOCAL lock_timeout = '5s';
+    PERFORM pg_catalog.set_config('auditstream._lock_timeout_fallback', 'on', true);
+  END IF;
+END
+$$";
+
+// Rejects runners that commit each statement separately (such as the Drizzle Neon HTTP migrator or
+// `psql -f` on a Prisma file), which discard transaction-local settings, break DDL atomicity, and
+// lose session state needed to revoke the temporary `auditstream_owner` self-grant on PG 16+.
+const REQUIRE_TRANSACTION: &str = "DO $$
+BEGIN
+  IF pg_catalog.current_setting('auditstream._migration_tx', true) IS DISTINCT FROM 'on' THEN
+    RAISE EXCEPTION 'Auditstream migrations must run inside a single transaction'
+      USING HINT = 'Use a transactional migrator (for example Prisma Migrate, psql --single-transaction, or Drizzle with node-postgres, postgres.js, or neon-serverless) instead of an autocommit/HTTP runner.';
+  END IF;
+END
+$$";
+
+const RESTORE_LOCK_TIMEOUT: &str = "DO $$
+BEGIN
+  IF pg_catalog.current_setting('auditstream._lock_timeout_fallback', true) = 'on' THEN
+    SET LOCAL lock_timeout = 0;
+    PERFORM pg_catalog.set_config('auditstream._lock_timeout_fallback', 'off', true);
+  END IF;
+  PERFORM pg_catalog.set_config('auditstream._migration_tx', 'off', true);
+END
+$$";
 
 /// Trigger names installed by [`crate::triggers::generate`] on each audited table.
 const AUDIT_TRIGGER_NAMES: [&str; 4] = [
@@ -179,7 +215,7 @@ pub fn preview(options: &MigrationOptions) -> Result<PreviewOutcome, MigrationEr
 /// - Composes D2 history schema DDL and D3 capture triggers, keeping D2's temporary
 ///   `auditstream_owner` self-grant active until after D3 creates/alters functions so
 ///   PostgreSQL 16+ non-superuser migrators succeed.
-/// - Re-running with the same selection writes nothing and returns [`WriteOutcome::UpToDate`].
+/// - Re-running with the same selection and function SQL writes nothing and returns [`WriteOutcome::UpToDate`].
 /// - Re-running with a changed selection leaves all existing migration files byte-identical,
 ///   emits `DROP TRIGGER IF EXISTS` statements for tables removed from the previous selection
 ///   (preserving their recorded history), and writes one new migration.
@@ -203,24 +239,32 @@ pub(crate) struct Manifest {
     pub(crate) tables: BTreeSet<(String, String)>,
 }
 
-pub(crate) fn build_manifest(options: &MigrationOptions) -> Manifest {
+fn canonicalize_tables(tables: &[TableTriggerSpec]) -> Vec<TableTriggerSpec> {
+    let mut sorted = tables.to_vec();
+    sorted.sort_by(|a, b| a.schema.cmp(&b.schema).then_with(|| a.table.cmp(&b.table)));
+    for spec in &mut sorted {
+        spec.excluded_columns.sort();
+        spec.excluded_columns.dedup();
+    }
+    sorted
+}
+
+fn build_manifest(
+    options: &MigrationOptions,
+    tables: BTreeSet<(String, String)>,
+    statements: &[String],
+) -> Manifest {
     let mut app_roles = options.ddl.app_roles.clone();
     app_roles.sort();
     app_roles.dedup();
 
-    let mut tables_sorted = options.tables.clone();
-    tables_sorted.sort_by(|a, b| a.schema.cmp(&b.schema).then_with(|| a.table.cmp(&b.table)));
+    let tables_sorted = canonicalize_tables(&options.tables);
 
-    let mut table_pairs = BTreeSet::new();
     let tables_json: Vec<Value> = tables_sorted
         .iter()
         .map(|spec| {
-            table_pairs.insert((spec.schema.clone(), spec.table.clone()));
-            let mut excl = spec.excluded_columns.clone();
-            excl.sort();
-            excl.dedup();
             json!({
-                "excluded_columns": excl,
+                "excluded_columns": spec.excluded_columns,
                 "is_partitioned": spec.is_partitioned,
                 "primary_key": spec.primary_key,
                 "schema": spec.schema,
@@ -231,6 +275,7 @@ pub(crate) fn build_manifest(options: &MigrationOptions) -> Manifest {
 
     let value = json!({
         "app_roles": app_roles,
+        "definitions_sha256": definition_digest::from_statements(statements),
         "schema": options.ddl.schema,
         "schema_version": CURRENT_SCHEMA_VERSION,
         "tables": tables_json,
@@ -239,7 +284,7 @@ pub(crate) fn build_manifest(options: &MigrationOptions) -> Manifest {
     Manifest {
         canonical_json: serde_json::to_string(&value)
             .expect("manifest JSON serialization cannot fail"),
-        tables: table_pairs,
+        tables,
     }
 }
 
@@ -274,25 +319,17 @@ pub(crate) fn parse_manifest_from_file(path: &Path) -> Result<Option<Manifest>, 
     Ok(None)
 }
 
-pub(crate) fn compute_dropped_tables(
+fn compute_dropped_tables(
     previous: Option<&Manifest>,
-    current: &Manifest,
+    selected: &BTreeSet<(String, String)>,
     explicit_removed: &[(String, String)],
 ) -> Vec<(String, String)> {
-    let mut dropped = BTreeSet::new();
-    if let Some(prev) = previous {
-        for pair in &prev.tables {
-            if !current.tables.contains(pair) {
-                dropped.insert(pair.clone());
-            }
-        }
+    let mut removed: BTreeSet<_> = explicit_removed.iter().cloned().collect();
+    if let Some(previous) = previous {
+        removed.extend(previous.tables.iter().cloned());
     }
-    for pair in explicit_removed {
-        if !current.tables.contains(pair) {
-            dropped.insert(pair.clone());
-        }
-    }
-    dropped.into_iter().collect()
+    removed.retain(|table| !selected.contains(table));
+    removed.into_iter().collect()
 }
 
 /// Standard two-line header comment prepended to every generated migration file.
@@ -310,13 +347,11 @@ pub(crate) fn compose_statements(
     options: &MigrationOptions,
     dropped_tables: &[(String, String)],
 ) -> Vec<String> {
-    let mut ddl_stmts = ddl::generate(&options.ddl);
     // Keep D2's temporary `auditstream_owner` self-grant active while D3 creates/alters functions,
-    // then run D2's cleanup statement at the very end.
-    let role_cleanup = ddl_stmts.pop();
-
-    let mut tables_sorted = options.tables.clone();
-    tables_sorted.sort_by(|a, b| a.schema.cmp(&b.schema).then_with(|| a.table.cmp(&b.table)));
+    // and run future monthly partition creation after triggers so holding a lock on `changes`
+    // cannot deadlock with in-flight writers holding an audited table.
+    let ddl_parts = ddl::generate_parts(&options.ddl);
+    let tables_sorted = canonicalize_tables(&options.tables);
 
     let trigger_stmts = triggers::generate(&TriggerOptions::new(
         options.ddl.schema.clone(),
@@ -334,11 +369,19 @@ pub(crate) fn compose_statements(
         }
     }
 
-    ddl_stmts
-        .into_iter()
+    let tx_check = matches!(
+        options.format,
+        MigrationFormat::Drizzle | MigrationFormat::Prisma
+    )
+    .then(|| REQUIRE_TRANSACTION.to_owned());
+    std::iter::once(SET_LOCK_TIMEOUT.to_owned())
+        .chain(tx_check)
+        .chain(ddl_parts.setup)
         .chain(trigger_stmts)
         .chain(drop_stmts)
-        .chain(role_cleanup)
+        .chain(std::iter::once(ddl_parts.future_partitions))
+        .chain(std::iter::once(ddl_parts.role_cleanup))
+        .chain(std::iter::once(RESTORE_LOCK_TIMEOUT.to_owned()))
         .collect()
 }
 
@@ -373,21 +416,21 @@ pub(crate) fn plan_migration(
     options: &MigrationOptions,
     newest: Option<(PathBuf, Manifest)>,
 ) -> PlannedMigration {
-    let current = build_manifest(options);
-    let prev_manifest = match newest {
-        Some((existing, prev))
-            if prev.canonical_json == current.canonical_json
-                && options.removed_tables.is_empty() =>
-        {
-            return PlannedMigration::UpToDate { existing };
-        }
-        Some((_, prev)) => Some(prev),
-        None => None,
-    };
-
-    let dropped_tables =
-        compute_dropped_tables(prev_manifest.as_ref(), &current, &options.removed_tables);
+    let selected = options
+        .tables
+        .iter()
+        .map(|t| (t.schema.clone(), t.table.clone()))
+        .collect();
+    let previous = newest.as_ref().map(|(_, manifest)| manifest);
+    let dropped_tables = compute_dropped_tables(previous, &selected, &options.removed_tables);
     let statements = compose_statements(options, &dropped_tables);
+    let current = build_manifest(options, selected, &statements);
+    if let Some((existing, previous)) = newest
+        && previous.canonical_json == current.canonical_json
+        && options.removed_tables.is_empty()
+    {
+        return PlannedMigration::UpToDate { existing };
+    }
     PlannedMigration::Changed {
         manifest: current,
         dropped_tables,

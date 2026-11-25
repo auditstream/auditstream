@@ -25,8 +25,8 @@ sequenceDiagram
 
 - **`INSERT` and `DELETE` run once per statement** using transition tables (`REFERENCING NEW TABLE` or `OLD TABLE`).
   The trigger resolves the actor once per statement instead of once per row.
-- **`UPDATE` runs per row** with `WHEN (OLD.* IS DISTINCT FROM NEW.*)` to skip no-op writes.
-  Updates that touch only excluded columns produce no history row.
+- **`UPDATE` runs per row.** The capture function compares the JSONB row images after removing excluded columns.
+  Equal images produce no history row. This also works for columns such as `json` that lack a PostgreSQL equality operator.
 - **`TRUNCATE` runs once per statement** and records the table and actor with `NULL` row images.
 - **Excluded columns** are removed from `before`, `after`, and `changed`.
 - **Partitioned user tables** attach statement triggers to the parent table.

@@ -3,13 +3,12 @@
 use std::fs;
 use std::path::PathBuf;
 
-use auditstream_pg::migrations::drizzle::STATEMENT_BREAKPOINT;
 use auditstream_testkit::TestDb;
 use insta_cmd::assert_cmd_snapshot;
 use predicates::prelude::*;
 use tempfile::tempdir;
 
-use crate::support::{auditstream_cmd, auditstream_std_cmd};
+use crate::support::{apply_generated_migration, auditstream_cmd, auditstream_std_cmd};
 
 async fn create_fixture_tables(db: &TestDb) {
     db.execute_batch(
@@ -30,25 +29,6 @@ async fn create_fixture_tables(db: &TestDb) {
     )
     .await
     .expect("create fixture tables");
-}
-
-async fn apply_migration_file(db: &TestDb, format: &str, path: &std::path::Path) {
-    let sql = fs::read_to_string(path).expect("read migration sql");
-    if format == "drizzle" {
-        let chunks: Vec<String> = sql
-            .split(STATEMENT_BREAKPOINT)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect();
-        db.execute_statements(&chunks)
-            .await
-            .expect("apply drizzle migration chunks");
-    } else {
-        db.execute_batch(&sql)
-            .await
-            .expect("apply prisma/sql migration");
-    }
 }
 
 #[test]
@@ -308,7 +288,7 @@ async fn per_format_generated_migrations_capture_writes_without_excluded_column(
             .iter()
             .find(|p| p.extension().is_some_and(|e| e == "sql"))
             .expect("generated sql path");
-        apply_migration_file(&db, format, sql_file).await;
+        apply_generated_migration(&db, format, sql_file).await;
 
         db.execute(
             "INSERT INTO public.invoice (id, status, password_hash) VALUES (1, 'open', 'top_secret') \
@@ -403,8 +383,8 @@ async fn changed_selection_writes_new_migration_and_applying_both_captures_only_
     );
 
     // Apply both migrations in order on live Postgres.
-    apply_migration_file(&db, "sql", &mig1_path).await;
-    apply_migration_file(&db, "sql", &mig2_path).await;
+    apply_generated_migration(&db, "sql", &mig1_path).await;
+    apply_generated_migration(&db, "sql", &mig2_path).await;
 
     // Write to all three tables: only invoice and customer must be captured (not removed line_item).
     db.execute("INSERT INTO public.invoice (id, status) VALUES (1, 'open')")
@@ -557,4 +537,71 @@ fn missing_or_ambiguous_migration_layout_exits_2_without_connecting() {
         .code(2)
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains("multiple migration layouts"));
+}
+
+#[tokio::test]
+async fn legacy_manifest_refreshes_outdated_functions_and_preserves_history() {
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let db = TestDb::new().await.expect("create TestDb");
+    create_fixture_tables(&db).await;
+    let dir = tempdir().expect("tempdir");
+    let run = |args: &[&str]| {
+        auditstream_cmd()
+            .current_dir(dir.path())
+            .env("AUDITSTREAM_DATABASE_URL", db.url())
+            .args(args)
+            .assert()
+    };
+    let first = run(&["init", "--migrations", "sql", "--table", "public.invoice"]).success();
+    let path = dir.path().join(
+        std::str::from_utf8(&first.get_output().stdout)
+            .expect("path")
+            .trim(),
+    );
+    let sql = fs::read_to_string(&path).expect("read migration");
+
+    // Reproduce the v0.1.0 selection-only manifest and a previous function body.
+    let manifest = r#"-- auditstream:manifest {"app_roles":[],"schema":"auditstream","schema_version":1,"tables":[{"excluded_columns":[],"is_partitioned":false,"primary_key":["id"],"schema":"public","table":"invoice"}]}"#;
+    let current = sql
+        .lines()
+        .find(|line| line.starts_with("-- auditstream:manifest "))
+        .expect("manifest");
+    let previous = sql
+        .replace(current, manifest)
+        .replace("AS $fn$\n", "AS $fn$\n-- previous generator\n");
+    fs::write(&path, &previous).expect("save previous migration");
+    db.execute_batch(&previous)
+        .await
+        .expect("install previous migration");
+    db.execute("INSERT INTO public.invoice (id, status) VALUES (1, 'open')")
+        .await
+        .expect("capture history");
+
+    run(&["verify"])
+        .code(1)
+        .stdout(predicate::str::contains("outdated"));
+    let upgrade = run(&["init"])
+        .success()
+        .stdout(predicate::str::is_empty().not());
+    let upgrade_path = dir.path().join(
+        std::str::from_utf8(&upgrade.get_output().stdout)
+            .expect("upgrade path")
+            .trim(),
+    );
+    assert_ne!(path, upgrade_path);
+    assert_eq!(
+        fs::read_to_string(path).expect("read previous migration"),
+        previous
+    );
+    apply_generated_migration(&db, "sql", &upgrade_path).await;
+    run(&["verify"]).success();
+    let inserts = db
+        .query_scalar_i64("SELECT count(*) FROM auditstream.changes WHERE table_name = 'invoice' AND op = 'INSERT'")
+        .await
+        .expect("preserved history");
+    assert_eq!(inserts, 1);
+    run(&["init"])
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("up to date"));
 }

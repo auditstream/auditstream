@@ -27,7 +27,6 @@ const TRIGGER_TYPE_INSTEAD: i16 = 1 << 6;
 const TRIGGER_EVENTS_MASK: i16 =
     TRIGGER_TYPE_INSERT | TRIGGER_TYPE_DELETE | TRIGGER_TYPE_UPDATE | TRIGGER_TYPE_TRUNCATE;
 
-const EXPECTED_UPDATE_WHEN: &str = "old.* is distinct from new.*";
 const EXPECTED_SEARCH_PATH: &str = "search_path=pg_catalog, pg_temp";
 
 /// Errors returned while running capture drift verification.
@@ -570,7 +569,6 @@ struct TableLookupRow {
 
 #[derive(Debug, FromRow)]
 struct TriggerCatalogRow {
-    oid: i64,
     tgrelid: i64,
     tgname: String,
     tgenabled: String,
@@ -581,7 +579,7 @@ struct TriggerCatalogRow {
     tgoldtable: Option<String>,
     func_schema: String,
     func_name: String,
-    triggerdef: String,
+    has_when: bool,
 }
 
 #[derive(Debug, FromRow)]
@@ -781,7 +779,6 @@ async fn fetch_table_triggers(
 
     let rows: Vec<TriggerCatalogRow> = sqlx::query_as(
         "SELECT \
-           t.oid::bigint AS oid, \
            t.tgrelid::bigint AS tgrelid, \
            t.tgname, \
            t.tgenabled::text AS tgenabled, \
@@ -792,7 +789,7 @@ async fn fetch_table_triggers(
            t.tgoldtable, \
            pn.nspname AS func_schema, \
            p.proname AS func_name, \
-           pg_catalog.pg_get_triggerdef(t.oid) AS triggerdef \
+           t.tgqual IS NOT NULL AS has_when \
          FROM pg_catalog.pg_trigger t \
          JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid \
          JOIN pg_catalog.pg_namespace pn ON pn.oid = p.pronamespace \
@@ -863,7 +860,6 @@ struct ExpectedTrigger {
     for_each_row: bool,
     new_table: Option<&'static str>,
     old_table: Option<&'static str>,
-    expects_when: bool,
 }
 
 const EXPECTED_TRIGGERS: [ExpectedTrigger; 4] = [
@@ -874,7 +870,6 @@ const EXPECTED_TRIGGERS: [ExpectedTrigger; 4] = [
         for_each_row: false,
         new_table: Some("new_rows"),
         old_table: None,
-        expects_when: false,
     },
     ExpectedTrigger {
         name: "auditstream_update",
@@ -883,7 +878,6 @@ const EXPECTED_TRIGGERS: [ExpectedTrigger; 4] = [
         for_each_row: true,
         new_table: None,
         old_table: None,
-        expects_when: true,
     },
     ExpectedTrigger {
         name: "auditstream_delete",
@@ -892,7 +886,6 @@ const EXPECTED_TRIGGERS: [ExpectedTrigger; 4] = [
         for_each_row: false,
         new_table: None,
         old_table: Some("old_rows"),
-        expects_when: false,
     },
     ExpectedTrigger {
         name: "auditstream_truncate",
@@ -901,7 +894,6 @@ const EXPECTED_TRIGGERS: [ExpectedTrigger; 4] = [
         for_each_row: false,
         new_table: None,
         old_table: None,
-        expects_when: false,
     },
 ];
 
@@ -935,46 +927,6 @@ fn decode_tgargs(bytes: &[u8], expected_count: i16) -> Vec<String> {
         .take(count)
         .map(|slice| String::from_utf8_lossy(slice).into_owned())
         .collect()
-}
-
-fn extract_when_clause(triggerdef: &str) -> Option<&str> {
-    let (_, after_when) = triggerdef.split_once(" WHEN (")?;
-    let (clause, _) = after_when.rsplit_once(") EXECUTE ")?;
-    Some(clause)
-}
-
-fn normalize_when_expr(expr: &str) -> String {
-    let mut trimmed = expr.trim();
-    while trimmed.starts_with('(') && trimmed.ends_with(')') {
-        let inner = &trimmed[1..trimmed.len() - 1];
-        if balanced_parens(inner) {
-            trimmed = inner.trim();
-        } else {
-            break;
-        }
-    }
-    trimmed
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
-}
-
-fn balanced_parens(s: &str) -> bool {
-    let mut depth: i32 = 0;
-    for ch in s.chars() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth < 0 {
-                    return false;
-                }
-            }
-            _ => {}
-        }
-    }
-    depth == 0
 }
 
 fn diff_trigger(
@@ -1034,24 +986,8 @@ fn diff_trigger(
         ));
     }
 
-    match (
-        expected.expects_when,
-        extract_when_clause(&actual.triggerdef),
-    ) {
-        (true, None) => {
-            diffs.push("WHEN clause is missing (expected `OLD.* IS DISTINCT FROM NEW.*`)".into());
-        }
-        (true, Some(expr)) => {
-            if normalize_when_expr(expr) != EXPECTED_UPDATE_WHEN {
-                diffs.push(format!(
-                    "WHEN clause is `{expr}`, expected `OLD.* IS DISTINCT FROM NEW.*`"
-                ));
-            }
-        }
-        (false, Some(expr)) => {
-            diffs.push(format!("unexpected WHEN clause `{expr}`"));
-        }
-        (false, None) => {}
+    if actual.has_when {
+        diffs.push("unexpected WHEN clause".to_owned());
     }
 
     let actual_args = decode_tgargs(&actual.tgargs, actual.tgnargs);
@@ -1073,7 +1009,6 @@ fn diff_trigger(
         }
     }
 
-    let _ = actual.oid;
     diffs
 }
 
@@ -1110,22 +1045,6 @@ mod tests {
             vec!["[\"id\"]".to_owned(), "[\"password_hash\"]".to_owned()]
         );
         assert_eq!(decode_tgargs(b"", 0), Vec::<String>::new());
-    }
-
-    #[test]
-    fn normalize_when_expr_strips_outer_parens_and_normalizes_whitespace() {
-        assert_eq!(
-            normalize_when_expr("((old.* IS DISTINCT FROM new.*))"),
-            EXPECTED_UPDATE_WHEN
-        );
-        assert_eq!(
-            normalize_when_expr("(OLD.*   is  distinct  from  NEW.*)"),
-            EXPECTED_UPDATE_WHEN
-        );
-        assert_ne!(
-            normalize_when_expr("(old.status IS DISTINCT FROM new.status)"),
-            EXPECTED_UPDATE_WHEN
-        );
     }
 
     #[test]

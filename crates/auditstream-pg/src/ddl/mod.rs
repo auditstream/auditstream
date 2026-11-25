@@ -57,6 +57,14 @@ pub fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+/// Structured parts of [`generate`] so migration composers can interleave trigger statements
+/// before creating future monthly partitions and revoking the temporary self-grant.
+pub(crate) struct GeneratedDdl {
+    pub(crate) setup: Vec<String>,
+    pub(crate) future_partitions: String,
+    pub(crate) role_cleanup: String,
+}
+
 /// Generates the ordered list of single SQL statements that initialize or idempotently
 /// reconcile the Auditstream history schema.
 ///
@@ -67,57 +75,80 @@ pub fn quote_literal(value: &str) -> String {
 /// Callers should execute the returned statements sequentially on a single connection
 /// (typically inside one transaction) so the temporary `auditstream._granted_self`
 /// session flag set in statement 1 is visible to the final cleanup statement.
+///
+/// The second-to-last statement creates the next three monthly partitions. Creating a
+/// partition locks `changes` until commit, so migrations run it after their trigger statements.
 pub fn generate(options: &DdlOptions) -> Vec<String> {
+    let parts = generate_parts(options);
+    let mut stmts = parts.setup;
+    stmts.push(parts.future_partitions);
+    stmts.push(parts.role_cleanup);
+    stmts
+}
+
+pub(crate) fn generate_parts(options: &DdlOptions) -> GeneratedDdl {
     let schema_q = quote_ident(&options.schema);
     let schema_lit = quote_literal(&options.schema);
     let owner_q = quote_ident(OWNER_ROLE);
     let owner_lit = quote_literal(OWNER_ROLE);
 
-    let mut stmts = Vec::with_capacity(14 + options.app_roles.len() * 3);
+    let mut setup = Vec::with_capacity(14 + options.app_roles.len() * 3);
 
-    stmts.push(role_setup_sql(&owner_q, &owner_lit));
-    stmts.push(format!(
+    setup.push(role_setup_sql(&owner_q, &owner_lit));
+    setup.push(format!(
         "CREATE SCHEMA IF NOT EXISTS {schema_q} AUTHORIZATION {owner_q}"
     ));
-    stmts.push(changes_table_sql(&schema_q));
-    stmts.push(format!("ALTER TABLE {schema_q}.changes OWNER TO {owner_q}"));
-    stmts.push(runtime_partitions_sql(&schema_lit, &owner_lit));
+    setup.push(changes_table_sql(&schema_q));
+    setup.push(partitions_sql(&schema_lit, &owner_lit, 0, 0));
 
     // Named indexes: BRIN on occurred_at, B-tree on (xact_id, id) for export cursor reads
     // (PostgreSQL 15-19 has no BRIN operator class for xid8), and partial hash on record_id
     // per ADR-0008 (`docs/decisions/0008-history-lookup-index.md`).
-    stmts.push(format!(
-        "CREATE INDEX IF NOT EXISTS changes_occurred_at_brin_idx ON {schema_q}.changes USING brin (occurred_at)"
+    setup.push(history_index_sql(
+        &schema_q,
+        &schema_lit,
+        "changes_occurred_at_brin_idx",
+        "USING brin (occurred_at)",
     ));
-    stmts.push(format!(
-        "CREATE INDEX IF NOT EXISTS changes_xact_id_idx ON {schema_q}.changes (xact_id, id)"
+    setup.push(history_index_sql(
+        &schema_q,
+        &schema_lit,
+        "changes_xact_id_idx",
+        "(xact_id, id)",
     ));
-    stmts.push(format!(
-        "CREATE INDEX IF NOT EXISTS changes_lookup_idx ON {schema_q}.changes USING hash (record_id) WHERE record_id IS NOT NULL"
+    setup.push(history_index_sql(
+        &schema_q,
+        &schema_lit,
+        "changes_lookup_idx",
+        "USING hash (record_id) WHERE record_id IS NOT NULL",
     ));
 
-    stmts.push(log_event_sql(&schema_q));
-    stmts.push(format!(
-        "ALTER FUNCTION {schema_q}.log_event(text, jsonb, jsonb) OWNER TO {owner_q}"
+    setup.push(log_event_sql(&schema_q));
+    setup.push(function_owner_sql(
+        &schema_q,
+        "log_event(text, jsonb, jsonb)",
     ));
 
-    stmts.push(format!("REVOKE ALL ON SCHEMA {schema_q} FROM PUBLIC"));
-    stmts.push(format!("REVOKE ALL ON {schema_q}.changes FROM PUBLIC"));
-    stmts.push(format!(
+    setup.push(format!("REVOKE ALL ON SCHEMA {schema_q} FROM PUBLIC"));
+    setup.push(format!("REVOKE ALL ON {schema_q}.changes FROM PUBLIC"));
+    setup.push(format!(
         "REVOKE ALL ON FUNCTION {schema_q}.log_event(text, jsonb, jsonb) FROM PUBLIC"
     ));
 
     for role in &options.app_roles {
         let role_q = quote_ident(role);
-        stmts.push(format!("GRANT USAGE ON SCHEMA {schema_q} TO {role_q}"));
-        stmts.push(format!("GRANT SELECT ON {schema_q}.changes TO {role_q}"));
-        stmts.push(format!(
+        setup.push(format!("GRANT USAGE ON SCHEMA {schema_q} TO {role_q}"));
+        setup.push(format!("GRANT SELECT ON {schema_q}.changes TO {role_q}"));
+        setup.push(format!(
             "GRANT EXECUTE ON FUNCTION {schema_q}.log_event(text, jsonb, jsonb) TO {role_q}"
         ));
     }
 
-    stmts.push(role_cleanup_sql(&owner_q));
-    stmts
+    GeneratedDdl {
+        setup,
+        future_partitions: partitions_sql(&schema_lit, &owner_lit, 1, 3),
+        role_cleanup: role_cleanup_sql(&owner_q),
+    }
 }
 
 fn role_setup_sql(owner_q: &str, owner_lit: &str) -> String {
@@ -175,48 +206,97 @@ fn changes_table_sql(schema_q: &str) -> String {
     )
 }
 
-fn runtime_partitions_sql(schema_lit: &str, owner_lit: &str) -> String {
-    format!(
-        "DO $$\n\
-DECLARE\n  \
-  base_month timestamp := pg_catalog.date_trunc('month', pg_catalog.now() AT TIME ZONE 'UTC');\n  \
-  m int;\n  \
-  month_start timestamp;\n  \
-  month_end timestamp;\n  \
-  part_name text;\n\
-BEGIN\n  \
-  EXECUTE pg_catalog.format(\n    \
-    'CREATE TABLE IF NOT EXISTS %I.changes_default PARTITION OF %I.changes DEFAULT',\n    \
-    {schema_lit},\n    \
-    {schema_lit}\n  \
-  );\n  \
-  EXECUTE pg_catalog.format(\n    \
-    'ALTER TABLE %I.changes_default OWNER TO %I',\n    \
-    {schema_lit},\n    \
-    {owner_lit}\n  \
-  );\n  \
-  FOR m IN 0..3 LOOP\n    \
-    month_start := base_month + pg_catalog.make_interval(months => m);\n    \
-    month_end := base_month + pg_catalog.make_interval(months => m + 1);\n    \
-    part_name := 'changes_' || pg_catalog.to_char(month_start, 'YYYY_MM');\n    \
-    EXECUTE pg_catalog.format(\n      \
-      'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.changes FOR VALUES FROM (%L) TO (%L)',\n      \
-      {schema_lit},\n      \
-      part_name,\n      \
-      {schema_lit},\n      \
-      pg_catalog.to_char(month_start, 'YYYY-MM-DD HH24:MI:SS') || '+00',\n      \
-      pg_catalog.to_char(month_end, 'YYYY-MM-DD HH24:MI:SS') || '+00'\n    \
-    );\n    \
-    EXECUTE pg_catalog.format(\n      \
-      'ALTER TABLE %I.%I OWNER TO %I',\n      \
-      {schema_lit},\n      \
-      part_name,\n      \
-      {owner_lit}\n    \
-    );\n  \
-  END LOOP;\n\
-END\n\
-$$"
-    )
+/// Creates the missing monthly partitions `first_month..=last_month` months after the current
+/// UTC month and gives them to the owner role. Month 0 also covers `changes` and its DEFAULT
+/// partition, which captured writes need as soon as the triggers exist.
+fn partitions_sql(schema_lit: &str, owner_lit: &str, first_month: u32, last_month: u32) -> String {
+    let (default_partition, managed_tables) = if first_month == 0 {
+        let create = format!(
+            "  EXECUTE pg_catalog.format(
+    'CREATE TABLE IF NOT EXISTS %I.changes_default PARTITION OF %I.changes DEFAULT',
+    {schema_lit},
+    {schema_lit}
+  );
+"
+        );
+        (create, "ARRAY['changes', 'changes_default']")
+    } else {
+        (String::new(), "ARRAY[]::name[]")
+    };
+    do_block(&format!(
+        "DECLARE
+  base_month timestamp := pg_catalog.date_trunc('month', pg_catalog.now() AT TIME ZONE 'UTC');
+  m int;
+  month_start timestamp;
+  month_end timestamp;
+  part_name name;
+  managed_tables name[] := {managed_tables};
+BEGIN
+{default_partition}  FOR m IN {first_month}..{last_month} LOOP
+    month_start := base_month + pg_catalog.make_interval(months => m);
+    month_end := base_month + pg_catalog.make_interval(months => m + 1);
+    part_name := 'changes_' || pg_catalog.to_char(month_start, 'YYYY_MM');
+    EXECUTE pg_catalog.format(
+      'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.changes FOR VALUES FROM (%L) TO (%L)',
+      {schema_lit},
+      part_name,
+      {schema_lit},
+      pg_catalog.to_char(month_start, 'YYYY-MM-DD HH24:MI:SS') || '+00',
+      pg_catalog.to_char(month_end, 'YYYY-MM-DD HH24:MI:SS') || '+00'
+    );
+    managed_tables := pg_catalog.array_append(managed_tables, part_name);
+  END LOOP;
+  FOR part_name IN
+    SELECT c.relname FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = {schema_lit} AND c.relname = ANY (managed_tables)
+      AND c.relowner <> {owner_lit}::pg_catalog.regrole
+    ORDER BY c.relname
+  LOOP
+    EXECUTE pg_catalog.format('ALTER TABLE %I.%I OWNER TO %I', {schema_lit}, part_name, {owner_lit});
+  END LOOP;
+END"
+    ))
+}
+
+/// Creates a history index unless one with this name exists. `CREATE INDEX IF NOT EXISTS`
+/// takes a SHARE lock on `changes` and every partition before it checks the name, and a
+/// migration holds that lock until it commits, blocking every audited write meanwhile.
+fn history_index_sql(schema_q: &str, schema_lit: &str, name: &str, definition: &str) -> String {
+    do_block(&format!(
+        "BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = {schema_lit} AND c.relname = '{name}') THEN
+    CREATE INDEX IF NOT EXISTS {name} ON {schema_q}.changes {definition};
+  END IF;
+END"
+    ))
+}
+
+pub(crate) fn function_owner_sql(schema_q: &str, signature: &str) -> String {
+    let function = format!("{schema_q}.{signature}");
+    let function_lit = quote_literal(&function);
+    let owner_q = quote_ident(OWNER_ROLE);
+    let owner_lit = quote_literal(OWNER_ROLE);
+    do_block(&format!(
+        "BEGIN
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_proc
+             WHERE oid = {function_lit}::pg_catalog.regprocedure
+               AND proowner <> {owner_lit}::pg_catalog.regrole) THEN
+    ALTER FUNCTION {function} OWNER TO {owner_q};
+  END IF;
+END"
+    ))
+}
+
+fn do_block(body: &str) -> String {
+    // A quoted schema identifier can itself contain the normal dollar delimiter.
+    if body.contains("$$") {
+        format!("DO {}", quote_literal(body))
+    } else {
+        format!("DO $$\n{body}\n$$")
+    }
 }
 
 fn log_event_sql(schema_q: &str) -> String {

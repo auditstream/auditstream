@@ -213,7 +213,15 @@ BEGIN
 END
 $fn$;
 
-ALTER FUNCTION "auditstream".resolve_actor() OWNER TO "auditstream_owner";
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_proc
+             WHERE oid = '"auditstream".resolve_actor()'::pg_catalog.regprocedure
+               AND proowner <> 'auditstream_owner'::pg_catalog.regrole) THEN
+    ALTER FUNCTION "auditstream".resolve_actor() OWNER TO "auditstream_owner";
+  END IF;
+END
+$$;
 
 REVOKE ALL ON FUNCTION "auditstream".resolve_actor() FROM PUBLIC;
 
@@ -290,21 +298,18 @@ BEGIN
     IF has_ex THEN
       v_before := pg_catalog.to_jsonb(OLD) - ex_cols;
       v_after := pg_catalog.to_jsonb(NEW) - ex_cols;
-      IF v_after = v_before THEN
-        RETURN NULL;
-      END IF;
     ELSE
       v_before := pg_catalog.to_jsonb(OLD);
       v_after := pg_catalog.to_jsonb(NEW);
+    END IF;
+    IF v_after = v_before THEN
+      RETURN NULL;
     END IF;
     v_changed := ARRAY(
       SELECT e.k
         FROM pg_catalog.jsonb_each(v_after) AS e(k, v)
        WHERE v_before->e.k IS DISTINCT FROM e.v
     );
-    IF NOT has_ex AND pg_catalog.cardinality(v_changed) = 0 THEN
-      RETURN NULL;
-    END IF;
     IF pk_single IS NOT NULL THEN
       v_record_id := pg_catalog.jsonb_build_object(pk_single, v_after->pk_single);
     ELSIF pg_catalog.cardinality(pk_cols) > 0 THEN
@@ -469,7 +474,15 @@ BEGIN
 END
 $fn$;
 
-ALTER FUNCTION "auditstream".capture() OWNER TO "auditstream_owner";
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_proc
+             WHERE oid = '"auditstream".capture()'::pg_catalog.regprocedure
+               AND proowner <> 'auditstream_owner'::pg_catalog.regrole) THEN
+    ALTER FUNCTION "auditstream".capture() OWNER TO "auditstream_owner";
+  END IF;
+END
+$$;
 
 REVOKE ALL ON FUNCTION "auditstream".capture() FROM PUBLIC;
 
@@ -482,7 +495,6 @@ CREATE OR REPLACE TRIGGER auditstream_insert
 CREATE OR REPLACE TRIGGER auditstream_update
   AFTER UPDATE ON "public"."scratch_log"
   FOR EACH ROW
-  WHEN (OLD.* IS DISTINCT FROM NEW.*)
   EXECUTE FUNCTION "auditstream".capture('[]', '[]');
 
 CREATE OR REPLACE TRIGGER auditstream_delete

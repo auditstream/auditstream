@@ -5,7 +5,7 @@ v0.1 captures with generated triggers that write to a partitioned `auditstream.c
 ## Triggers
 
 - **INSERT and DELETE are statement-level**, with transition tables (`REFERENCING NEW TABLE` or `OLD TABLE`) and the actor resolved once per statement. A 10,000-row insert took 155 to 180 ms this way against 541 to 550 ms with row-level triggers, and single-row inserts also ran faster (7,906 against 6,913 transactions per second).
-- **UPDATE stays row-level**, with `WHEN (OLD.* IS DISTINCT FROM NEW.*)` so no-op writes are skipped. A statement-level version was built and measured: about 10% faster on a 10,000-row update, 4% slower on single rows, and it splits a primary-key change into two half-events. Not worth it.
+- **UPDATE stays row-level**. The capture function skips no-op writes by comparing the JSONB row images, including on tables with `json` columns. A statement-level version was built and measured: about 10% faster on a 10,000-row update, 4% slower on single rows, and it splits a primary-key change into two half-events. Not worth it.
 - **TRUNCATE** has its own `AFTER TRUNCATE FOR EACH STATEMENT` trigger. It records the table and the actor, with no rows.
 - **Row data** is `to_jsonb(OLD)` and `to_jsonb(NEW)` minus the excluded columns. `changed` lists the keys that differ, and an update that only touches excluded columns writes nothing.
 - **Partitioned user tables** get their statement triggers on the parent. A statement that names a partition directly does not fire them, so `verify` reports such tables.

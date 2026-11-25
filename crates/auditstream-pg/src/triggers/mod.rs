@@ -18,7 +18,7 @@
 //! Actor comment extraction uses pure SQL string builtins (no POSIX regexes),
 //! keeping length bounds explicit in SQL without hitting PostgreSQL's 255 quantifier cap.
 
-use crate::ddl::{DEFAULT_SCHEMA, OWNER_ROLE, quote_ident, quote_literal};
+use crate::ddl::{DEFAULT_SCHEMA, OWNER_ROLE, function_owner_sql, quote_ident, quote_literal};
 
 /// Trigger specification for a single audited PostgreSQL table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,17 +118,13 @@ pub fn generate(options: &TriggerOptions) -> Vec<String> {
 
     stmts.push(role_grant_setup_sql(&owner_q, &owner_lit));
     stmts.push(resolve_actor_sql(&schema_q));
-    stmts.push(format!(
-        "ALTER FUNCTION {schema_q}.resolve_actor() OWNER TO {owner_q}"
-    ));
+    stmts.push(function_owner_sql(&schema_q, "resolve_actor()"));
     stmts.push(format!(
         "REVOKE ALL ON FUNCTION {schema_q}.resolve_actor() FROM PUBLIC"
     ));
 
     stmts.push(capture_function_sql(&schema_q));
-    stmts.push(format!(
-        "ALTER FUNCTION {schema_q}.capture() OWNER TO {owner_q}"
-    ));
+    stmts.push(function_owner_sql(&schema_q, "capture()"));
     stmts.push(format!(
         "REVOKE ALL ON FUNCTION {schema_q}.capture() FROM PUBLIC"
     ));
@@ -171,7 +167,6 @@ fn append_table_triggers(stmts: &mut Vec<String>, schema_q: &str, table: &TableT
         "CREATE OR REPLACE TRIGGER auditstream_update\n  \
          AFTER UPDATE ON {table_fq}\n  \
          FOR EACH ROW\n  \
-         WHEN (OLD.* IS DISTINCT FROM NEW.*)\n  \
          EXECUTE FUNCTION {schema_q}.capture({args})"
     ));
 
@@ -523,22 +518,19 @@ BEGIN\n  \
   IF TG_OP = 'UPDATE' THEN\n    \
     IF has_ex THEN\n      \
       v_before := pg_catalog.to_jsonb(OLD) - ex_cols;\n      \
-      v_after := pg_catalog.to_jsonb(NEW) - ex_cols;\n      \
-      IF v_after = v_before THEN\n        \
-        RETURN NULL;\n      \
-      END IF;\n    \
+      v_after := pg_catalog.to_jsonb(NEW) - ex_cols;\n    \
     ELSE\n      \
       v_before := pg_catalog.to_jsonb(OLD);\n      \
       v_after := pg_catalog.to_jsonb(NEW);\n    \
+    END IF;\n    \
+    IF v_after = v_before THEN\n      \
+      RETURN NULL;\n    \
     END IF;\n    \
     v_changed := ARRAY(\n      \
       SELECT e.k\n        \
         FROM pg_catalog.jsonb_each(v_after) AS e(k, v)\n       \
        WHERE v_before->e.k IS DISTINCT FROM e.v\n    \
     );\n    \
-    IF NOT has_ex AND pg_catalog.cardinality(v_changed) = 0 THEN\n      \
-      RETURN NULL;\n    \
-    END IF;\n    \
     IF pk_single IS NOT NULL THEN\n      \
       v_record_id := pg_catalog.jsonb_build_object(pk_single, v_after->pk_single);\n    \
     ELSIF pg_catalog.cardinality(pk_cols) > 0 THEN\n      \

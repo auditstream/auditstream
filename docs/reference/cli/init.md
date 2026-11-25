@@ -50,6 +50,34 @@ When that file exists, `init` writes the 0.45 numbered format and appends one jo
 Otherwise it writes the Drizzle 1.x folder format.
 All Drizzle files separate statements with `--> statement-breakpoint` comments.
 
+## Migration lock waits
+
+Generated migrations honor the PostgreSQL `lock_timeout` on the connection that applies them.
+When it is zero (unlimited), the migration sets a five-second timeout for each lock acquisition
+and restores the unlimited setting in its last statement, so later migrations in the same
+transaction keep their own setting.
+Plain SQL files open an explicit transaction. Prisma applies each migration file as one implicit
+transaction, and transactional Drizzle runners apply every pending migration in one transaction.
+
+To choose a different timeout for Prisma or Drizzle, set a PostgreSQL default for the migration
+role (for example `ALTER ROLE migrator SET lock_timeout = '2s'`), or pass
+`options=-c%20lock_timeout=2000` in the migration connection string when you cannot run `ALTER ROLE`.
+When applying a file with `psql`, you can run `SET lock_timeout = '2s'` in the same session.
+
+A refresh migration does not block writes to `auditstream.changes` while it waits for an audited
+table: it skips history indexes that already exist and creates missing future monthly partitions
+after its trigger statements. Creating a partition locks `changes` until the migration commits.
+Run `auditstream verify --fix` before applying a refresh to create upcoming partitions in a
+separate short transaction instead.
+
+Auditstream migrations must run inside a single transaction so `lock_timeout`, DDL atomicity, and
+the temporary `auditstream_owner` self-grant/revocation on PostgreSQL 16+ stay intact. Runners that
+commit each statement separately — such as Drizzle's stateless Neon HTTP migrator or `psql -f` on a
+Prisma file without `--single-transaction` — are rejected before any DDL runs. Use a transactional
+migrator (Prisma Migrate, `psql`, or Drizzle with `node-postgres`, `postgres.js`, or the Neon
+WebSocket `neon-serverless` driver) to apply migrations; `@auditstream/drizzle/neon-http` remains
+fully supported for application queries.
+
 ## Configuration file updates
 
 When writing a new migration, `init` creates `auditstream.toml` (or the `--config` path) if it does not exist.
@@ -61,7 +89,8 @@ Comments, formatting, `schema`, and `[export]` remain untouched.
 
 - **No tables selected:** Lists all introspected user tables on stderr and exits `2`.
 - **Unknown schema, table, or column:** Names the invalid entry on stderr and exits `2`.
-- **Same selection re-run:** Compares against the manifest in the newest Auditstream migration in `--out`. Writes nothing, prints `up to date` on stderr, and exits `0`.
+- `init` compares the selection and a digest of the generated function and trigger definitions against the newest Auditstream migration in `--out`. When both match, it prints `up to date` on stderr and exits `0`.
+- When upgrading from v0.1.0, run `auditstream init` in the project with its existing migrations, apply the new migration with your usual migration tool, then run `auditstream verify`. The v0.1.0 manifest has no digest, so the first run writes a refresh migration even with the same selection. It preserves recorded history.
 - **Changed selection:** Leaves earlier migrations byte-identical and writes one new migration. Removed tables receive `DROP TRIGGER IF EXISTS` statements while keeping their recorded history.
 
 ## Streams and exit codes

@@ -239,9 +239,11 @@ version = "0.1.0"
 dependencies = [
  "auditstream-core",
  "auditstream-testkit",
+ "hex",
  "insta",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror",
  "time",
