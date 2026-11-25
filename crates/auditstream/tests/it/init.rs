@@ -426,3 +426,108 @@ async fn changed_selection_writes_new_migration_and_applying_both_captures_only_
         vec!["customer".to_owned(), "invoice".to_owned()]
     );
 }
+
+#[tokio::test]
+async fn unqualified_table_autodetects_prisma_and_drizzle_and_normalizes_config() {
+    let db = TestDb::new().await.expect("create TestDb");
+    create_fixture_tables(&db).await;
+
+    // 1. Prisma project (`prisma/` directory present) with unqualified `--table invoice`.
+    let prisma_dir = tempdir().expect("prisma tempdir");
+    fs::create_dir(prisma_dir.path().join("prisma")).expect("create prisma dir");
+    let prisma_out = auditstream_cmd()
+        .current_dir(prisma_dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["init", "--table", "invoice"])
+        .output()
+        .expect("run init in prisma project");
+    assert!(
+        prisma_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&prisma_out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&prisma_out.stderr).contains("detected migration format: prisma")
+    );
+    let prisma_stdout = String::from_utf8_lossy(&prisma_out.stdout);
+    assert!(
+        prisma_stdout.trim().starts_with("prisma/migrations/"),
+        "expected prisma/migrations path, got {prisma_stdout:?}"
+    );
+    let prisma_toml =
+        fs::read_to_string(prisma_dir.path().join("auditstream.toml")).expect("read prisma toml");
+    assert!(
+        prisma_toml.contains(r#"tables = ["public.invoice"]"#),
+        "{prisma_toml}"
+    );
+    assert!(
+        prisma_toml.contains(r#"format = "prisma""#),
+        "{prisma_toml}"
+    );
+
+    // 2. Drizzle project (`drizzle.config.ts` present) with unqualified `--table invoice`.
+    let drizzle_dir = tempdir().expect("drizzle tempdir");
+    fs::write(
+        drizzle_dir.path().join("drizzle.config.ts"),
+        "export default {};\n",
+    )
+    .expect("write drizzle.config.ts");
+    let drizzle_out = auditstream_cmd()
+        .current_dir(drizzle_dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["init", "--table", "invoice"])
+        .output()
+        .expect("run init in drizzle project");
+    assert!(
+        drizzle_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&drizzle_out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&drizzle_out.stderr).contains("detected migration format: drizzle")
+    );
+    let drizzle_stdout = String::from_utf8_lossy(&drizzle_out.stdout);
+    assert!(
+        drizzle_stdout.trim().starts_with("drizzle/"),
+        "expected drizzle/ path, got {drizzle_stdout:?}"
+    );
+    let drizzle_toml =
+        fs::read_to_string(drizzle_dir.path().join("auditstream.toml")).expect("read drizzle toml");
+    assert!(
+        drizzle_toml.contains(r#"tables = ["public.invoice"]"#),
+        "{drizzle_toml}"
+    );
+    assert!(
+        drizzle_toml.contains(r#"format = "drizzle""#),
+        "{drizzle_toml}"
+    );
+
+    // 3. Ambiguous project (both Prisma and Drizzle present) exits 2 without `--migrations`.
+    let both_dir = tempdir().expect("both tempdir");
+    fs::create_dir(both_dir.path().join("prisma")).expect("create prisma dir");
+    fs::write(both_dir.path().join("drizzle.config.ts"), "").expect("write drizzle.config.ts");
+    auditstream_cmd()
+        .current_dir(both_dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["init", "--table", "invoice"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("--migrations"));
+
+    // 4. Unqualified table inside `auditstream.toml` stays rejected (exit 2).
+    let cfg_dir = tempdir().expect("cfg tempdir");
+    fs::write(
+        cfg_dir.path().join("auditstream.toml"),
+        "[capture]\ntables = [\"invoice\"]\n[migrations]\nformat = \"sql\"\n",
+    )
+    .expect("write invalid config");
+    auditstream_cmd()
+        .current_dir(cfg_dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["init"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("in config"));
+}

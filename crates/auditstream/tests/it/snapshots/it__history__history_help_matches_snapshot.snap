@@ -19,8 +19,8 @@ Options:
           
           [env: AUDITSTREAM_CONFIG=]
 
-      --table <SCHEMA.TABLE>
-          Filter by audited table (`<schema>.<table>`)
+      --table <[SCHEMA.]TABLE>
+          Filter by audited table (`[schema.]table`, defaults to `public`)
 
       --database-url <URL>
           Postgres connection URL (also reads `DATABASE_URL` as fallback)
@@ -66,6 +66,9 @@ Options:
           - json:  One compact JSON event per line matching `spec/schemas/event.schema.json`
           
           [default: table]
+
+      --diff
+          Show field-level `before -> after` diffs (`--format table` only)
 
   -h, --help
           Print help (see a summary with '-h')

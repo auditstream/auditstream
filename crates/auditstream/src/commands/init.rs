@@ -21,16 +21,35 @@ use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
 
 use crate::commands::common::{
     connect_database, parse_exclude_refs, parse_table_refs, require_database_url,
-    run_async as run_command_async, table_trigger_spec,
+    run_async as run_command_async, sanitize_terminal, table_trigger_spec,
 };
 use crate::config::{Config, MigrationFormat};
 use crate::exit::{Exit, ExitCodeExt, write_stdout};
 
+const PRISMA_CONFIG_FILES: [&str; 6] = [
+    "prisma.config.ts",
+    "prisma.config.js",
+    "prisma.config.mjs",
+    "prisma.config.cjs",
+    "prisma.config.mts",
+    "prisma.config.cts",
+];
+
+const DRIZZLE_CONFIG_FILES: [&str; 7] = [
+    "drizzle.config.ts",
+    "drizzle.config.js",
+    "drizzle.config.mjs",
+    "drizzle.config.cjs",
+    "drizzle.config.mts",
+    "drizzle.config.cts",
+    "drizzle.config.json",
+];
+
 /// Arguments for `auditstream init`.
 #[derive(Debug, ClapArgs)]
 pub(crate) struct Args {
-    /// Table to audit (`schema.table`), repeatable.
-    #[arg(long, value_name = "SCHEMA.TABLE")]
+    /// Table to audit (`[schema.]table`, defaults to `public`), repeatable.
+    #[arg(long, value_name = "[SCHEMA.]TABLE")]
     pub(crate) table: Vec<String>,
 
     /// Column to exclude from row images (`schema.table.column`), repeatable.
@@ -60,8 +79,9 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
     let db_url = require_database_url(config)?;
 
     // Parse table and exclusion specs up front so syntax mistakes exit 2 immediately.
-    let parsed_tables = parse_table_refs(&config.capture.tables, false)?;
-    let parsed_excludes = parse_exclude_refs(&config.capture.exclude, false)?;
+    // CLI `--table` flags default unqualified names to `public.<table>`; config entries stay explicit.
+    let parsed_tables = parse_table_refs(&config.capture.tables, args.table.is_empty())?;
+    let parsed_excludes = parse_exclude_refs(&config.capture.exclude, args.exclude.is_empty())?;
 
     let pool = connect_database(db_url).await?;
 
@@ -89,21 +109,31 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
         } else {
             eprintln!("Available tables:");
             for table in &discovered {
-                eprintln!("  {}.{}", table.schema, table.name);
+                eprintln!(
+                    "  {}.{}",
+                    sanitize_terminal(&table.schema),
+                    sanitize_terminal(&table.name)
+                );
             }
         }
         return Err(anyhow!(
-            "no tables selected: pass --table <schema.table> or set capture.tables in auditstream.toml"
+            "no tables selected: pass --table <[schema.]table> or set capture.tables in auditstream.toml"
         ))
         .exit_code(Exit::Usage);
     }
 
-    let Some(format) = config.migrations.format else {
-        pool.close().await;
-        return Err(anyhow!(
-            "missing migration format: pass --migrations prisma|drizzle|sql or set migrations.format in auditstream.toml"
-        ))
-        .exit_code(Exit::Usage);
+    let format = match config.migrations.format {
+        Some(format) => format,
+        None => match detect_migration_format(Path::new(".")) {
+            Ok(detected) => {
+                eprintln!("detected migration format: {}", format_name(detected));
+                detected
+            }
+            Err(err) => {
+                pool.close().await;
+                return Err(err);
+            }
+        },
     };
 
     // Collect every unique schema referenced by --table or --exclude.
@@ -355,4 +385,102 @@ fn update_config_file(
         .exit_code(Exit::Io)?;
 
     Ok(())
+}
+
+fn detect_migration_format(dir: &Path) -> anyhow::Result<MigrationFormat> {
+    let has_prisma = dir.join("prisma").is_dir()
+        || PRISMA_CONFIG_FILES
+            .iter()
+            .any(|name| dir.join(name).is_file());
+    let has_drizzle = dir.join("drizzle").is_dir()
+        || DRIZZLE_CONFIG_FILES
+            .iter()
+            .any(|name| dir.join(name).is_file());
+
+    match (has_prisma, has_drizzle) {
+        (true, true) => Err(anyhow!(
+            "multiple migration layouts detected (prisma and drizzle): pass --migrations prisma|drizzle|sql or set migrations.format in auditstream.toml"
+        ))
+        .exit_code(Exit::Usage),
+        (true, false) => Ok(MigrationFormat::Prisma),
+        (false, true) => Ok(MigrationFormat::Drizzle),
+        (false, false) if dir.join("migrations").is_dir() => Ok(MigrationFormat::Sql),
+        (false, false) => Err(anyhow!(
+            "missing migration format: pass --migrations prisma|drizzle|sql or set migrations.format in auditstream.toml"
+        ))
+        .exit_code(Exit::Usage),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::detect_migration_format;
+    use crate::config::MigrationFormat;
+    use crate::exit::{Exit, exit_code_for};
+
+    #[test]
+    fn detect_migration_format_identifies_prisma_drizzle_and_sql_layouts() {
+        let prisma_dir = tempdir().unwrap();
+        fs::create_dir(prisma_dir.path().join("prisma")).unwrap();
+        assert_eq!(
+            detect_migration_format(prisma_dir.path()).unwrap(),
+            MigrationFormat::Prisma
+        );
+
+        let prisma_cfg = tempdir().unwrap();
+        fs::write(prisma_cfg.path().join("prisma.config.ts"), "").unwrap();
+        assert_eq!(
+            detect_migration_format(prisma_cfg.path()).unwrap(),
+            MigrationFormat::Prisma
+        );
+
+        let drizzle_cfg = tempdir().unwrap();
+        fs::write(drizzle_cfg.path().join("drizzle.config.ts"), "").unwrap();
+        assert_eq!(
+            detect_migration_format(drizzle_cfg.path()).unwrap(),
+            MigrationFormat::Drizzle
+        );
+
+        let drizzle_dir = tempdir().unwrap();
+        fs::create_dir(drizzle_dir.path().join("drizzle")).unwrap();
+        assert_eq!(
+            detect_migration_format(drizzle_dir.path()).unwrap(),
+            MigrationFormat::Drizzle
+        );
+
+        // Framework marker takes precedence over a generic migrations/ folder.
+        let drizzle_and_migrations = tempdir().unwrap();
+        fs::write(drizzle_and_migrations.path().join("drizzle.config.mjs"), "").unwrap();
+        fs::create_dir(drizzle_and_migrations.path().join("migrations")).unwrap();
+        assert_eq!(
+            detect_migration_format(drizzle_and_migrations.path()).unwrap(),
+            MigrationFormat::Drizzle
+        );
+
+        let sql_dir = tempdir().unwrap();
+        fs::create_dir(sql_dir.path().join("migrations")).unwrap();
+        assert_eq!(
+            detect_migration_format(sql_dir.path()).unwrap(),
+            MigrationFormat::Sql
+        );
+    }
+
+    #[test]
+    fn detect_migration_format_rejects_ambiguous_or_unknown_layouts() {
+        let both = tempdir().unwrap();
+        fs::create_dir(both.path().join("prisma")).unwrap();
+        fs::write(both.path().join("drizzle.config.ts"), "").unwrap();
+        let err = detect_migration_format(both.path()).unwrap_err();
+        assert_eq!(exit_code_for(&err), Exit::Usage);
+        assert!(err.to_string().contains("multiple migration layouts"));
+
+        let empty = tempdir().unwrap();
+        let err = detect_migration_format(empty.path()).unwrap_err();
+        assert_eq!(exit_code_for(&err), Exit::Usage);
+        assert!(err.to_string().contains("missing migration format"));
+    }
 }

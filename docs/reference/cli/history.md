@@ -15,7 +15,7 @@ auditstream [GLOBAL OPTIONS] history [OPTIONS]
 
 | Flag | Values | Default | Description |
 | --- | --- | --- | --- |
-| `--table` | `<schema>.<table>` | none | Filter by audited schema and table name |
+| `--table` | `<[schema.]table>` | none | Filter by audited table (defaults unqualified names to `public`) |
 | `--record-id` | `<value>` | none | Filter by primary key value (requires `--table`) |
 | `--actor` | `<id>` | none | Filter by `actor.id` or `actor.onBehalfOf.id` |
 | `--tenant` | `<id>` | none | Filter by `actor.tenant` or `actor.onBehalfOf.tenant` |
@@ -23,13 +23,14 @@ auditstream [GLOBAL OPTIONS] history [OPTIONS]
 | `--until` | `<time>` | none | Exclusive upper bound on `occurred_at` |
 | `--limit` | `1..=1000` | `100` | Maximum number of events returned |
 | `--format` | `table`, `json` | `table` | Output format written to stdout |
+| `--diff` | — | off | Show field-level `before -> after` diffs (`--format table` only) |
 
 ## Filter semantics
 
 All provided filters combine with logical `AND`.
 Every filter executes in PostgreSQL against `{schema}.changes`.
 
-- **`--table <schema>.<table>`:** Requires both schema and table parts separated by one dot.
+- **`--table <[schema.]table>`:** Accepts `<table>` (resolved to `public.<table>`) or `<schema>.<table>`. Rejects empty segments or extra dots with exit code `2`.
 - **`--record-id <value>`:** Requires `--table`. Parses `<value>` as JSON first, falling back to a JSON string.
   - A JSON scalar (number, string, or boolean) matches single-key `record_id` objects with exact JSONB type equality (`1` differs from `"1"`).
   - A non-empty JSON object matches composite or partial keys by JSONB containment (`record_id @> value::jsonb`).
@@ -94,6 +95,20 @@ Columns appear in fixed order:
 | `ACTOR` | `type:id` (plus ` for type:id` when `onBehalfOf` is set), or `-` |
 | `ACTOR_SOURCE` | `set_config`, `comment`, `jwt`, `invalid`, or `-` |
 | `CHANGED` | Comma-separated changed column names, or `-` |
+
+### Diff output (`--diff`)
+
+Prints each event header followed by field-level changes:
+
+- `UPDATE`: `~ <column>: <before> -> <after>` (plus `+` / `-` for keys added or removed), preserving arbitrary-precision PostgreSQL `numeric` values.
+- `INSERT`: `+ <column>: <value>` for each column in `after`.
+- `DELETE`: `- <column>: <value>` for each column in `before`.
+- `TRUNCATE` (or events without row images): `(no row image)`.
+
+Color output is enabled automatically only when stdout is a TTY, `NO_COLOR` is unset or empty, and `TERM` is not `dumb`.
+Passing `--diff` together with `--format json` exits with code `2` (JSON output already includes `before` and `after`).
+
+All human-readable terminal output (`--format table` and `--diff`) strips ANSI CSI/OSC/DCS/ESC sequences, C0/C1 control characters, and Unicode BiDi overrides (`U+202A`–`U+202E`, `U+2066`–`U+2069`), and maps `\n`, `\r`, and `\t` to spaces.
 
 ### JSON output (`--format json`)
 
