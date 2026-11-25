@@ -5,8 +5,8 @@
 //! selection) into deterministic, re-runnable migration files that each ORM's own migrator
 //! executes unchanged.
 
+mod definition_digest;
 pub mod drizzle;
-mod function_digest;
 pub mod prisma;
 pub mod sql;
 
@@ -27,10 +27,23 @@ use crate::triggers::{self, TableTriggerSpec, TriggerOptions};
 /// Auditstream-generated migration file.
 pub(crate) const MANIFEST_PREFIX: &str = "-- auditstream:manifest ";
 
+// Bounds every lock wait when the connection has no timeout. The flag lets the last statement
+// restore the setting for any later migration in the same transaction, because Drizzle's
+// transactional migrators apply every pending migration in one transaction.
 const SET_LOCK_TIMEOUT: &str = "DO $$
 BEGIN
   IF pg_catalog.current_setting('lock_timeout') = '0' THEN
     SET LOCAL lock_timeout = '5s';
+    PERFORM pg_catalog.set_config('auditstream._lock_timeout_fallback', 'on', true);
+  END IF;
+END
+$$";
+
+const RESTORE_LOCK_TIMEOUT: &str = "DO $$
+BEGIN
+  IF pg_catalog.current_setting('auditstream._lock_timeout_fallback', true) = 'on' THEN
+    SET LOCAL lock_timeout = 0;
+    PERFORM pg_catalog.set_config('auditstream._lock_timeout_fallback', 'off', true);
   END IF;
 END
 $$";
@@ -242,7 +255,7 @@ fn build_manifest(
 
     let value = json!({
         "app_roles": app_roles,
-        "function_sql_sha256": function_digest::from_statements(statements),
+        "definitions_sha256": definition_digest::from_statements(statements),
         "schema": options.ddl.schema,
         "schema_version": CURRENT_SCHEMA_VERSION,
         "tables": tables_json,
@@ -318,6 +331,10 @@ pub(crate) fn compose_statements(
     // Keep D2's temporary `auditstream_owner` self-grant active while D3 creates/alters functions,
     // then run D2's cleanup statement at the very end.
     let role_cleanup = ddl_stmts.pop();
+    // Creating a monthly partition locks `changes` until commit. Holding that lock while a
+    // trigger statement waits for an audited table would stall every audited write and can
+    // deadlock with a writer that already holds that table, so it runs after them.
+    let future_partitions = ddl_stmts.pop();
 
     let mut tables_sorted = options.tables.clone();
     tables_sorted.sort_by(|a, b| a.schema.cmp(&b.schema).then_with(|| a.table.cmp(&b.table)));
@@ -345,7 +362,9 @@ pub(crate) fn compose_statements(
         .chain(ddl_stmts)
         .chain(trigger_stmts)
         .chain(drop_stmts)
+        .chain(future_partitions)
         .chain(role_cleanup)
+        .chain(std::iter::once(RESTORE_LOCK_TIMEOUT.to_owned()))
         .collect()
 }
 

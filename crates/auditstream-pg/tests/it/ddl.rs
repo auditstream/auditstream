@@ -46,7 +46,7 @@ fn ddl_lookup_index_uses_adr0008_partial_hash() {
     let stmts = ddl::generate(&DdlOptions::new(DEFAULT_SCHEMA, vec![]));
     let expected = "CREATE INDEX IF NOT EXISTS changes_lookup_idx ON \"auditstream\".changes USING hash (record_id) WHERE record_id IS NOT NULL";
     assert!(
-        stmts.iter().any(|s| s == expected),
+        stmts.iter().any(|s| s.contains(expected)),
         "expected ADR-0008 partial hash lookup index statement:\n  {expected}\nfound:\n{}",
         stmts
             .iter()
@@ -79,6 +79,39 @@ async fn reapplying_ddl_skips_redundant_owner_changes() {
     run_statements(&mut conn, &statements)
         .await
         .expect("matching owners should be left in place");
+}
+
+#[tokio::test]
+async fn reapplying_ddl_does_not_block_history_writes() {
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let db = TestDb::new().await.expect("test database");
+    let mut conn = PgConnection::connect(db.url()).await.expect("connect");
+    let mut statements = ddl::generate(&DdlOptions::default());
+    statements.extend(triggers::generate(&TriggerOptions::default()));
+    run_statements(&mut conn, &statements).await.expect("setup");
+
+    // A refresh migration holds its locks until it commits. Every audited write inserts into
+    // the history table, so a lock that conflicts with ROW EXCLUSIVE stalls all of them and can
+    // deadlock with writers that already hold a lock on an audited table.
+    let mut refresh = conn.begin().await.expect("begin refresh");
+    run_statements(&mut refresh, &statements)
+        .await
+        .expect("refresh");
+    let blocking: Vec<String> = sqlx::query_scalar(
+        "SELECT c.relname || ': ' || l.mode FROM pg_catalog.pg_locks l \
+           JOIN pg_catalog.pg_class c ON c.oid = l.relation \
+          WHERE l.pid = pg_catalog.pg_backend_pid() \
+            AND c.relnamespace = 'auditstream'::pg_catalog.regnamespace \
+            AND l.mode IN ('ShareLock', 'ShareRowExclusiveLock', 'ExclusiveLock', 'AccessExclusiveLock') \
+          ORDER BY 1",
+    )
+    .fetch_all(&mut *refresh)
+    .await
+    .expect("read refresh locks");
+    assert!(
+        blocking.is_empty(),
+        "refresh blocks audited writes: {blocking:?}"
+    );
 }
 
 #[tokio::test]

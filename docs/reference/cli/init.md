@@ -53,17 +53,28 @@ All Drizzle files separate statements with `--> statement-breakpoint` comments.
 ## Migration lock waits
 
 Generated migrations honor the PostgreSQL `lock_timeout` on the connection that applies them.
-When it is zero (unlimited), the migration sets a five-second timeout for each lock acquisition.
-Prisma and plain SQL files open an explicit transaction. Transactional Drizzle runners wrap the file.
-The previous session setting takes effect again at transaction end.
+When it is zero (unlimited), the migration sets a five-second timeout for each lock acquisition
+and restores the unlimited setting in its last statement, so later migrations in the same
+transaction keep their own setting.
+Plain SQL files open an explicit transaction. Prisma applies each migration file as one implicit
+transaction, and transactional Drizzle runners apply every pending migration in one transaction.
 
 To choose a different timeout for Prisma or Drizzle, set a PostgreSQL default for the migration
 role, for example `ALTER ROLE migrator SET lock_timeout = '2s'`, before connecting.
 When applying a file with `psql`, you can run `SET lock_timeout = '2s'` in the same session.
 
+A refresh migration does not block writes to `auditstream.changes` while it waits for an audited
+table: it skips history indexes that already exist and creates missing future monthly partitions
+after its trigger statements. Creating a partition locks `changes` until the migration commits.
+Run `auditstream verify --fix` before applying a refresh to create upcoming partitions in a
+separate short transaction instead.
+
 Drizzle runners that commit each statement separately, including the Neon HTTP migrator,
-require a nonzero timeout on every migration connection. Set it on the role or database and
-reconnect. If the timeout is still zero at the second statement, the migration stops before DDL.
+require a nonzero timeout on every migration connection. If the timeout is still zero at the
+second statement, the migration stops before DDL. Prefer a transactional migrator, such as the
+`node-postgres`, `postgres.js`, or Neon WebSocket (`neon-serverless`) migrator. Otherwise set the
+timeout on a dedicated migration role and reconnect; setting it on a role or database that the
+application also uses limits the application's lock waits too.
 
 ## Configuration file updates
 
@@ -76,7 +87,7 @@ Comments, formatting, `schema`, and `[export]` remain untouched.
 
 - **No tables selected:** Lists all introspected user tables on stderr and exits `2`.
 - **Unknown schema, table, or column:** Names the invalid entry on stderr and exits `2`.
-- `init` compares the selection and the digest of the generated `resolve_actor`, `capture`, and `log_event` functions against the newest Auditstream migration in `--out`. When both match, it prints `up to date` on stderr and exits `0`.
+- `init` compares the selection and a digest of the generated function and trigger definitions against the newest Auditstream migration in `--out`. When both match, it prints `up to date` on stderr and exits `0`.
 - When upgrading from v0.1.0, run `auditstream init` in the project with its existing migrations, apply the new migration with your usual migration tool, then run `auditstream verify`. The v0.1.0 manifest has no digest, so the first run writes a refresh migration even with the same selection. It preserves recorded history.
 - **Changed selection:** Leaves earlier migrations byte-identical and writes one new migration. Removed tables receive `DROP TRIGGER IF EXISTS` statements while keeping their recorded history.
 

@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use auditstream_pg::ddl::{DEFAULT_SCHEMA, DdlOptions, quote_ident};
 use auditstream_pg::migrations::drizzle::STATEMENT_BREAKPOINT;
@@ -8,6 +9,7 @@ use auditstream_pg::migrations::{
     self, DrizzleLayout, MigrationFormat, MigrationOptions, PreviewOutcome, WriteOutcome,
 };
 use auditstream_pg::triggers::TableTriggerSpec;
+use auditstream_pg::verify;
 use auditstream_testkit::TestDb;
 use sqlx::postgres::PgConnection;
 use sqlx::{AssertSqlSafe, Connection, Executor};
@@ -125,6 +127,270 @@ async fn autocommit_drizzle_requires_a_configured_lock_timeout_before_ddl() {
     execute_drizzle_chunks(&mut configured, &sql)
         .await
         .expect("bounded autocommit migration");
+}
+
+#[tokio::test]
+async fn transactional_drizzle_run_keeps_its_lock_timeout_for_later_migrations() {
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let db = TestDb::new().await.expect("create TestDb");
+    let dir = ScratchDir::new("drizzle_later_migrations");
+    let options = MigrationOptions::new(
+        MigrationFormat::Drizzle,
+        dir.path(),
+        fixed_time(),
+        DdlOptions::default(),
+        vec![],
+    );
+    let PreviewOutcome::Sql { sql, .. } = migrations::preview(&options).expect("preview") else {
+        panic!("expected new migration");
+    };
+
+    let mut conn = PgConnection::connect(db.url()).await.expect("connect");
+    conn.execute("SET lock_timeout = 0")
+        .await
+        .expect("clear timeout");
+    // Transactional Drizzle migrators apply every pending migration in one transaction.
+    let mut run = conn.begin().await.expect("begin Drizzle run");
+    execute_drizzle_chunks(&mut run, &sql)
+        .await
+        .expect("apply Auditstream migration");
+    let next_migration_timeout: String =
+        sqlx::query_scalar("SELECT pg_catalog.current_setting('lock_timeout')")
+            .fetch_one(&mut *run)
+            .await
+            .expect("read timeout");
+    assert_eq!(next_migration_timeout, "0");
+    run.commit().await.expect("commit Drizzle run");
+}
+
+/// Prisma's schema engine sends each migration file as one script, then records the outcome
+/// in `_prisma_migrations` on the same connection.
+#[tokio::test]
+async fn failed_prisma_migration_leaves_the_connection_able_to_record_the_failure() {
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let db = TestDb::new().await.expect("create TestDb");
+    let dir = ScratchDir::new("prisma_failure");
+    let options = MigrationOptions::new(
+        MigrationFormat::Prisma,
+        dir.path(),
+        fixed_time(),
+        DdlOptions::default(),
+        fixture_tables(),
+    );
+    let PreviewOutcome::Sql { sql, .. } = migrations::preview(&options).expect("preview") else {
+        panic!("expected new migration");
+    };
+
+    let mut holder = PgConnection::connect(db.url()).await.expect("connect");
+    holder
+        .execute(
+            "CREATE TABLE public.invoice (id int PRIMARY KEY, status text, password_hash text); \
+             CREATE TABLE public.line_item (id int PRIMARY KEY, invoice_id int, qty int);",
+        )
+        .await
+        .expect("create tables");
+    let mut busy = holder.begin().await.expect("begin");
+    busy.execute("LOCK TABLE public.invoice IN ACCESS EXCLUSIVE MODE")
+        .await
+        .expect("hold a conflicting lock");
+
+    let mut prisma = PgConnection::connect(db.url()).await.expect("connect");
+    prisma
+        .execute("SET lock_timeout = '100ms'")
+        .await
+        .expect("set timeout");
+    let err = prisma
+        .execute(AssertSqlSafe(sql))
+        .await
+        .expect_err("busy table times out");
+    assert!(err.to_string().contains("lock timeout"), "{err}");
+    prisma
+        .execute("SELECT 1")
+        .await
+        .expect("Prisma records the failure on this connection next");
+    busy.rollback().await.expect("release lock");
+}
+
+async fn wait_until_a_lock_on_invoice_is_awaited(db: &TestDb) {
+    for _ in 0..500 {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_locks \
+              WHERE NOT granted AND relation = 'public.invoice'::pg_catalog.regclass)",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("read locks");
+        if waiting {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the refresh never waited for public.invoice");
+}
+
+#[tokio::test]
+async fn refresh_in_a_later_month_does_not_deadlock_with_an_in_flight_write() {
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let db = TestDb::new().await.expect("create TestDb");
+    let dir = ScratchDir::new("refresh_deadlock");
+    let options = MigrationOptions::new(
+        MigrationFormat::Sql,
+        dir.path(),
+        fixed_time(),
+        DdlOptions::default(),
+        fixture_tables(),
+    );
+    let PreviewOutcome::Sql { sql, .. } = migrations::preview(&options).expect("preview") else {
+        panic!("expected new migration");
+    };
+
+    let mut app = PgConnection::connect(db.url()).await.expect("connect");
+    app.execute(
+        "CREATE TABLE public.invoice (id int PRIMARY KEY, status text, password_hash text); \
+         CREATE TABLE public.line_item (id int PRIMARY KEY, invoice_id int, qty int);",
+    )
+    .await
+    .expect("create tables");
+    app.execute(AssertSqlSafe(sql.clone()))
+        .await
+        .expect("install");
+    app.execute("INSERT INTO public.invoice (id, status) VALUES (1, 'open')")
+        .await
+        .expect("insert");
+    // A refresh applied in a later month must create the partition three months ahead.
+    app.execute(
+        "DO $$ BEGIN EXECUTE pg_catalog.format('DROP TABLE auditstream.%I', 'changes_' || \
+         pg_catalog.to_char(pg_catalog.date_trunc('month', pg_catalog.now() AT TIME ZONE 'UTC') \
+         + interval '3 months', 'YYYY_MM')); END $$",
+    )
+    .await
+    .expect("drop the newest partition");
+
+    // A long statement on an audited table holds ROW EXCLUSIVE before its trigger writes history.
+    let mut writer = app.begin().await.expect("begin writer");
+    writer
+        .execute("UPDATE public.invoice SET status = status WHERE false")
+        .await
+        .expect("lock invoice");
+    let url = db.url().to_owned();
+    let refresh = tokio::spawn(async move {
+        let mut conn = PgConnection::connect(&url).await.expect("connect");
+        conn.execute(AssertSqlSafe(sql)).await.map(|_| ())
+    });
+    wait_until_a_lock_on_invoice_is_awaited(&db).await;
+
+    writer
+        .execute("UPDATE public.invoice SET status = 'paid' WHERE id = 1")
+        .await
+        .expect("the in-flight write must not deadlock with the refresh");
+    writer.commit().await.expect("commit writer");
+    refresh
+        .await
+        .expect("join refresh")
+        .expect("the refresh finishes after the writer commits");
+}
+
+/// `plain_sql` snapshot at tag `auditstream-v0.1.0`: the released engine's output for
+/// [`fixture_tables`] with the `app_user` application role.
+const V0_1_0_PLAIN_SQL: &str = include_str!("fixtures/v0.1.0/plain_sql.sql");
+
+#[tokio::test]
+async fn upgrades_a_v0_1_0_installation_in_place() {
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let db = TestDb::new().await.expect("create TestDb");
+    let admin_url = db.admin_url().to_owned();
+    let app_role = format!("upgrade_{}", db.database_name());
+    let legacy = V0_1_0_PLAIN_SQL.replace("app_user", &app_role);
+    let dir = ScratchDir::new("v0_1_0_upgrade");
+    fs::write(dir.path().join("20261124123000_auditstream.sql"), &legacy)
+        .expect("save v0.1.0 migration");
+
+    let mut admin = PgConnection::connect(db.url()).await.expect("connect");
+    admin
+        .execute(AssertSqlSafe(format!(
+            "CREATE ROLE {} NOLOGIN",
+            quote_ident(&app_role)
+        )))
+        .await
+        .expect("create role");
+    admin
+        .execute(
+            "CREATE TABLE public.invoice (id int PRIMARY KEY, status text, password_hash text); \
+             CREATE TABLE public.line_item (id int PRIMARY KEY, invoice_id int, qty int);",
+        )
+        .await
+        .expect("create tables");
+    admin
+        .execute(AssertSqlSafe(legacy))
+        .await
+        .expect("install v0.1.0");
+    admin
+        .execute(
+            "INSERT INTO public.invoice (id, status) VALUES (1, 'open'); \
+             ALTER TABLE public.invoice ADD COLUMN document json;",
+        )
+        .await
+        .expect("record history and add a json column");
+    let legacy_update = admin
+        .execute("UPDATE public.invoice SET document = '{}' WHERE id = 1")
+        .await
+        .expect_err("the v0.1.0 WHEN clause cannot compare json");
+    assert!(
+        legacy_update.to_string().contains("equality operator"),
+        "{legacy_update}"
+    );
+
+    let options = MigrationOptions::new(
+        MigrationFormat::Sql,
+        dir.path(),
+        fixed_time() + time::Duration::days(1),
+        DdlOptions::new(DEFAULT_SCHEMA, vec![app_role.clone()]),
+        fixture_tables(),
+    );
+    let WriteOutcome::Written {
+        files,
+        dropped_tables,
+    } = migrations::write(&options).expect("write refresh")
+    else {
+        panic!("a v0.1.0 manifest must produce a refresh migration");
+    };
+    assert!(dropped_tables.is_empty(), "{dropped_tables:?}");
+    let refresh = fs::read_to_string(&files[0]).expect("read refresh");
+    admin
+        .execute(AssertSqlSafe(refresh))
+        .await
+        .expect("apply refresh");
+
+    let report = verify::check(db.pool(), &fixture_tables())
+        .await
+        .expect("verify");
+    assert!(report.findings.is_empty(), "{:?}", report.findings);
+    admin
+        .execute("UPDATE public.invoice SET document = '{}' WHERE id = 1")
+        .await
+        .expect("json UPDATE after the refresh");
+    let ops: Vec<String> = sqlx::query_scalar("SELECT op FROM auditstream.changes ORDER BY id")
+        .fetch_all(&mut admin)
+        .await
+        .expect("read history");
+    assert_eq!(ops, ["INSERT", "UPDATE"]);
+    assert!(matches!(
+        migrations::write(&options).expect("re-run"),
+        WriteOutcome::UpToDate { .. }
+    ));
+
+    admin.close().await.expect("close admin");
+    drop(db);
+    let mut cleanup = PgConnection::connect(&admin_url)
+        .await
+        .expect("cleanup connect");
+    cleanup
+        .execute(AssertSqlSafe(format!(
+            "DROP ROLE IF EXISTS {}",
+            quote_ident(&app_role)
+        )))
+        .await
+        .expect("drop role");
 }
 
 #[test]

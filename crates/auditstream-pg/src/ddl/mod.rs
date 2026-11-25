@@ -67,6 +67,9 @@ pub fn quote_literal(value: &str) -> String {
 /// Callers should execute the returned statements sequentially on a single connection
 /// (typically inside one transaction) so the temporary `auditstream._granted_self`
 /// session flag set in statement 1 is visible to the final cleanup statement.
+///
+/// The second-to-last statement creates the next three monthly partitions. Creating a
+/// partition locks `changes` until commit, so migrations run it after their trigger statements.
 pub fn generate(options: &DdlOptions) -> Vec<String> {
     let schema_q = quote_ident(&options.schema);
     let schema_lit = quote_literal(&options.schema);
@@ -80,19 +83,28 @@ pub fn generate(options: &DdlOptions) -> Vec<String> {
         "CREATE SCHEMA IF NOT EXISTS {schema_q} AUTHORIZATION {owner_q}"
     ));
     stmts.push(changes_table_sql(&schema_q));
-    stmts.push(runtime_partitions_sql(&schema_lit, &owner_lit));
+    stmts.push(partitions_sql(&schema_lit, &owner_lit, 0, 0));
 
     // Named indexes: BRIN on occurred_at, B-tree on (xact_id, id) for export cursor reads
     // (PostgreSQL 15-19 has no BRIN operator class for xid8), and partial hash on record_id
     // per ADR-0008 (`docs/decisions/0008-history-lookup-index.md`).
-    stmts.push(format!(
-        "CREATE INDEX IF NOT EXISTS changes_occurred_at_brin_idx ON {schema_q}.changes USING brin (occurred_at)"
+    stmts.push(history_index_sql(
+        &schema_q,
+        &schema_lit,
+        "changes_occurred_at_brin_idx",
+        "USING brin (occurred_at)",
     ));
-    stmts.push(format!(
-        "CREATE INDEX IF NOT EXISTS changes_xact_id_idx ON {schema_q}.changes (xact_id, id)"
+    stmts.push(history_index_sql(
+        &schema_q,
+        &schema_lit,
+        "changes_xact_id_idx",
+        "(xact_id, id)",
     ));
-    stmts.push(format!(
-        "CREATE INDEX IF NOT EXISTS changes_lookup_idx ON {schema_q}.changes USING hash (record_id) WHERE record_id IS NOT NULL"
+    stmts.push(history_index_sql(
+        &schema_q,
+        &schema_lit,
+        "changes_lookup_idx",
+        "USING hash (record_id) WHERE record_id IS NOT NULL",
     ));
 
     stmts.push(log_event_sql(&schema_q));
@@ -116,6 +128,7 @@ pub fn generate(options: &DdlOptions) -> Vec<String> {
         ));
     }
 
+    stmts.push(partitions_sql(&schema_lit, &owner_lit, 1, 3));
     stmts.push(role_cleanup_sql(&owner_q));
     stmts
 }
@@ -175,44 +188,70 @@ fn changes_table_sql(schema_q: &str) -> String {
     )
 }
 
-fn runtime_partitions_sql(schema_lit: &str, owner_lit: &str) -> String {
+/// Creates the missing monthly partitions `first_month..=last_month` months after the current
+/// UTC month and gives them to the owner role. Month 0 also covers `changes` and its DEFAULT
+/// partition, which captured writes need as soon as the triggers exist.
+fn partitions_sql(schema_lit: &str, owner_lit: &str, first_month: u32, last_month: u32) -> String {
+    let (default_partition, managed_tables) = if first_month == 0 {
+        let create = format!(
+            "  EXECUTE pg_catalog.format(
+    'CREATE TABLE IF NOT EXISTS %I.changes_default PARTITION OF %I.changes DEFAULT',
+    {schema_lit},
+    {schema_lit}
+  );
+"
+        );
+        (create, "ARRAY['changes', 'changes_default']")
+    } else {
+        (String::new(), "ARRAY[]::name[]")
+    };
     do_block(&format!(
-        "DECLARE\n  \
-  base_month timestamp := pg_catalog.date_trunc('month', pg_catalog.now() AT TIME ZONE 'UTC');\n  \
-  m int;\n  \
-  month_start timestamp;\n  \
-  month_end timestamp;\n  \
-  part_name name;\n  \
-  managed_tables name[] := ARRAY['changes', 'changes_default'];\n\
-BEGIN\n  \
-  EXECUTE pg_catalog.format(\n    \
-    'CREATE TABLE IF NOT EXISTS %I.changes_default PARTITION OF %I.changes DEFAULT',\n    \
-    {schema_lit},\n    \
-    {schema_lit}\n  \
-  );\n  \
-  FOR m IN 0..3 LOOP\n    \
-    month_start := base_month + pg_catalog.make_interval(months => m);\n    \
-    month_end := base_month + pg_catalog.make_interval(months => m + 1);\n    \
-    part_name := 'changes_' || pg_catalog.to_char(month_start, 'YYYY_MM');\n    \
-    EXECUTE pg_catalog.format(\n      \
-      'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.changes FOR VALUES FROM (%L) TO (%L)',\n      \
-      {schema_lit},\n      \
-      part_name,\n      \
-      {schema_lit},\n      \
-      pg_catalog.to_char(month_start, 'YYYY-MM-DD HH24:MI:SS') || '+00',\n      \
-      pg_catalog.to_char(month_end, 'YYYY-MM-DD HH24:MI:SS') || '+00'\n    \
-    );\n    \
-    managed_tables := pg_catalog.array_append(managed_tables, part_name);\n  \
-  END LOOP;\n  \
-  FOR part_name IN\n    \
-    SELECT c.relname FROM pg_catalog.pg_class c\n    \
-    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n    \
-    WHERE n.nspname = {schema_lit} AND c.relname = ANY (managed_tables)\n      \
-      AND c.relowner <> {owner_lit}::pg_catalog.regrole\n    \
-    ORDER BY c.relname\n  \
-  LOOP\n    \
-    EXECUTE pg_catalog.format('ALTER TABLE %I.%I OWNER TO %I', {schema_lit}, part_name, {owner_lit});\n  \
-  END LOOP;\n\
+        "DECLARE
+  base_month timestamp := pg_catalog.date_trunc('month', pg_catalog.now() AT TIME ZONE 'UTC');
+  m int;
+  month_start timestamp;
+  month_end timestamp;
+  part_name name;
+  managed_tables name[] := {managed_tables};
+BEGIN
+{default_partition}  FOR m IN {first_month}..{last_month} LOOP
+    month_start := base_month + pg_catalog.make_interval(months => m);
+    month_end := base_month + pg_catalog.make_interval(months => m + 1);
+    part_name := 'changes_' || pg_catalog.to_char(month_start, 'YYYY_MM');
+    EXECUTE pg_catalog.format(
+      'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.changes FOR VALUES FROM (%L) TO (%L)',
+      {schema_lit},
+      part_name,
+      {schema_lit},
+      pg_catalog.to_char(month_start, 'YYYY-MM-DD HH24:MI:SS') || '+00',
+      pg_catalog.to_char(month_end, 'YYYY-MM-DD HH24:MI:SS') || '+00'
+    );
+    managed_tables := pg_catalog.array_append(managed_tables, part_name);
+  END LOOP;
+  FOR part_name IN
+    SELECT c.relname FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = {schema_lit} AND c.relname = ANY (managed_tables)
+      AND c.relowner <> {owner_lit}::pg_catalog.regrole
+    ORDER BY c.relname
+  LOOP
+    EXECUTE pg_catalog.format('ALTER TABLE %I.%I OWNER TO %I', {schema_lit}, part_name, {owner_lit});
+  END LOOP;
+END"
+    ))
+}
+
+/// Creates a history index unless one with this name exists. `CREATE INDEX IF NOT EXISTS`
+/// takes a SHARE lock on `changes` and every partition before it checks the name, and a
+/// migration holds that lock until it commits, blocking every audited write meanwhile.
+fn history_index_sql(schema_q: &str, schema_lit: &str, name: &str, definition: &str) -> String {
+    do_block(&format!(
+        "BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = {schema_lit} AND c.relname = '{name}') THEN
+    CREATE INDEX IF NOT EXISTS {name} ON {schema_q}.changes {definition};
+  END IF;
 END"
     ))
 }

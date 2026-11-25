@@ -13,7 +13,7 @@ use super::{
 
 pub(crate) fn preview(options: &MigrationOptions) -> Result<PreviewOutcome, MigrationError> {
     let newest = find_newest_sql_migration(&options.out_dir)?;
-    Ok(preview_with(options, newest, render_transaction))
+    Ok(preview_with(options, newest, render_plain_sql))
 }
 
 pub(crate) fn write(options: &MigrationOptions) -> Result<WriteOutcome, MigrationError> {
@@ -24,7 +24,7 @@ pub(crate) fn write(options: &MigrationOptions) -> Result<WriteOutcome, Migratio
             manifest,
             dropped_tables,
             statements,
-        } => (render_transaction(&manifest, &statements), dropped_tables),
+        } => (render_plain_sql(&manifest, &statements), dropped_tables),
     };
 
     fs::create_dir_all(&options.out_dir)?;
@@ -43,7 +43,7 @@ pub(crate) fn write(options: &MigrationOptions) -> Result<WriteOutcome, Migratio
     })
 }
 
-pub(crate) fn render_transaction(manifest: &Manifest, statements: &[String]) -> String {
+pub(crate) fn render_plain_sql(manifest: &Manifest, statements: &[String]) -> String {
     let mut out = String::new();
     out.push_str(&header_comment(manifest));
     out.push_str("\n\nBEGIN;\n\n");
