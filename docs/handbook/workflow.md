@@ -1,13 +1,13 @@
 # Workflow
 
-Every change follows one path: issue, branch, pull request, squash merge. One issue maps to one pull request and one owner.
+Non-trivial changes follow one path: issue, branch, pull request, squash merge — one issue maps to one pull request and one owner. Small standalone documentation, typo, or obvious bug fixes may open a pull request directly without a separate issue (see [CONTRIBUTING.md](../../CONTRIBUTING.md)).
 
 ## Issues
 
 - **Issue types** (organization level): Feature, Bug, Task, Spec, Docs. GitHub creates Task, Bug and Feature by default; Spec and Docs are added. An epic is a parent issue with sub-issues: up to 100 per parent, eight levels deep.
 - **Dependencies** use GitHub's native "blocked by" relation, available on the Free plan. `gh issue create --blocked-by` needs a gh release newer than 2.89.
 - **Issue fields** are switched on for the organization, which creates Priority, Effort, Start date and Target date. Priority and Effort live in these fields, not in labels, with the organization's default options: Priority is Urgent, High, Medium or Low; Effort is Low for size S and Medium for size M. Effort High is never used, because anything that large is split first.
-- **Issue forms** (still a GitHub public preview): bug, feature request, agent-ready task, spec change. A label a form sets is applied only if it already exists in the repository. Blank issues are disabled; questions go to Discussions once the repositories are public.
+- **Issue forms** (still a GitHub public preview): bug, feature request, agent-ready task, spec change. A label a form sets is applied only if it already exists in the repository. Blank issues are disabled; questions go to [GitHub Discussions](https://github.com/auditstream/auditstream/discussions) (see [SUPPORT.md](../../SUPPORT.md)).
 - **Every task issue states:** goal; context with links to the spec section, its version and the ADR; in-scope paths; out-of-scope paths; testable acceptance criteria; the verification command; blockers; size; definition of done.
 - **Size:** S is up to one day, M up to two. Anything larger is split before it is marked ready.
 
@@ -45,17 +45,17 @@ Labels are defined in `.github/labels.yml` in each repository and synced by a wo
 
 ## Pull requests
 
-- One pull request closes one issue with `Closes #N`.
-- Work in progress opens as a draft pull request; drafts work in private repositories on the Free plan.
+- Link the matching issue with `Closes #N` when one exists (small standalone docs or typo fixes do not require a separate issue).
+- Work in progress opens as a draft pull request.
 - Aim for 400 changed lines or fewer, not counting lockfiles and generated files. Refactors go in their own pull request. Dependent changes use stacked pull requests, generally available on every plan since October 2026.
-- **Template sections:** Summary; Linked issue; Spec impact (none, additive or breaking, with the spec version); How it was tested, with the commands and their output; AI disclosure; Checklist.
+- **Template sections:** Summary; Linked issue; Spec impact (none, additive or breaking, with the spec version); How it was tested (exact commands and output, or `N/A — docs-only` for pure documentation edits); AI disclosure; Checklist.
 
 ## Review and merge
 
 - One human approval. Changes to `spec/` and `.github/workflows/` need both maintainers.
 - CI green, conversations resolved, squash merge only. The default squash message is set to "Pull request title and description"; otherwise a one-commit pull request lands with that commit's message. The branch is deleted after merge.
 - Nobody approves their own pull request, and agents never approve or merge.
-- The organization is on GitHub Team, so a ruleset on main enforces these rules in the private repositories: changes only through pull requests, one approval, green CI, resolved conversations and squash merge, with no bypass for agents. The two-maintainer rule for spec/ and .github/workflows/ holds by agreement until CODEOWNERS is added at the public launch. A merge queue in private repositories would still need Enterprise Cloud.
+- A ruleset on `main` enforces changes only through pull requests, at least one human approval, green CI, resolved conversations, and squash merge, with no bypass for agents. `.github/CODEOWNERS` auto-requests `@auditstream/maintainers`; because GitHub CODEOWNERS requires approval from any single member of the team, the two-maintainer requirement for external or bot pull requests touching `spec/` and `.github/workflows/` is upheld by maintainer review policy.
 
 ## Definition of done
 
