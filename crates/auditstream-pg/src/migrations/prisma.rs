@@ -2,15 +2,15 @@
 //!
 //! Never modifies `migration_lock.toml` or any existing migration folder.
 
+use super::sql::render_transaction;
 use super::{
-    Manifest, MigrationError, MigrationOptions, PlannedMigration, PreviewOutcome, WriteOutcome,
-    find_newest_folder_migration, header_comment, plan_migration, preview_with,
-    write_folder_migration,
+    MigrationError, MigrationOptions, PlannedMigration, PreviewOutcome, WriteOutcome,
+    find_newest_folder_migration, plan_migration, preview_with, write_folder_migration,
 };
 
 pub(crate) fn preview(options: &MigrationOptions) -> Result<PreviewOutcome, MigrationError> {
     let newest = find_newest_folder_migration(&options.out_dir)?;
-    Ok(preview_with(options, newest, render_sql))
+    Ok(preview_with(options, newest, render_transaction))
 }
 
 pub(crate) fn write(options: &MigrationOptions) -> Result<WriteOutcome, MigrationError> {
@@ -22,23 +22,8 @@ pub(crate) fn write(options: &MigrationOptions) -> Result<WriteOutcome, Migratio
             dropped_tables,
             statements,
         } => {
-            let rendered = render_sql(&manifest, &statements);
+            let rendered = render_transaction(&manifest, &statements);
             write_folder_migration(options, &rendered, dropped_tables)
         }
     }
-}
-
-pub(crate) fn render_sql(manifest: &Manifest, statements: &[String]) -> String {
-    let mut out = String::new();
-    out.push_str(&header_comment(manifest));
-    out.push_str("\n\n");
-    for (idx, stmt) in statements.iter().enumerate() {
-        if idx > 0 {
-            out.push_str("\n\n");
-        }
-        out.push_str(stmt);
-        out.push(';');
-    }
-    out.push('\n');
-    out
 }

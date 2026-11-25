@@ -515,6 +515,30 @@ async fn t7_noop_and_excluded_column_only_updates_write_nothing_and_exclude_from
 }
 
 #[tokio::test]
+async fn updates_capture_changes_after_adding_a_json_column() {
+    let mut fx = CaptureFixture::kit_default().await;
+    fx.db
+        .execute("ALTER TABLE line_item ADD COLUMN document json")
+        .await
+        .expect("add json column after installing triggers");
+    fx.exec_app(r#"INSERT INTO line_item (id, document) VALUES (1, '{"n":1}')"#)
+        .await;
+    fx.exec_app(r#"UPDATE line_item SET document = '{ "n": 1 }'"#)
+        .await;
+    fx.exec_app(r#"UPDATE line_item SET document = '{"n":2}'"#)
+        .await;
+
+    let updates: Vec<(Vec<String>, String, String)> = sqlx::query_as(
+        "SELECT changed, before->'document'->>'n', after->'document'->>'n' \
+         FROM auditstream.changes WHERE op = 'UPDATE'",
+    )
+    .fetch_all(fx.db.pool())
+    .await
+    .expect("read captured updates");
+    assert_eq!(updates, [(vec!["document".into()], "1".into(), "2".into())]);
+}
+
+#[tokio::test]
 async fn t8_truncate_records_table_and_actor() {
     let mut fx = CaptureFixture::kit_default().await;
     let start_id = fx.seed_invoices_for_update_tests().await;

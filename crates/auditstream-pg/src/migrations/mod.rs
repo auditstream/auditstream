@@ -6,6 +6,7 @@
 //! executes unchanged.
 
 pub mod drizzle;
+mod function_digest;
 pub mod prisma;
 pub mod sql;
 
@@ -25,6 +26,14 @@ use crate::triggers::{self, TableTriggerSpec, TriggerOptions};
 /// Prefix identifying the machine-readable manifest comment emitted at the top of every
 /// Auditstream-generated migration file.
 pub(crate) const MANIFEST_PREFIX: &str = "-- auditstream:manifest ";
+
+const SET_LOCK_TIMEOUT: &str = "DO $$
+BEGIN
+  IF pg_catalog.current_setting('lock_timeout') = '0' THEN
+    SET LOCAL lock_timeout = '5s';
+  END IF;
+END
+$$";
 
 /// Trigger names installed by [`crate::triggers::generate`] on each audited table.
 const AUDIT_TRIGGER_NAMES: [&str; 4] = [
@@ -179,7 +188,7 @@ pub fn preview(options: &MigrationOptions) -> Result<PreviewOutcome, MigrationEr
 /// - Composes D2 history schema DDL and D3 capture triggers, keeping D2's temporary
 ///   `auditstream_owner` self-grant active until after D3 creates/alters functions so
 ///   PostgreSQL 16+ non-superuser migrators succeed.
-/// - Re-running with the same selection writes nothing and returns [`WriteOutcome::UpToDate`].
+/// - Re-running with the same selection and function SQL writes nothing and returns [`WriteOutcome::UpToDate`].
 /// - Re-running with a changed selection leaves all existing migration files byte-identical,
 ///   emits `DROP TRIGGER IF EXISTS` statements for tables removed from the previous selection
 ///   (preserving their recorded history), and writes one new migration.
@@ -203,7 +212,11 @@ pub(crate) struct Manifest {
     pub(crate) tables: BTreeSet<(String, String)>,
 }
 
-pub(crate) fn build_manifest(options: &MigrationOptions) -> Manifest {
+fn build_manifest(
+    options: &MigrationOptions,
+    tables: BTreeSet<(String, String)>,
+    statements: &[String],
+) -> Manifest {
     let mut app_roles = options.ddl.app_roles.clone();
     app_roles.sort();
     app_roles.dedup();
@@ -211,11 +224,9 @@ pub(crate) fn build_manifest(options: &MigrationOptions) -> Manifest {
     let mut tables_sorted = options.tables.clone();
     tables_sorted.sort_by(|a, b| a.schema.cmp(&b.schema).then_with(|| a.table.cmp(&b.table)));
 
-    let mut table_pairs = BTreeSet::new();
     let tables_json: Vec<Value> = tables_sorted
         .iter()
         .map(|spec| {
-            table_pairs.insert((spec.schema.clone(), spec.table.clone()));
             let mut excl = spec.excluded_columns.clone();
             excl.sort();
             excl.dedup();
@@ -231,6 +242,7 @@ pub(crate) fn build_manifest(options: &MigrationOptions) -> Manifest {
 
     let value = json!({
         "app_roles": app_roles,
+        "function_sql_sha256": function_digest::from_statements(statements),
         "schema": options.ddl.schema,
         "schema_version": CURRENT_SCHEMA_VERSION,
         "tables": tables_json,
@@ -239,7 +251,7 @@ pub(crate) fn build_manifest(options: &MigrationOptions) -> Manifest {
     Manifest {
         canonical_json: serde_json::to_string(&value)
             .expect("manifest JSON serialization cannot fail"),
-        tables: table_pairs,
+        tables,
     }
 }
 
@@ -274,25 +286,17 @@ pub(crate) fn parse_manifest_from_file(path: &Path) -> Result<Option<Manifest>, 
     Ok(None)
 }
 
-pub(crate) fn compute_dropped_tables(
+fn compute_dropped_tables(
     previous: Option<&Manifest>,
-    current: &Manifest,
+    selected: &BTreeSet<(String, String)>,
     explicit_removed: &[(String, String)],
 ) -> Vec<(String, String)> {
-    let mut dropped = BTreeSet::new();
-    if let Some(prev) = previous {
-        for pair in &prev.tables {
-            if !current.tables.contains(pair) {
-                dropped.insert(pair.clone());
-            }
-        }
+    let mut removed: BTreeSet<_> = explicit_removed.iter().cloned().collect();
+    if let Some(previous) = previous {
+        removed.extend(previous.tables.iter().cloned());
     }
-    for pair in explicit_removed {
-        if !current.tables.contains(pair) {
-            dropped.insert(pair.clone());
-        }
-    }
-    dropped.into_iter().collect()
+    removed.retain(|table| !selected.contains(table));
+    removed.into_iter().collect()
 }
 
 /// Standard two-line header comment prepended to every generated migration file.
@@ -334,8 +338,11 @@ pub(crate) fn compose_statements(
         }
     }
 
-    ddl_stmts
-        .into_iter()
+    let drizzle_check = (options.format == MigrationFormat::Drizzle)
+        .then(|| drizzle::CHECK_LOCK_TIMEOUT.to_owned());
+    std::iter::once(SET_LOCK_TIMEOUT.to_owned())
+        .chain(drizzle_check)
+        .chain(ddl_stmts)
         .chain(trigger_stmts)
         .chain(drop_stmts)
         .chain(role_cleanup)
@@ -373,21 +380,21 @@ pub(crate) fn plan_migration(
     options: &MigrationOptions,
     newest: Option<(PathBuf, Manifest)>,
 ) -> PlannedMigration {
-    let current = build_manifest(options);
-    let prev_manifest = match newest {
-        Some((existing, prev))
-            if prev.canonical_json == current.canonical_json
-                && options.removed_tables.is_empty() =>
-        {
-            return PlannedMigration::UpToDate { existing };
-        }
-        Some((_, prev)) => Some(prev),
-        None => None,
-    };
-
-    let dropped_tables =
-        compute_dropped_tables(prev_manifest.as_ref(), &current, &options.removed_tables);
+    let selected = options
+        .tables
+        .iter()
+        .map(|t| (t.schema.clone(), t.table.clone()))
+        .collect();
+    let previous = newest.as_ref().map(|(_, manifest)| manifest);
+    let dropped_tables = compute_dropped_tables(previous, &selected, &options.removed_tables);
     let statements = compose_statements(options, &dropped_tables);
+    let current = build_manifest(options, selected, &statements);
+    if let Some((existing, previous)) = newest
+        && previous.canonical_json == current.canonical_json
+        && options.removed_tables.is_empty()
+    {
+        return PlannedMigration::UpToDate { existing };
+    }
     PlannedMigration::Changed {
         manifest: current,
         dropped_tables,

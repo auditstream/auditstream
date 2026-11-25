@@ -1,4 +1,5 @@
 use auditstream_pg::ddl::{self, DEFAULT_SCHEMA, DdlOptions, OWNER_ROLE, quote_ident};
+use auditstream_pg::triggers::{self, TriggerOptions};
 use auditstream_testkit::TestDb;
 use sqlx::postgres::PgConnection;
 use sqlx::{AssertSqlSafe, Connection, Executor, Row};
@@ -54,6 +55,30 @@ fn ddl_lookup_index_uses_adr0008_partial_hash() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+#[tokio::test]
+async fn reapplying_ddl_skips_redundant_owner_changes() {
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let db = TestDb::new().await.expect("test database");
+    let mut conn = PgConnection::connect(db.url()).await.expect("connect");
+    let schema = r#"Audit "History's""#;
+    let mut statements = ddl::generate(&DdlOptions::new(schema, vec![]));
+    statements.extend(triggers::generate(&TriggerOptions::new(schema, vec![])));
+    run_statements(&mut conn, &statements).await.expect("setup");
+
+    conn.execute(
+        "CREATE FUNCTION reject_redundant_alter() RETURNS event_trigger LANGUAGE plpgsql
+         AS $$ BEGIN RAISE EXCEPTION 'unexpected % during refresh', tg_tag; END $$;
+         CREATE EVENT TRIGGER reject_redundant_alter ON ddl_command_start
+         WHEN TAG IN ('ALTER TABLE', 'ALTER FUNCTION') EXECUTE FUNCTION reject_redundant_alter()",
+    )
+    .await
+    .expect("watch for redundant ALTERs");
+
+    run_statements(&mut conn, &statements)
+        .await
+        .expect("matching owners should be left in place");
 }
 
 #[tokio::test]

@@ -67,15 +67,64 @@ fn app_role_url(db: &TestDb, role: &str, password: &str) -> String {
 }
 
 async fn apply_drizzle_chunks(conn: &mut PgConnection, sql_text: &str) {
-    for chunk in sql_text.split(STATEMENT_BREAKPOINT) {
-        let trimmed = chunk.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        conn.execute(AssertSqlSafe(trimmed.to_owned()))
-            .await
-            .unwrap_or_else(|err| panic!("drizzle chunk failed:\n{trimmed}\nerror: {err}"));
+    let mut tx = conn.begin().await.expect("begin Drizzle migration");
+    execute_drizzle_chunks(&mut tx, sql_text)
+        .await
+        .expect("apply Drizzle migration");
+    tx.commit().await.expect("commit Drizzle migration");
+}
+
+async fn execute_drizzle_chunks(conn: &mut PgConnection, sql: &str) -> Result<(), sqlx::Error> {
+    for chunk in sql.split(STATEMENT_BREAKPOINT) {
+        conn.execute(AssertSqlSafe(chunk)).await?;
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn autocommit_drizzle_requires_a_configured_lock_timeout_before_ddl() {
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let db = TestDb::new().await.expect("create TestDb");
+    let dir = ScratchDir::new("autocommit_drizzle");
+    let options = MigrationOptions::new(
+        MigrationFormat::Drizzle,
+        dir.path(),
+        fixed_time(),
+        DdlOptions::default(),
+        vec![],
+    );
+    let PreviewOutcome::Sql { sql, .. } = migrations::preview(&options).expect("preview") else {
+        panic!("expected new migration");
+    };
+
+    let mut conn = PgConnection::connect(db.url()).await.expect("connect");
+    conn.execute("SET lock_timeout = 0")
+        .await
+        .expect("clear timeout");
+    let err = execute_drizzle_chunks(&mut conn, &sql)
+        .await
+        .expect_err("reject unbounded autocommit migration");
+    assert!(err.to_string().contains("lock_timeout"), "{err}");
+    let schema_exists: bool =
+        sqlx::query_scalar("SELECT to_regnamespace('auditstream') IS NOT NULL")
+            .fetch_one(&mut conn)
+            .await
+            .expect("check schema");
+    assert!(
+        !schema_exists,
+        "rejected migration must leave the schema untouched"
+    );
+
+    conn.execute(AssertSqlSafe(format!(
+        "ALTER DATABASE {} SET lock_timeout = '2s'",
+        quote_ident(db.database_name())
+    )))
+    .await
+    .expect("configure migration database");
+    let mut configured = PgConnection::connect(db.url()).await.expect("reconnect");
+    execute_drizzle_chunks(&mut configured, &sql)
+        .await
+        .expect("bounded autocommit migration");
 }
 
 #[test]
@@ -486,19 +535,43 @@ async fn live_postgres_applies_each_format_twice_and_handles_removed_table_selec
             .await
             .expect("grant dml");
 
-        // Apply migration TWICE as its migrator does (single script for Prisma/SQL, chunk-by-chunk for Drizzle).
-        for run_idx in 0..2 {
+        admin
+            .execute(
+                "CREATE FUNCTION observe_lock_timeout() RETURNS event_trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   PERFORM set_config('test.observed_timeout', current_setting('lock_timeout'), false);
+                 END $$;
+                 CREATE EVENT TRIGGER observe_lock_timeout ON ddl_command_start
+                 WHEN TAG IN ('CREATE SCHEMA') EXECUTE FUNCTION observe_lock_timeout();",
+            )
+            .await
+            .expect("record the timeout in effect during migration DDL");
+
+        for (session_timeout, expected_during_ddl) in [("0", "5s"), ("2s", "2s")] {
+            sqlx::query("SELECT set_config('lock_timeout', $1, false)")
+                .bind(session_timeout)
+                .execute(&mut admin)
+                .await
+                .expect("set migration connection timeout");
             match format {
                 MigrationFormat::Prisma | MigrationFormat::Sql => {
                     admin
                         .execute(AssertSqlSafe(mig1_sql.clone()))
                         .await
-                        .unwrap_or_else(|err| panic!("{label} run {run_idx} failed: {err}"));
+                        .unwrap_or_else(|err| panic!("{label} migration failed: {err}"));
                 }
                 MigrationFormat::Drizzle => {
                     apply_drizzle_chunks(&mut admin, &mig1_sql).await;
                 }
             }
+            let (during, after): (String, String) = sqlx::query_as(
+                "SELECT current_setting('test.observed_timeout'), current_setting('lock_timeout')",
+            )
+            .fetch_one(&mut admin)
+            .await
+            .expect("read observed and session lock timeouts");
+            assert_eq!(during, expected_during_ddl, "{label}: DDL timeout");
+            assert_eq!(after, session_timeout, "{label}: session timeout");
         }
 
         // Verify capture works after double application (and excluded password_hash is stripped).

@@ -45,4 +45,4 @@ auditstream init --migrations sql \
 
 `init` leaves previous migrations untouched and writes one new migration.
 Removed tables receive `DROP TRIGGER IF EXISTS` while keeping all existing rows in `auditstream.changes`.
-Re-running with an unchanged selection prints `up to date` to stderr and exits `0`.
+Re-running with the same selection and generated functions prints `up to date` to stderr and exits `0`.

@@ -9,14 +9,13 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use auditstream_pg::ddl::quote_ident;
-use auditstream_pg::migrations::drizzle::STATEMENT_BREAKPOINT;
 use auditstream_testkit::TestDb;
 use insta_cmd::assert_cmd_snapshot;
 use predicates::prelude::*;
 use serde_json::Value;
 use tempfile::tempdir;
 
-use crate::support::{auditstream_cmd, auditstream_std_cmd};
+use crate::support::{apply_generated_migration, auditstream_cmd, auditstream_std_cmd};
 
 const FIXTURE_SCHEMA_SQL: &str = include_str!("e2e/fixture_schema.sql");
 
@@ -36,25 +35,6 @@ fn role_connection_url(db: &TestDb, role: &str, password: &str) -> String {
     let (scheme, rest) = base.split_once("://").expect("valid postgres URL");
     let (_, host_and_db) = rest.split_once('@').expect("URL contains credentials");
     format!("{scheme}://{role}:{password}@{host_and_db}")
-}
-
-async fn apply_generated_migration(db: &TestDb, format: &str, path: &Path) {
-    let sql = fs::read_to_string(path).expect("read generated migration");
-    if format == "drizzle" {
-        let chunks: Vec<String> = sql
-            .split(STATEMENT_BREAKPOINT)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect();
-        db.execute_statements(&chunks)
-            .await
-            .expect("apply drizzle migration");
-    } else {
-        db.execute_batch(&sql)
-            .await
-            .expect("apply prisma/sql migration");
-    }
 }
 
 fn load_event_validator() -> jsonschema::Validator {

@@ -80,7 +80,6 @@ pub fn generate(options: &DdlOptions) -> Vec<String> {
         "CREATE SCHEMA IF NOT EXISTS {schema_q} AUTHORIZATION {owner_q}"
     ));
     stmts.push(changes_table_sql(&schema_q));
-    stmts.push(format!("ALTER TABLE {schema_q}.changes OWNER TO {owner_q}"));
     stmts.push(runtime_partitions_sql(&schema_lit, &owner_lit));
 
     // Named indexes: BRIN on occurred_at, B-tree on (xact_id, id) for export cursor reads
@@ -97,8 +96,9 @@ pub fn generate(options: &DdlOptions) -> Vec<String> {
     ));
 
     stmts.push(log_event_sql(&schema_q));
-    stmts.push(format!(
-        "ALTER FUNCTION {schema_q}.log_event(text, jsonb, jsonb) OWNER TO {owner_q}"
+    stmts.push(function_owner_sql(
+        &schema_q,
+        "log_event(text, jsonb, jsonb)",
     ));
 
     stmts.push(format!("REVOKE ALL ON SCHEMA {schema_q} FROM PUBLIC"));
@@ -176,24 +176,19 @@ fn changes_table_sql(schema_q: &str) -> String {
 }
 
 fn runtime_partitions_sql(schema_lit: &str, owner_lit: &str) -> String {
-    format!(
-        "DO $$\n\
-DECLARE\n  \
+    do_block(&format!(
+        "DECLARE\n  \
   base_month timestamp := pg_catalog.date_trunc('month', pg_catalog.now() AT TIME ZONE 'UTC');\n  \
   m int;\n  \
   month_start timestamp;\n  \
   month_end timestamp;\n  \
-  part_name text;\n\
+  part_name name;\n  \
+  managed_tables name[] := ARRAY['changes', 'changes_default'];\n\
 BEGIN\n  \
   EXECUTE pg_catalog.format(\n    \
     'CREATE TABLE IF NOT EXISTS %I.changes_default PARTITION OF %I.changes DEFAULT',\n    \
     {schema_lit},\n    \
     {schema_lit}\n  \
-  );\n  \
-  EXECUTE pg_catalog.format(\n    \
-    'ALTER TABLE %I.changes_default OWNER TO %I',\n    \
-    {schema_lit},\n    \
-    {owner_lit}\n  \
   );\n  \
   FOR m IN 0..3 LOOP\n    \
     month_start := base_month + pg_catalog.make_interval(months => m);\n    \
@@ -207,16 +202,44 @@ BEGIN\n  \
       pg_catalog.to_char(month_start, 'YYYY-MM-DD HH24:MI:SS') || '+00',\n      \
       pg_catalog.to_char(month_end, 'YYYY-MM-DD HH24:MI:SS') || '+00'\n    \
     );\n    \
-    EXECUTE pg_catalog.format(\n      \
-      'ALTER TABLE %I.%I OWNER TO %I',\n      \
-      {schema_lit},\n      \
-      part_name,\n      \
-      {owner_lit}\n    \
-    );\n  \
+    managed_tables := pg_catalog.array_append(managed_tables, part_name);\n  \
+  END LOOP;\n  \
+  FOR part_name IN\n    \
+    SELECT c.relname FROM pg_catalog.pg_class c\n    \
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n    \
+    WHERE n.nspname = {schema_lit} AND c.relname = ANY (managed_tables)\n      \
+      AND c.relowner <> {owner_lit}::pg_catalog.regrole\n    \
+    ORDER BY c.relname\n  \
+  LOOP\n    \
+    EXECUTE pg_catalog.format('ALTER TABLE %I.%I OWNER TO %I', {schema_lit}, part_name, {owner_lit});\n  \
   END LOOP;\n\
-END\n\
-$$"
-    )
+END"
+    ))
+}
+
+pub(crate) fn function_owner_sql(schema_q: &str, signature: &str) -> String {
+    let function = format!("{schema_q}.{signature}");
+    let function_lit = quote_literal(&function);
+    let owner_q = quote_ident(OWNER_ROLE);
+    let owner_lit = quote_literal(OWNER_ROLE);
+    do_block(&format!(
+        "BEGIN
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_proc
+             WHERE oid = {function_lit}::pg_catalog.regprocedure
+               AND proowner <> {owner_lit}::pg_catalog.regrole) THEN
+    ALTER FUNCTION {function} OWNER TO {owner_q};
+  END IF;
+END"
+    ))
+}
+
+fn do_block(body: &str) -> String {
+    // A quoted schema identifier can itself contain the normal dollar delimiter.
+    if body.contains("$$") {
+        format!("DO {}", quote_literal(body))
+    } else {
+        format!("DO $$\n{body}\n$$")
+    }
 }
 
 fn log_event_sql(schema_q: &str) -> String {

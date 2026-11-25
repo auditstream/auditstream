@@ -50,6 +50,21 @@ When that file exists, `init` writes the 0.45 numbered format and appends one jo
 Otherwise it writes the Drizzle 1.x folder format.
 All Drizzle files separate statements with `--> statement-breakpoint` comments.
 
+## Migration lock waits
+
+Generated migrations honor the PostgreSQL `lock_timeout` on the connection that applies them.
+When it is zero (unlimited), the migration sets a five-second timeout for each lock acquisition.
+Prisma and plain SQL files open an explicit transaction. Transactional Drizzle runners wrap the file.
+The previous session setting takes effect again at transaction end.
+
+To choose a different timeout for Prisma or Drizzle, set a PostgreSQL default for the migration
+role, for example `ALTER ROLE migrator SET lock_timeout = '2s'`, before connecting.
+When applying a file with `psql`, you can run `SET lock_timeout = '2s'` in the same session.
+
+Drizzle runners that commit each statement separately, including the Neon HTTP migrator,
+require a nonzero timeout on every migration connection. Set it on the role or database and
+reconnect. If the timeout is still zero at the second statement, the migration stops before DDL.
+
 ## Configuration file updates
 
 When writing a new migration, `init` creates `auditstream.toml` (or the `--config` path) if it does not exist.
@@ -61,7 +76,8 @@ Comments, formatting, `schema`, and `[export]` remain untouched.
 
 - **No tables selected:** Lists all introspected user tables on stderr and exits `2`.
 - **Unknown schema, table, or column:** Names the invalid entry on stderr and exits `2`.
-- **Same selection re-run:** Compares against the manifest in the newest Auditstream migration in `--out`. Writes nothing, prints `up to date` on stderr, and exits `0`.
+- `init` compares the selection and the digest of the generated `resolve_actor`, `capture`, and `log_event` functions against the newest Auditstream migration in `--out`. When both match, it prints `up to date` on stderr and exits `0`.
+- When upgrading from v0.1.0, run `auditstream init` in the project with its existing migrations, apply the new migration with your usual migration tool, then run `auditstream verify`. The v0.1.0 manifest has no digest, so the first run writes a refresh migration even with the same selection. It preserves recorded history.
 - **Changed selection:** Leaves earlier migrations byte-identical and writes one new migration. Removed tables receive `DROP TRIGGER IF EXISTS` statements while keeping their recorded history.
 
 ## Streams and exit codes

@@ -213,7 +213,15 @@ BEGIN
 END
 $fn$;
 
-ALTER FUNCTION "auditstream".resolve_actor() OWNER TO "auditstream_owner";
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_proc
+             WHERE oid = '"auditstream".resolve_actor()'::pg_catalog.regprocedure
+               AND proowner <> 'auditstream_owner'::pg_catalog.regrole) THEN
+    ALTER FUNCTION "auditstream".resolve_actor() OWNER TO "auditstream_owner";
+  END IF;
+END
+$$;
 
 REVOKE ALL ON FUNCTION "auditstream".resolve_actor() FROM PUBLIC;
 
@@ -469,7 +477,15 @@ BEGIN
 END
 $fn$;
 
-ALTER FUNCTION "auditstream".capture() OWNER TO "auditstream_owner";
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_proc
+             WHERE oid = '"auditstream".capture()'::pg_catalog.regprocedure
+               AND proowner <> 'auditstream_owner'::pg_catalog.regrole) THEN
+    ALTER FUNCTION "auditstream".capture() OWNER TO "auditstream_owner";
+  END IF;
+END
+$$;
 
 REVOKE ALL ON FUNCTION "auditstream".capture() FROM PUBLIC;
 
@@ -482,7 +498,6 @@ CREATE OR REPLACE TRIGGER auditstream_insert
 CREATE OR REPLACE TRIGGER auditstream_update
   AFTER UPDATE ON "public"."project"
   FOR EACH ROW
-  WHEN (OLD.* IS DISTINCT FROM NEW.*)
   EXECUTE FUNCTION "auditstream".capture('["tenant_id","project_id"]', '[]');
 
 CREATE OR REPLACE TRIGGER auditstream_delete
@@ -505,7 +520,6 @@ CREATE OR REPLACE TRIGGER auditstream_insert
 CREATE OR REPLACE TRIGGER auditstream_update
   AFTER UPDATE ON "public"."ledger"
   FOR EACH ROW
-  WHEN (OLD.* IS DISTINCT FROM NEW.*)
   EXECUTE FUNCTION "auditstream".capture('["id","bucket"]', '[]', 'public', 'ledger');
 
 CREATE OR REPLACE TRIGGER auditstream_delete

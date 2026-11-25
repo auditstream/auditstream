@@ -46,7 +46,7 @@ The primary key is `(id, occurred_at)` to satisfy PostgreSQL range partitioning.
 | Trigger name | Event and granularity | Behavior |
 | --- | --- | --- |
 | `auditstream_insert` | `AFTER INSERT ... FOR EACH STATEMENT` | Resolves actor once per statement; records `after` |
-| `auditstream_update` | `AFTER UPDATE ... FOR EACH ROW WHEN (OLD.* IS DISTINCT FROM NEW.*)` | Skips no-ops and excluded-only updates; sets `changed` |
+| `auditstream_update` | `AFTER UPDATE ... FOR EACH ROW` | Compares JSONB row images after exclusions and sets `changed` for recorded updates |
 | `auditstream_delete` | `AFTER DELETE ... FOR EACH STATEMENT` | Resolves actor once per statement; records `before` |
 | `auditstream_truncate` | `AFTER TRUNCATE ... FOR EACH STATEMENT` | Records table and actor with `NULL` row images |
 
