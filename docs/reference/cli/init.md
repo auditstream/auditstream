@@ -60,7 +60,8 @@ Plain SQL files open an explicit transaction. Prisma applies each migration file
 transaction, and transactional Drizzle runners apply every pending migration in one transaction.
 
 To choose a different timeout for Prisma or Drizzle, set a PostgreSQL default for the migration
-role, for example `ALTER ROLE migrator SET lock_timeout = '2s'`, before connecting.
+role (for example `ALTER ROLE migrator SET lock_timeout = '2s'`), or pass
+`options=-c%20lock_timeout=2000` in the migration connection string when you cannot run `ALTER ROLE`.
 When applying a file with `psql`, you can run `SET lock_timeout = '2s'` in the same session.
 
 A refresh migration does not block writes to `auditstream.changes` while it waits for an audited
@@ -69,12 +70,13 @@ after its trigger statements. Creating a partition locks `changes` until the mig
 Run `auditstream verify --fix` before applying a refresh to create upcoming partitions in a
 separate short transaction instead.
 
-Drizzle runners that commit each statement separately, including the Neon HTTP migrator,
-require a nonzero timeout on every migration connection. If the timeout is still zero at the
-second statement, the migration stops before DDL. Prefer a transactional migrator, such as the
-`node-postgres`, `postgres.js`, or Neon WebSocket (`neon-serverless`) migrator. Otherwise set the
-timeout on a dedicated migration role and reconnect; setting it on a role or database that the
-application also uses limits the application's lock waits too.
+Auditstream migrations must run inside a single transaction so `lock_timeout`, DDL atomicity, and
+the temporary `auditstream_owner` self-grant/revocation on PostgreSQL 16+ stay intact. Runners that
+commit each statement separately — such as Drizzle's stateless Neon HTTP migrator or `psql -f` on a
+Prisma file without `--single-transaction` — are rejected before any DDL runs. Use a transactional
+migrator (Prisma Migrate, `psql`, or Drizzle with `node-postgres`, `postgres.js`, or the Neon
+WebSocket `neon-serverless` driver) to apply migrations; `@auditstream/drizzle/neon-http` remains
+fully supported for application queries.
 
 ## Configuration file updates
 

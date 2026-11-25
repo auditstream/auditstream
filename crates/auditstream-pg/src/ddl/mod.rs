@@ -57,6 +57,14 @@ pub fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+/// Structured parts of [`generate`] so migration composers can interleave trigger statements
+/// before creating future monthly partitions and revoking the temporary self-grant.
+pub(crate) struct GeneratedDdl {
+    pub(crate) setup: Vec<String>,
+    pub(crate) future_partitions: String,
+    pub(crate) role_cleanup: String,
+}
+
 /// Generates the ordered list of single SQL statements that initialize or idempotently
 /// reconcile the Auditstream history schema.
 ///
@@ -71,66 +79,76 @@ pub fn quote_literal(value: &str) -> String {
 /// The second-to-last statement creates the next three monthly partitions. Creating a
 /// partition locks `changes` until commit, so migrations run it after their trigger statements.
 pub fn generate(options: &DdlOptions) -> Vec<String> {
+    let parts = generate_parts(options);
+    let mut stmts = parts.setup;
+    stmts.push(parts.future_partitions);
+    stmts.push(parts.role_cleanup);
+    stmts
+}
+
+pub(crate) fn generate_parts(options: &DdlOptions) -> GeneratedDdl {
     let schema_q = quote_ident(&options.schema);
     let schema_lit = quote_literal(&options.schema);
     let owner_q = quote_ident(OWNER_ROLE);
     let owner_lit = quote_literal(OWNER_ROLE);
 
-    let mut stmts = Vec::with_capacity(14 + options.app_roles.len() * 3);
+    let mut setup = Vec::with_capacity(14 + options.app_roles.len() * 3);
 
-    stmts.push(role_setup_sql(&owner_q, &owner_lit));
-    stmts.push(format!(
+    setup.push(role_setup_sql(&owner_q, &owner_lit));
+    setup.push(format!(
         "CREATE SCHEMA IF NOT EXISTS {schema_q} AUTHORIZATION {owner_q}"
     ));
-    stmts.push(changes_table_sql(&schema_q));
-    stmts.push(partitions_sql(&schema_lit, &owner_lit, 0, 0));
+    setup.push(changes_table_sql(&schema_q));
+    setup.push(partitions_sql(&schema_lit, &owner_lit, 0, 0));
 
     // Named indexes: BRIN on occurred_at, B-tree on (xact_id, id) for export cursor reads
     // (PostgreSQL 15-19 has no BRIN operator class for xid8), and partial hash on record_id
     // per ADR-0008 (`docs/decisions/0008-history-lookup-index.md`).
-    stmts.push(history_index_sql(
+    setup.push(history_index_sql(
         &schema_q,
         &schema_lit,
         "changes_occurred_at_brin_idx",
         "USING brin (occurred_at)",
     ));
-    stmts.push(history_index_sql(
+    setup.push(history_index_sql(
         &schema_q,
         &schema_lit,
         "changes_xact_id_idx",
         "(xact_id, id)",
     ));
-    stmts.push(history_index_sql(
+    setup.push(history_index_sql(
         &schema_q,
         &schema_lit,
         "changes_lookup_idx",
         "USING hash (record_id) WHERE record_id IS NOT NULL",
     ));
 
-    stmts.push(log_event_sql(&schema_q));
-    stmts.push(function_owner_sql(
+    setup.push(log_event_sql(&schema_q));
+    setup.push(function_owner_sql(
         &schema_q,
         "log_event(text, jsonb, jsonb)",
     ));
 
-    stmts.push(format!("REVOKE ALL ON SCHEMA {schema_q} FROM PUBLIC"));
-    stmts.push(format!("REVOKE ALL ON {schema_q}.changes FROM PUBLIC"));
-    stmts.push(format!(
+    setup.push(format!("REVOKE ALL ON SCHEMA {schema_q} FROM PUBLIC"));
+    setup.push(format!("REVOKE ALL ON {schema_q}.changes FROM PUBLIC"));
+    setup.push(format!(
         "REVOKE ALL ON FUNCTION {schema_q}.log_event(text, jsonb, jsonb) FROM PUBLIC"
     ));
 
     for role in &options.app_roles {
         let role_q = quote_ident(role);
-        stmts.push(format!("GRANT USAGE ON SCHEMA {schema_q} TO {role_q}"));
-        stmts.push(format!("GRANT SELECT ON {schema_q}.changes TO {role_q}"));
-        stmts.push(format!(
+        setup.push(format!("GRANT USAGE ON SCHEMA {schema_q} TO {role_q}"));
+        setup.push(format!("GRANT SELECT ON {schema_q}.changes TO {role_q}"));
+        setup.push(format!(
             "GRANT EXECUTE ON FUNCTION {schema_q}.log_event(text, jsonb, jsonb) TO {role_q}"
         ));
     }
 
-    stmts.push(partitions_sql(&schema_lit, &owner_lit, 1, 3));
-    stmts.push(role_cleanup_sql(&owner_q));
-    stmts
+    GeneratedDdl {
+        setup,
+        future_partitions: partitions_sql(&schema_lit, &owner_lit, 1, 3),
+        role_cleanup: role_cleanup_sql(&owner_q),
+    }
 }
 
 fn role_setup_sql(owner_q: &str, owner_lit: &str) -> String {

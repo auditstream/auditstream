@@ -84,39 +84,49 @@ async fn execute_drizzle_chunks(conn: &mut PgConnection, sql: &str) -> Result<()
 }
 
 #[tokio::test]
-async fn autocommit_drizzle_requires_a_configured_lock_timeout_before_ddl() {
+async fn autocommit_migrations_fail_before_ddl_even_with_configured_lock_timeout() {
     let _lock = TestDb::cluster_lock().await.expect("cluster lock");
     let db = TestDb::new().await.expect("create TestDb");
-    let dir = ScratchDir::new("autocommit_drizzle");
-    let options = MigrationOptions::new(
+    let dir = ScratchDir::new("autocommit_migrations");
+    let drizzle_options = MigrationOptions::new(
         MigrationFormat::Drizzle,
         dir.path(),
         fixed_time(),
         DdlOptions::default(),
         vec![],
     );
-    let PreviewOutcome::Sql { sql, .. } = migrations::preview(&options).expect("preview") else {
-        panic!("expected new migration");
+    let PreviewOutcome::Sql {
+        sql: drizzle_sql, ..
+    } = migrations::preview(&drizzle_options).expect("preview drizzle")
+    else {
+        panic!("expected new drizzle migration");
+    };
+    let prisma_options = MigrationOptions::new(
+        MigrationFormat::Prisma,
+        dir.path(),
+        fixed_time(),
+        DdlOptions::default(),
+        vec![],
+    );
+    let PreviewOutcome::Sql {
+        sql: prisma_sql, ..
+    } = migrations::preview(&prisma_options).expect("preview prisma")
+    else {
+        panic!("expected new prisma migration");
     };
 
     let mut conn = PgConnection::connect(db.url()).await.expect("connect");
     conn.execute("SET lock_timeout = 0")
         .await
         .expect("clear timeout");
-    let err = execute_drizzle_chunks(&mut conn, &sql)
+    let err = execute_drizzle_chunks(&mut conn, &drizzle_sql)
         .await
-        .expect_err("reject unbounded autocommit migration");
-    assert!(err.to_string().contains("lock_timeout"), "{err}");
-    let schema_exists: bool =
-        sqlx::query_scalar("SELECT to_regnamespace('auditstream') IS NOT NULL")
-            .fetch_one(&mut conn)
-            .await
-            .expect("check schema");
-    assert!(
-        !schema_exists,
-        "rejected migration must leave the schema untouched"
-    );
+        .expect_err("reject autocommit Drizzle migration when lock_timeout = 0");
+    assert!(err.to_string().contains("single transaction"), "{err}");
 
+    // Even with a nonzero role/database lock_timeout, autocommit runners (such as Neon HTTP or
+    // `psql -f` on a Prisma file) must still be rejected before DDL so role self-grant cleanup
+    // and DDL atomicity cannot be broken.
     conn.execute(AssertSqlSafe(format!(
         "ALTER DATABASE {} SET lock_timeout = '2s'",
         quote_ident(db.database_name())
@@ -124,9 +134,50 @@ async fn autocommit_drizzle_requires_a_configured_lock_timeout_before_ddl() {
     .await
     .expect("configure migration database");
     let mut configured = PgConnection::connect(db.url()).await.expect("reconnect");
-    execute_drizzle_chunks(&mut configured, &sql)
+
+    let drizzle_err = execute_drizzle_chunks(&mut configured, &drizzle_sql)
         .await
-        .expect("bounded autocommit migration");
+        .expect_err("reject autocommit Drizzle migration even with nonzero lock_timeout");
+    assert!(
+        drizzle_err.to_string().contains("single transaction"),
+        "{drizzle_err}"
+    );
+
+    // Simulate `psql -f` executing the first two Prisma statements as separate autocommit queries.
+    let prisma_stmts: Vec<&str> = prisma_sql.split(";\n\n").collect();
+    assert!(
+        prisma_stmts.len() >= 3,
+        "expected Prisma statements separated by blank lines"
+    );
+    configured
+        .execute(AssertSqlSafe(prisma_stmts[0]))
+        .await
+        .expect("first Prisma statement sets transaction marker");
+    let prisma_err = configured
+        .execute(AssertSqlSafe(prisma_stmts[1]))
+        .await
+        .expect_err("second Prisma statement must reject autocommit execution");
+    assert!(
+        prisma_err.to_string().contains("single transaction"),
+        "{prisma_err}"
+    );
+
+    let schema_exists: bool =
+        sqlx::query_scalar("SELECT to_regnamespace('auditstream') IS NOT NULL")
+            .fetch_one(&mut configured)
+            .await
+            .expect("check schema");
+    assert!(
+        !schema_exists,
+        "rejected autocommit migrations must leave the schema untouched"
+    );
+
+    apply_drizzle_chunks(&mut configured, &drizzle_sql).await;
+    let installed: bool = sqlx::query_scalar("SELECT to_regnamespace('auditstream') IS NOT NULL")
+        .fetch_one(&mut configured)
+        .await
+        .expect("check schema after transactional run");
+    assert!(installed);
 }
 
 #[tokio::test]
@@ -203,11 +254,22 @@ async fn failed_prisma_migration_leaves_the_connection_able_to_record_the_failur
         .execute(AssertSqlSafe(sql))
         .await
         .expect_err("busy table times out");
-    assert!(err.to_string().contains("lock timeout"), "{err}");
-    prisma
-        .execute("SELECT 1")
-        .await
-        .expect("Prisma records the failure on this connection next");
+    assert_eq!(
+        err.as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("55P03"),
+        "expected SQLSTATE 55P03 (lock_not_available), got: {err}"
+    );
+    let schema_exists: bool =
+        sqlx::query_scalar("SELECT to_regnamespace('auditstream') IS NOT NULL")
+            .fetch_one(&mut prisma)
+            .await
+            .expect("Prisma records the failure on this connection next");
+    assert!(
+        !schema_exists,
+        "failed Prisma implicit transaction must roll back earlier DDL"
+    );
     busy.rollback().await.expect("release lock");
 }
 
@@ -294,6 +356,22 @@ async fn refresh_in_a_later_month_does_not_deadlock_with_an_in_flight_write() {
 /// [`fixture_tables`] with the `app_user` application role.
 const V0_1_0_PLAIN_SQL: &str = include_str!("fixtures/v0.1.0/plain_sql.sql");
 
+async fn assert_v0_1_0_verify_drift(pool: &sqlx::PgPool) {
+    let report = verify::check(pool, &fixture_tables())
+        .await
+        .expect("verify before refresh");
+    for object in ["auditstream.capture()", "public.invoice.auditstream_update"] {
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.kind == verify::FindingKind::Outdated && f.object == object),
+            "expected outdated {object} finding before refresh, got: {:?}",
+            report.findings
+        );
+    }
+}
+
 #[tokio::test]
 async fn upgrades_a_v0_1_0_installation_in_place() {
     let _lock = TestDb::cluster_lock().await.expect("cluster lock");
@@ -339,6 +417,7 @@ async fn upgrades_a_v0_1_0_installation_in_place() {
         legacy_update.to_string().contains("equality operator"),
         "{legacy_update}"
     );
+    assert_v0_1_0_verify_drift(db.pool()).await;
 
     let options = MigrationOptions::new(
         MigrationFormat::Sql,
@@ -625,6 +704,68 @@ fn rerunning_same_selection_is_up_to_date_and_changed_selection_adds_and_drops_w
         assert!(
             second_sql.contains(r#"ON "public"."customer""#),
             "{label}: expected trigger creation for added table"
+        );
+    }
+}
+
+#[test]
+fn reordered_or_duplicate_excluded_columns_stay_up_to_date() {
+    let now = fixed_time();
+    let ddl = DdlOptions::new(DEFAULT_SCHEMA, vec!["app_user".to_owned()]);
+
+    for (label, format, layout) in [
+        ("prisma", MigrationFormat::Prisma, None),
+        (
+            "drizzle045",
+            MigrationFormat::Drizzle,
+            Some(DrizzleLayout::V045),
+        ),
+        (
+            "drizzle1x",
+            MigrationFormat::Drizzle,
+            Some(DrizzleLayout::V1),
+        ),
+        ("sql", MigrationFormat::Sql, None),
+    ] {
+        let dir = ScratchDir::new(&format!("canon_excl_{label}"));
+        let initial = vec![TableTriggerSpec::new(
+            "public",
+            "invoice",
+            vec!["id".to_owned()],
+            vec![
+                "z_secret".to_owned(),
+                "a_token".to_owned(),
+                "z_secret".to_owned(),
+            ],
+        )];
+        let mut opts1 = MigrationOptions::new(format, dir.path(), now, ddl.clone(), initial);
+        if let Some(l) = layout {
+            opts1 = opts1.with_drizzle_layout(l);
+        }
+        let WriteOutcome::Written { files, .. } = migrations::write(&opts1).expect("first write")
+        else {
+            panic!("{label}: expected Written");
+        };
+        let sql = fs::read_to_string(&files[0]).expect("read migration");
+        assert!(
+            sql.contains(r#"["a_token","z_secret"]"#),
+            "{label}: expected sorted, deduplicated excluded_columns in trigger args"
+        );
+
+        let reordered = vec![TableTriggerSpec::new(
+            "public",
+            "invoice",
+            vec!["id".to_owned()],
+            vec!["a_token".to_owned(), "z_secret".to_owned()],
+        )];
+        let mut opts2 = MigrationOptions::new(format, dir.path(), now, ddl.clone(), reordered);
+        if let Some(l) = layout {
+            opts2 = opts2.with_drizzle_layout(l);
+        }
+        let outcome = migrations::write(&opts2).expect("second write");
+        assert!(
+            matches!(outcome, WriteOutcome::UpToDate { ref existing } if existing == &files[0]),
+            "{label}: reordered/duplicate excluded_columns must be UpToDate, got {outcome:?}"
         );
     }
 }

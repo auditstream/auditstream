@@ -62,7 +62,7 @@ async fn reapplying_ddl_skips_redundant_owner_changes() {
     let _lock = TestDb::cluster_lock().await.expect("cluster lock");
     let db = TestDb::new().await.expect("test database");
     let mut conn = PgConnection::connect(db.url()).await.expect("connect");
-    let schema = r#"Audit "History's""#;
+    let schema = r#"Audit "History's" $$v1$$"#;
     let mut statements = ddl::generate(&DdlOptions::new(schema, vec![]));
     statements.extend(triggers::generate(&TriggerOptions::new(schema, vec![])));
     run_statements(&mut conn, &statements).await.expect("setup");

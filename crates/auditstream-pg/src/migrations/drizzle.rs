@@ -16,16 +16,6 @@ use super::{
     plan_migration, preview_with, write_folder_migration,
 };
 
-// Some Drizzle runners commit at each breakpoint, discarding the transaction-local fallback.
-pub(super) const CHECK_LOCK_TIMEOUT: &str = "DO $$
-BEGIN
-  IF pg_catalog.current_setting('lock_timeout') = '0' THEN
-    RAISE EXCEPTION 'Auditstream requires a nonzero lock_timeout'
-      USING HINT = 'Run this migration in one transaction or set lock_timeout on the migration role or database and reconnect.';
-  END IF;
-END
-$$";
-
 pub(crate) fn preview(options: &MigrationOptions) -> Result<PreviewOutcome, MigrationError> {
     let layout = options
         .drizzle_layout

@@ -1,8 +1,9 @@
 use sha2::{Digest, Sha256};
 
-/// Hashes the generated function and trigger definitions, which `verify` compares with the
-/// catalog, so changing either produces a refresh migration. Other statements are skipped:
-/// they are idempotent or depend on the previous selection (`DROP TRIGGER` for removed tables).
+/// Hashes the generated function (`resolve_actor`, `capture`, `log_event`) and trigger
+/// definitions so changing any of them produces a refresh migration. Other statements are skipped:
+/// they are idempotent DDL wrappers or depend on the previous selection (`DROP TRIGGER` for
+/// removed tables).
 pub(super) fn from_statements(statements: &[String]) -> String {
     let mut digest = Sha256::new();
     for sql in statements {

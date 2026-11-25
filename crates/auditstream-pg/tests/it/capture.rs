@@ -518,24 +518,60 @@ async fn t7_noop_and_excluded_column_only_updates_write_nothing_and_exclude_from
 async fn updates_capture_changes_after_adding_a_json_column() {
     let mut fx = CaptureFixture::kit_default().await;
     fx.db
-        .execute("ALTER TABLE line_item ADD COLUMN document json")
+        .execute(
+            "ALTER TABLE line_item \
+             ADD COLUMN document json, \
+             ADD COLUMN note xml, \
+             ADD COLUMN coords point",
+        )
         .await
-        .expect("add json column after installing triggers");
-    fx.exec_app(r#"INSERT INTO line_item (id, document) VALUES (1, '{"n":1}')"#)
-        .await;
-    fx.exec_app(r#"UPDATE line_item SET document = '{ "n": 1 }'"#)
-        .await;
-    fx.exec_app(r#"UPDATE line_item SET document = '{"n":2}'"#)
-        .await;
+        .expect("add non-equality columns after installing triggers");
+    fx.exec_app(
+        r#"INSERT INTO line_item (id, document, note, coords)
+           VALUES (1, '{"n":1}', xmlparse(content '<a/>'), point '(1,2)')"#,
+    )
+    .await;
+    // Semantically equivalent JSON formatting and unchanged xml/point are no-op updates
+    // on a table without excluded columns and must write no history row.
+    fx.exec_app(
+        r#"UPDATE line_item
+              SET document = '{ "n": 1 }',
+                  note = note,
+                  coords = coords
+            WHERE id = 1"#,
+    )
+    .await;
+    fx.exec_app(
+        r#"UPDATE line_item
+              SET document = '{"n":2}',
+                  note = xmlparse(content '<b/>'),
+                  coords = point '(3,4)'
+            WHERE id = 1"#,
+    )
+    .await;
 
-    let updates: Vec<(Vec<String>, String, String)> = sqlx::query_as(
-        "SELECT changed, before->'document'->>'n', after->'document'->>'n' \
+    let mut updates: Vec<(Vec<String>, String, String, String, String)> = sqlx::query_as(
+        "SELECT changed, \
+                before->'document'->>'n', after->'document'->>'n', \
+                after->>'note', after->>'coords' \
          FROM auditstream.changes WHERE op = 'UPDATE'",
     )
     .fetch_all(fx.db.pool())
     .await
     .expect("read captured updates");
-    assert_eq!(updates, [(vec!["document".into()], "1".into(), "2".into())]);
+    for (changed, ..) in &mut updates {
+        changed.sort();
+    }
+    assert_eq!(
+        updates,
+        [(
+            vec!["coords".into(), "document".into(), "note".into()],
+            "1".into(),
+            "2".into(),
+            "<b/>".into(),
+            "(3,4)".into(),
+        )]
+    );
 }
 
 #[tokio::test]

@@ -27,14 +27,27 @@ use crate::triggers::{self, TableTriggerSpec, TriggerOptions};
 /// Auditstream-generated migration file.
 pub(crate) const MANIFEST_PREFIX: &str = "-- auditstream:manifest ";
 
-// Bounds every lock wait when the connection has no timeout. The flag lets the last statement
-// restore the setting for any later migration in the same transaction, because Drizzle's
-// transactional migrators apply every pending migration in one transaction.
+// Marks the enclosing transaction and bounds every lock wait when the connection has no timeout.
+// The fallback flag lets the last statement restore the setting for any later migration in the
+// same transaction, because Drizzle's transactional migrators apply pending migrations together.
 const SET_LOCK_TIMEOUT: &str = "DO $$
 BEGIN
+  PERFORM pg_catalog.set_config('auditstream._migration_tx', 'on', true);
   IF pg_catalog.current_setting('lock_timeout') = '0' THEN
     SET LOCAL lock_timeout = '5s';
     PERFORM pg_catalog.set_config('auditstream._lock_timeout_fallback', 'on', true);
+  END IF;
+END
+$$";
+
+// Rejects runners that commit each statement separately (such as the Drizzle Neon HTTP migrator or
+// `psql -f` on a Prisma file), which discard transaction-local settings, break DDL atomicity, and
+// lose session state needed to revoke the temporary `auditstream_owner` self-grant on PG 16+.
+const REQUIRE_TRANSACTION: &str = "DO $$
+BEGIN
+  IF pg_catalog.current_setting('auditstream._migration_tx', true) IS DISTINCT FROM 'on' THEN
+    RAISE EXCEPTION 'Auditstream migrations must run inside a single transaction'
+      USING HINT = 'Use a transactional migrator (for example Prisma Migrate, psql --single-transaction, or Drizzle with node-postgres, postgres.js, or neon-serverless) instead of an autocommit/HTTP runner.';
   END IF;
 END
 $$";
@@ -45,6 +58,7 @@ BEGIN
     SET LOCAL lock_timeout = 0;
     PERFORM pg_catalog.set_config('auditstream._lock_timeout_fallback', 'off', true);
   END IF;
+  PERFORM pg_catalog.set_config('auditstream._migration_tx', 'off', true);
 END
 $$";
 
@@ -225,6 +239,16 @@ pub(crate) struct Manifest {
     pub(crate) tables: BTreeSet<(String, String)>,
 }
 
+fn canonicalize_tables(tables: &[TableTriggerSpec]) -> Vec<TableTriggerSpec> {
+    let mut sorted = tables.to_vec();
+    sorted.sort_by(|a, b| a.schema.cmp(&b.schema).then_with(|| a.table.cmp(&b.table)));
+    for spec in &mut sorted {
+        spec.excluded_columns.sort();
+        spec.excluded_columns.dedup();
+    }
+    sorted
+}
+
 fn build_manifest(
     options: &MigrationOptions,
     tables: BTreeSet<(String, String)>,
@@ -234,17 +258,13 @@ fn build_manifest(
     app_roles.sort();
     app_roles.dedup();
 
-    let mut tables_sorted = options.tables.clone();
-    tables_sorted.sort_by(|a, b| a.schema.cmp(&b.schema).then_with(|| a.table.cmp(&b.table)));
+    let tables_sorted = canonicalize_tables(&options.tables);
 
     let tables_json: Vec<Value> = tables_sorted
         .iter()
         .map(|spec| {
-            let mut excl = spec.excluded_columns.clone();
-            excl.sort();
-            excl.dedup();
             json!({
-                "excluded_columns": excl,
+                "excluded_columns": spec.excluded_columns,
                 "is_partitioned": spec.is_partitioned,
                 "primary_key": spec.primary_key,
                 "schema": spec.schema,
@@ -327,17 +347,11 @@ pub(crate) fn compose_statements(
     options: &MigrationOptions,
     dropped_tables: &[(String, String)],
 ) -> Vec<String> {
-    let mut ddl_stmts = ddl::generate(&options.ddl);
     // Keep D2's temporary `auditstream_owner` self-grant active while D3 creates/alters functions,
-    // then run D2's cleanup statement at the very end.
-    let role_cleanup = ddl_stmts.pop();
-    // Creating a monthly partition locks `changes` until commit. Holding that lock while a
-    // trigger statement waits for an audited table would stall every audited write and can
-    // deadlock with a writer that already holds that table, so it runs after them.
-    let future_partitions = ddl_stmts.pop();
-
-    let mut tables_sorted = options.tables.clone();
-    tables_sorted.sort_by(|a, b| a.schema.cmp(&b.schema).then_with(|| a.table.cmp(&b.table)));
+    // and run future monthly partition creation after triggers so holding a lock on `changes`
+    // cannot deadlock with in-flight writers holding an audited table.
+    let ddl_parts = ddl::generate_parts(&options.ddl);
+    let tables_sorted = canonicalize_tables(&options.tables);
 
     let trigger_stmts = triggers::generate(&TriggerOptions::new(
         options.ddl.schema.clone(),
@@ -355,15 +369,18 @@ pub(crate) fn compose_statements(
         }
     }
 
-    let drizzle_check = (options.format == MigrationFormat::Drizzle)
-        .then(|| drizzle::CHECK_LOCK_TIMEOUT.to_owned());
+    let tx_check = matches!(
+        options.format,
+        MigrationFormat::Drizzle | MigrationFormat::Prisma
+    )
+    .then(|| REQUIRE_TRANSACTION.to_owned());
     std::iter::once(SET_LOCK_TIMEOUT.to_owned())
-        .chain(drizzle_check)
-        .chain(ddl_stmts)
+        .chain(tx_check)
+        .chain(ddl_parts.setup)
         .chain(trigger_stmts)
         .chain(drop_stmts)
-        .chain(future_partitions)
-        .chain(role_cleanup)
+        .chain(std::iter::once(ddl_parts.future_partitions))
+        .chain(std::iter::once(ddl_parts.role_cleanup))
         .chain(std::iter::once(RESTORE_LOCK_TIMEOUT.to_owned()))
         .collect()
 }

@@ -518,22 +518,19 @@ BEGIN\n  \
   IF TG_OP = 'UPDATE' THEN\n    \
     IF has_ex THEN\n      \
       v_before := pg_catalog.to_jsonb(OLD) - ex_cols;\n      \
-      v_after := pg_catalog.to_jsonb(NEW) - ex_cols;\n      \
-      IF v_after = v_before THEN\n        \
-        RETURN NULL;\n      \
-      END IF;\n    \
+      v_after := pg_catalog.to_jsonb(NEW) - ex_cols;\n    \
     ELSE\n      \
       v_before := pg_catalog.to_jsonb(OLD);\n      \
       v_after := pg_catalog.to_jsonb(NEW);\n    \
+    END IF;\n    \
+    IF v_after = v_before THEN\n      \
+      RETURN NULL;\n    \
     END IF;\n    \
     v_changed := ARRAY(\n      \
       SELECT e.k\n        \
         FROM pg_catalog.jsonb_each(v_after) AS e(k, v)\n       \
        WHERE v_before->e.k IS DISTINCT FROM e.v\n    \
     );\n    \
-    IF NOT has_ex AND pg_catalog.cardinality(v_changed) = 0 THEN\n      \
-      RETURN NULL;\n    \
-    END IF;\n    \
     IF pk_single IS NOT NULL THEN\n      \
       v_record_id := pg_catalog.jsonb_build_object(pk_single, v_after->pk_single);\n    \
     ELSIF pg_catalog.cardinality(pk_cols) > 0 THEN\n      \

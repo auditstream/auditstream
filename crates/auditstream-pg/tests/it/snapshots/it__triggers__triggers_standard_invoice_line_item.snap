@@ -298,21 +298,18 @@ BEGIN
     IF has_ex THEN
       v_before := pg_catalog.to_jsonb(OLD) - ex_cols;
       v_after := pg_catalog.to_jsonb(NEW) - ex_cols;
-      IF v_after = v_before THEN
-        RETURN NULL;
-      END IF;
     ELSE
       v_before := pg_catalog.to_jsonb(OLD);
       v_after := pg_catalog.to_jsonb(NEW);
+    END IF;
+    IF v_after = v_before THEN
+      RETURN NULL;
     END IF;
     v_changed := ARRAY(
       SELECT e.k
         FROM pg_catalog.jsonb_each(v_after) AS e(k, v)
        WHERE v_before->e.k IS DISTINCT FROM e.v
     );
-    IF NOT has_ex AND pg_catalog.cardinality(v_changed) = 0 THEN
-      RETURN NULL;
-    END IF;
     IF pk_single IS NOT NULL THEN
       v_record_id := pg_catalog.jsonb_build_object(pk_single, v_after->pk_single);
     ELSIF pg_catalog.cardinality(pk_cols) > 0 THEN
