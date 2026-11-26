@@ -1,9 +1,10 @@
 [profile.default]
 
 # Cluster-wide `DROP ROLE IF EXISTS "auditstream_owner"` tests must run exclusively so no
-# concurrent test database holds objects owned by `auditstream_owner` (`SQLSTATE 2BP01`).
+# concurrent test database holds objects owned by `auditstream_owner` (`SQLSTATE 2BP01`) or
+# drops mid-`checkSharedDependencies()` (`SQLSTATE XX000: cache lookup failed for database`).
 [[profile.default.overrides]]
-filter = 'package(auditstream-pg) & test(/^(ddl::(setup_runs_as_non_superuser|alter_default_privileges|autocommit_and_failed_tx|pg16_group_admin)|triggers::every_capture_conformance_case)/)'
+filter = 'package(auditstream-pg) & test(/^(ddl::(setup_runs_as_non_superuser|alter_default_privileges|autocommit_and_failed_tx|pg16_group_admin)|partitions::(non_superuser_creates_future_partitions|ensure_ahead_under_alter_default_privileges)|triggers::every_capture_conformance_case)/)'
 threads-required = "num-test-threads"
 
 [profile.ci]
