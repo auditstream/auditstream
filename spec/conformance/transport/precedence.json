@@ -223,6 +223,34 @@
         "context": null,
         "actor_source": "invalid"
       }
+    },
+    {
+      "name": "jwt-nul-in-non-sub-claim-invalid",
+      "description": "request.jwt.claims containing a JSON \\u0000 escape outside sub yields actor_source='invalid' (matching PostgreSQL jsonb).",
+      "input": {
+        "sql": "UPDATE invoice SET total=55 WHERE id=2;",
+        "set_config": null,
+        "jwt_claims": "{\"sub\":\"u1\",\"extra\":\"a\\u0000b\"}"
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": "invalid"
+      }
+    },
+    {
+      "name": "jwt-nul-in-shadowed-duplicate-key-invalid",
+      "description": "request.jwt.claims containing a JSON \\u0000 escape in an overwritten duplicate key yields actor_source='invalid'.",
+      "input": {
+        "sql": "UPDATE invoice SET total=55 WHERE id=2;",
+        "set_config": null,
+        "jwt_claims": "{\"sub\":\"u\\u00001\",\"sub\":\"u1\"}"
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": "invalid"
+      }
     }
   ]
 }

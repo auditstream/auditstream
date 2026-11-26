@@ -289,6 +289,34 @@
       "expected": {
         "error": "invalid_context"
       }
+    },
+    {
+      "name": "reject-nul-in-object-key",
+      "description": "NUL character (U+0000) in an object key MUST fail.",
+      "input": {
+        "actor": {
+          "type": "user",
+          "id": "usr_1",
+          "bad\u0000key": "v"
+        }
+      },
+      "expected": {
+        "error": "invalid_actor"
+      }
+    },
+    {
+      "name": "reject-nul-in-unknown-key-value",
+      "description": "NUL character (U+0000) in an unknown additive property value MUST fail.",
+      "input": {
+        "actor": {
+          "type": "user",
+          "id": "usr_1",
+          "extra": "a\u0000b"
+        }
+      },
+      "expected": {
+        "error": "invalid_actor"
+      }
     }
   ]
 }

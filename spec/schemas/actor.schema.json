@@ -6,6 +6,11 @@
   "type": "object",
   "required": ["type", "id"],
   "additionalProperties": true,
+  "allOf": [
+    {
+      "$ref": "#/$defs/noNulValue"
+    }
+  ],
   "properties": {
     "type": {
       "$ref": "#/$defs/actorType"
@@ -28,6 +33,22 @@
       "type": "string",
       "enum": ["user", "api_key", "ai_agent", "service", "system"]
     },
+    "noNulKey": {
+      "type": "string",
+      "pattern": "^[^\\u0000]*$"
+    },
+    "noNulValue": {
+      "pattern": "^[^\\u0000]*$",
+      "items": {
+        "$ref": "#/$defs/noNulValue"
+      },
+      "propertyNames": {
+        "$ref": "#/$defs/noNulKey"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/noNulValue"
+      }
+    },
     "nonEmptyString": {
       "type": "string",
       "minLength": 1,
@@ -37,6 +58,11 @@
       "type": "object",
       "required": ["type", "id"],
       "additionalProperties": true,
+      "allOf": [
+        {
+          "$ref": "#/$defs/noNulValue"
+        }
+      ],
       "properties": {
         "type": {
           "$ref": "#/$defs/actorType"
@@ -53,6 +79,11 @@
     "context": {
       "type": "object",
       "additionalProperties": true,
+      "allOf": [
+        {
+          "$ref": "#/$defs/noNulValue"
+        }
+      ],
       "properties": {
         "requestId": {
           "$ref": "#/$defs/nonEmptyString"

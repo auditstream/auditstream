@@ -40,7 +40,7 @@ String values and object keys anywhere in an actor or context payload (including
 - Encoders MUST reject any payload containing `U+0000` with an error before sending SQL.
 - Readers and decoders MUST treat any payload containing `U+0000` as malformed (`actor = NULL`, `context = NULL`, `actor_source = 'invalid'`).
 
-*(Informative)* PostgreSQL `jsonb` cannot store `U+0000` (`SQLSTATE 22P05`). Allowing encoders to emit `\u0000` causes database writes to succeed while silently erasing attribution (`actor = NULL`, `actor_source = 'invalid'`). Host languages with UTF-16 strings (such as JavaScript) SHOULD also reject lone UTF-16 surrogates, which cannot be encoded as valid UTF-8 for PostgreSQL.
+*(Informative)* PostgreSQL `jsonb` cannot store `U+0000` (`SQLSTATE 22P05`). Allowing encoders to emit `\u0000` causes database writes to succeed while silently erasing attribution (`actor = NULL`, `actor_source = 'invalid'`). Host languages with UTF-16 strings (such as JavaScript) should also reject lone UTF-16 surrogates, which cannot be encoded as valid UTF-8 for PostgreSQL.
 
 ## Privacy rule (IDs only)
 
@@ -48,7 +48,7 @@ Actor payloads SHOULD carry opaque identifiers only. Personal data such as names
 
 ## Forward compatibility and unknown keys
 
-Readers MUST ignore unknown keys in both actor and context objects. Adding a new optional field to the contract is therefore a backwards-compatible minor specification release. Accordingly, [spec/schemas/actor.schema.json](schemas/actor.schema.json) sets `additionalProperties: true` on actor and context objects (while explicitly forbidding `onBehalfOf` inside `onBehalfOf`).
+Readers MUST ignore unknown keys in both actor and context objects. Adding a new optional field to the contract is therefore a backwards-compatible minor specification release. Accordingly, [spec/schemas/actor.schema.json](schemas/actor.schema.json) permits additional properties on actor and context objects as long as object keys and string values contain no `U+0000` (while explicitly forbidding `onBehalfOf` inside `onBehalfOf`).
 
 ## Size limit
 

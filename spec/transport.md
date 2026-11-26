@@ -94,7 +94,7 @@ Database readers MUST resolve the actor in the following strict precedence order
 | 2 (malformed) | `comment` | Trailing comment in `right(current_query(), 4096)` has key `auditstream` and malformed payload | `NULL` | `'invalid'` (MUST NOT fall through) |
 | 3 | `jwt` | `nullif(current_setting('request.jwt.claims', true), '')` is a valid JSON object with non-empty string `sub` | `{"type":"user","id":"<sub>"}` | `'jwt'` |
 | 3 (absent `sub`) | `jwt` | `nullif(current_setting('request.jwt.claims', true), '')` is a valid JSON object with no `sub` key (or `sub: null`) | `NULL` | `NULL` |
-| 3 (malformed) | `jwt` | `nullif(current_setting('request.jwt.claims', true), '')` is invalid JSON, a non-object JSON value, or has a non-null `sub` that is not a non-empty string | `NULL` | `'invalid'` |
+| 3 (malformed) | `jwt` | `nullif(current_setting('request.jwt.claims', true), '')` is invalid JSON, contains NUL (`U+0000`), is a non-object JSON value, or has a non-null `sub` that is not a non-empty string | `NULL` | `'invalid'` |
 | 4 | none | None of the above produced an actor | `NULL` | `NULL` |
 
 In all cases — including when `actor` is `NULL` — the trigger MUST still write the history row with `db_user` set to `session_user`.

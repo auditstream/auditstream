@@ -142,12 +142,12 @@ BEGIN
   END IF;
 
   needs_grant := NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'USAGE');
-  IF NOT needs_grant AND pg_catalog.current_setting('server_version_num')::int >= 160000 THEN
-    needs_grant := NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'SET');
-  END IF;
-
-  IF needs_grant THEN
-    EXECUTE pg_catalog.format('GRANT auditstream_owner TO %I', current_user);
+  IF NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'MEMBER') THEN
+    IF pg_catalog.current_setting('server_version_num')::int >= 160000 THEN
+      EXECUTE pg_catalog.format('GRANT auditstream_owner TO %I WITH INHERIT TRUE, SET TRUE', current_user);
+    ELSE
+      EXECUTE pg_catalog.format('GRANT auditstream_owner TO %I', current_user);
+    END IF;
     granted_self := true;
   END IF;
 
@@ -156,6 +156,7 @@ BEGIN
     CASE WHEN granted_self THEN '1' ELSE '0' END,
     true
   );
+  PERFORM pg_catalog.set_config('auditstream._prev_role', current_user, true);
 END
 $$;
 
@@ -208,8 +209,6 @@ CREATE TABLE IF NOT EXISTS auditstream.changes_2027_02
 
 CREATE TABLE IF NOT EXISTS auditstream.changes_default
   PARTITION OF auditstream.changes DEFAULT;
-
-SET LOCAL ROLE NONE;
 
 CREATE INDEX IF NOT EXISTS changes_occurred_at_brin_idx
   ON auditstream.changes USING brin (occurred_at);
@@ -478,19 +477,25 @@ BEGIN
 END
 $fn$;
 
-ALTER FUNCTION auditstream.log_event(text, jsonb, jsonb) OWNER TO auditstream_owner;
-
-REVOKE ALL ON SCHEMA auditstream FROM PUBLIC;
-REVOKE ALL ON auditstream.changes FROM PUBLIC;
-REVOKE ALL ON FUNCTION auditstream.resolve_actor() FROM PUBLIC;
-REVOKE ALL ON FUNCTION auditstream.log_event(text, jsonb, jsonb) FROM PUBLIC;
+REVOKE ALL ON SCHEMA auditstream FROM PUBLIC CASCADE;
+REVOKE ALL ON auditstream.changes FROM PUBLIC CASCADE;
+REVOKE ALL ON auditstream.changes_default FROM PUBLIC CASCADE;
+REVOKE ALL ON FUNCTION auditstream.resolve_actor() FROM PUBLIC CASCADE;
+REVOKE ALL ON FUNCTION auditstream.log_event(text, jsonb, jsonb) FROM PUBLIC CASCADE;
 
 GRANT USAGE ON SCHEMA auditstream TO auditstream_app;
 GRANT SELECT ON auditstream.changes TO auditstream_app;
 GRANT EXECUTE ON FUNCTION auditstream.log_event(text, jsonb, jsonb) TO auditstream_app;
 
 DO $$
+DECLARE
+  prev_role text := pg_catalog.current_setting('auditstream._prev_role', true);
 BEGIN
+  SET LOCAL ROLE NONE;
+  IF prev_role IS NOT NULL AND prev_role <> '' AND prev_role <> current_user THEN
+    EXECUTE pg_catalog.format('SET LOCAL ROLE %I', prev_role);
+  END IF;
+  PERFORM pg_catalog.set_config('auditstream._prev_role', '', true);
   IF pg_catalog.current_setting('auditstream._granted_self', true) = '1' THEN
     EXECUTE pg_catalog.format('REVOKE auditstream_owner FROM %I', current_user);
     PERFORM pg_catalog.set_config('auditstream._granted_self', '', true);

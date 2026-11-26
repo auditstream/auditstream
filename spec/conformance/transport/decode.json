@@ -389,6 +389,30 @@
         "context": null,
         "actor_source": "invalid"
       }
+    },
+    {
+      "name": "reject-nul-in-object-key",
+      "description": "JSON \\u0000 escape inside an object key yields actor_source='invalid'.",
+      "input": {
+        "sql": "UPDATE invoice SET status = 'ok' /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidTEiLCJiYWRcdTAwMDBrIjoxfQ'*/"
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": "invalid"
+      }
+    },
+    {
+      "name": "reject-nul-in-shadowed-duplicate-key",
+      "description": "JSON \\u0000 escape in an overwritten duplicate key yields actor_source='invalid' (PostgreSQL jsonb rejects before deduplication).",
+      "input": {
+        "sql": "UPDATE invoice SET status = 'ok' /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidVx1MDAwMDEiLCJpZCI6InUxIn0'*/"
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": "invalid"
+      }
     }
   ]
 }
