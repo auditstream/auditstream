@@ -365,6 +365,7 @@ async fn verify_without_selection_checks_installed_triggers_only_and_notes_on_st
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn verify_reports_invalid_exclusion_when_config_excludes_primary_key() {
     let db = TestDb::new().await.expect("create TestDb");
     create_invoice_table(&db).await;
@@ -426,6 +427,35 @@ async fn verify_reports_invalid_exclusion_when_config_excludes_primary_key() {
             .iter()
             .any(|f| f["kind"] == "invalid_exclusion" && f["severity"] == "error"),
         "expected invalid_exclusion without capture.tables, got: {parsed_installed}"
+    );
+
+    // Without `capture.tables`, configured `capture.exclude` replaces (not unions) live excludes.
+    fs::write(
+        dir.path().join("auditstream.toml"),
+        "[capture]\nexclude = [\"public.invoice.status\"]\n",
+    )
+    .expect("write swapped exclude config without capture.tables");
+    let out_swapped = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["verify", "--format", "json"])
+        .output()
+        .expect("run verify json on swapped exclude");
+    assert_eq!(out_swapped.status.code(), Some(1));
+    let parsed_swapped: serde_json::Value =
+        serde_json::from_slice(&out_swapped.stdout).expect("parse verify swapped json");
+    assert!(
+        parsed_swapped["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .any(|f| {
+                f["kind"] == "outdated"
+                    && f["detail"]
+                        .as_str()
+                        .is_some_and(|d| d.contains(r#"expected ["status"]"#))
+            }),
+        "expected outdated finding with exact configured exclude [\"status\"], got: {parsed_swapped}"
     );
 
     // Leaked child-partition privileges and PUBLIC execute on capture() report `unsafe_privileges`.

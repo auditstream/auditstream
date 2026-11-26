@@ -131,16 +131,34 @@ fn percent_decode_form_key(raw: &str) -> String {
 
 fn redact_url_password(raw: &str) -> String {
     let trimmed = raw.trim_matches(|c: char| c <= ' ');
-    if let Some(scheme_end) = trimmed.find("://") {
-        let scheme_clean: String = trimmed[..scheme_end]
-            .chars()
-            .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
-            .collect();
-        if is_valid_uri_scheme(&scheme_clean) {
-            return redact_uri_password(trimmed, scheme_end);
-        }
+    let normalized: std::borrow::Cow<'_, str> = if trimmed.contains(['\t', '\n', '\r']) {
+        std::borrow::Cow::Owned(
+            trimmed
+                .chars()
+                .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(trimmed)
+    };
+    if let Some(scheme_end) = normalized.find("://")
+        && is_valid_uri_scheme(&normalized[..scheme_end])
+    {
+        return redact_uri_password(&normalized, scheme_end);
+    }
+    if let Some(scheme_end) = normalized.find(':')
+        && is_valid_uri_scheme(&normalized[..scheme_end])
+    {
+        return redact_authorityless_uri_query(&normalized, scheme_end);
     }
     redact_libpq_kv_password(raw)
+}
+
+fn redact_authorityless_uri_query(raw: &str, scheme_end: usize) -> String {
+    let mut out = String::with_capacity(raw.len());
+    out.push_str(&raw[..=scheme_end]);
+    append_redacted_uri_tail(&mut out, &raw[scheme_end + 1..]);
+    out
 }
 
 fn is_host_port_authority(authority: &str) -> bool {
@@ -168,6 +186,40 @@ fn tail_at_is_query_value(tail: &str, at_in_tail: usize) -> bool {
         .is_some_and(|q_pos| tail[q_pos + 1..at_in_tail].contains('='))
 }
 
+fn append_redacted_uri_tail(out: &mut String, tail: &str) {
+    let hash_pos = tail.find('#');
+    let q_limit = hash_pos.unwrap_or(tail.len());
+    let Some(q_pos) = tail[..q_limit].find('?') else {
+        out.push_str(tail);
+        return;
+    };
+
+    out.push_str(&tail[..=q_pos]);
+    let after_q = &tail[q_pos + 1..];
+    let (query, fragment) = match after_q.find('#') {
+        Some(h) => (&after_q[..h], &after_q[h..]),
+        None => (after_q, ""),
+    };
+
+    for (idx, pair) in query.split('&').enumerate() {
+        if idx > 0 {
+            out.push('&');
+        }
+        if let Some(eq_pos) = pair.find('=') {
+            let key = &pair[..eq_pos];
+            let decoded_key = percent_decode_form_key(key);
+            if is_secret_pg_param(&decoded_key) {
+                out.push_str(key);
+                out.push_str("=***");
+                continue;
+            }
+        }
+        out.push_str(pair);
+    }
+
+    out.push_str(fragment);
+}
+
 fn redact_uri_password(raw: &str, scheme_end: usize) -> String {
     let rest = &raw[scheme_end + 3..];
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
@@ -176,16 +228,21 @@ fn redact_uri_password(raw: &str, scheme_end: usize) -> String {
 
     // If an unencoded `/`, `?`, or `#` appeared inside an authority password (for example
     // `postgresql://app:abc/def@host/db`, `postgresql://app:1234/secret@host/db`, or
-    // `postgresql://app:p1@p2/secret@host/db`), re-slice at the final `@` (or fail closed) so raw
-    // credentials are never echoed, while preserving legitimate `@` inside query values such as
-    // `postgresql://host:5432/db?application_name=ops@corp.com`.
-    let has_later_authority_at = authority.contains(':')
-        && rest.rfind('@').is_some_and(|last_at| {
-            last_at > authority_end && !tail_at_is_query_value(tail, last_at - authority_end)
-        });
+    // `postgresql://app:p1@p2/secret@host/db?application_name=ops@corp.com`), re-slice at the
+    // rightmost `@` outside query values (or fail closed) so raw credentials are never echoed,
+    // while preserving legitimate `@` inside query values.
+    let last_non_query_at = rest
+        .match_indices('@')
+        .rev()
+        .find(|&(pos, _)| {
+            pos <= authority_end || !tail_at_is_query_value(tail, pos - authority_end)
+        })
+        .map(|(pos, _)| pos);
+    let has_later_authority_at =
+        authority.contains(':') && last_non_query_at.is_some_and(|pos| pos > authority_end);
     let malformed_authority = !authority.contains('@') && !is_host_port_authority(authority);
     if malformed_authority || has_later_authority_at {
-        if let Some(later_at) = rest.rfind('@') {
+        if let Some(later_at) = last_non_query_at.filter(|&pos| pos > authority_end) {
             let after_at = &rest[later_at + 1..];
             let host_end = after_at.find(['/', '?', '#']).unwrap_or(after_at.len());
             let new_end = later_at + 1 + host_end;
@@ -212,35 +269,7 @@ fn redact_uri_password(raw: &str, scheme_end: usize) -> String {
         out.push_str(authority);
     }
 
-    let Some(q_pos) = tail.find('?') else {
-        out.push_str(tail);
-        return out;
-    };
-
-    out.push_str(&tail[..=q_pos]);
-    let after_q = &tail[q_pos + 1..];
-    let (query, fragment) = match after_q.find('#') {
-        Some(hash_pos) => (&after_q[..hash_pos], &after_q[hash_pos..]),
-        None => (after_q, ""),
-    };
-
-    for (idx, pair) in query.split('&').enumerate() {
-        if idx > 0 {
-            out.push('&');
-        }
-        if let Some(eq_pos) = pair.find('=') {
-            let key = &pair[..eq_pos];
-            let decoded_key = percent_decode_form_key(key);
-            if is_secret_pg_param(&decoded_key) {
-                out.push_str(key);
-                out.push_str("=***");
-                continue;
-            }
-        }
-        out.push_str(pair);
-    }
-
-    out.push_str(fragment);
+    append_redacted_uri_tail(&mut out, tail);
     out
 }
 
@@ -880,6 +909,7 @@ batch_size = 250
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn redacted_url_handles_adversarial_bypasses_and_toml_parse_errors_hide_secrets() {
         let pw1 = "s3cr3t_alpha";
         let pw2 = "s3cr3t_beta";
@@ -927,8 +957,25 @@ batch_size = 250
             format!("{scheme}app:1234#{pw1}@db.example.com:5432/prod"),
             format!("{scheme}app:p1@p2/{pw1}@db.example.com:5432/prod"),
             format!("{scheme}app:p1/p2@p3/{pw1}@db.example.com:5432/prod"),
+            format!(
+                "{scheme}app:1234/{pw1}@db.example.com:5432/prod?application_name=ops@corp.com"
+            ),
+            format!(
+                "{scheme}app:p1@p2/{pw1}@db.example.com:5432/prod?application_name=ops@corp.com"
+            ),
+            format!(
+                "{scheme}app:abc/{pw1}@db.example.com/prod?application_name=ops@corp.com&password={pw2}"
+            ),
+            format!("{scheme}app:abc/{pw1}?application_name=ops@corp.com&password={pw2}"),
             format!("{scheme}app:{pw1}/no-at-sign"),
             format!(" \t{scheme}app:{pw1}@db.example.com:5432/prod "),
+            format!("postgresql:\t//app:{pw1}@db.example.com:5432/prod"),
+            format!("postgresql:/\n/app:{pw1}@db.example.com:5432/prod"),
+            format!(
+                "{scheme}app@db.example.com:5432/prod?%7\t0assword={pw1}&%\n73slpassword={pw2}"
+            ),
+            format!("postgresql:?host=localhost&password={pw1}&sslpassword={pw2}"),
+            format!("postgres:prod?oauth_client_secret={pw1}"),
             format!(
                 "{scheme}app@db.example.com:5432/prod?ssl\tpassword={pw1}&ssl-password={pw2}&oauth_client_secret={pw1}"
             ),
@@ -936,6 +983,20 @@ batch_size = 250
             let red = RedactedUrl::new(bad_uri).redacted();
             assert!(!red.contains(pw1) && !red.contains(pw2), "leaked: {red}");
         }
+        assert_eq!(
+            RedactedUrl::new(format!(
+                "{scheme}app:1234/{pw1}@db.example.com:5432/prod?application_name=ops@corp.com"
+            ))
+            .redacted(),
+            "postgresql://app:***@db.example.com:5432/prod?application_name=ops@corp.com"
+        );
+        assert_eq!(
+            RedactedUrl::new(format!(
+                "{scheme}app:abc/{pw1}@db.example.com/prod?application_name=ops@corp.com&password={pw2}"
+            ))
+            .redacted(),
+            "postgresql://app:***@db.example.com/prod?application_name=ops@corp.com&password=***"
+        );
         let safe_query_at =
             format!("{scheme}db.example.com:5432/prod?application_name=ops@corp.com");
         assert_eq!(

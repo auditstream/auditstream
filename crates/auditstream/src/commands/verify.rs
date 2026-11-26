@@ -147,12 +147,13 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
 
         let mut specs = build_installed_verify_specs(&installed, &introspected_map);
         for spec in &mut specs {
-            if let Some(extra_excludes) =
+            if let Some(configured_excludes) =
                 excludes_by_table.get(&(spec.schema.clone(), spec.table.clone()))
             {
-                spec.excluded_columns.extend(extra_excludes.iter().cloned());
-                spec.excluded_columns.sort();
-                spec.excluded_columns.dedup();
+                let mut cols: Vec<String> = configured_excludes.iter().cloned().collect();
+                cols.sort();
+                cols.dedup();
+                spec.excluded_columns = cols;
             }
         }
         specs
