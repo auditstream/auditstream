@@ -14,9 +14,7 @@ pub(crate) fn resolve_filter(verbose: u8, quiet: bool, env_log: Option<&str>) ->
     if let Some(directive) = env_log.map(str::trim).filter(|val| !val.is_empty()) {
         let overrides_sqlx_options = directive.split(',').any(|part| {
             let part = part.trim();
-            part == "sqlx_postgres::options"
-                || part.starts_with("sqlx_postgres::options=")
-                || part.starts_with("sqlx_postgres::options[")
+            part == "sqlx_postgres::options" || part.starts_with("sqlx_postgres::options=")
         });
         if overrides_sqlx_options {
             return directive.to_owned();
@@ -92,6 +90,18 @@ mod tests {
         assert_eq!(
             resolve_filter(0, false, Some("debug,sqlx_postgres::options::pgpass=error")),
             "sqlx_postgres::options=error,debug,sqlx_postgres::options::pgpass=error"
+        );
+        assert_eq!(
+            resolve_filter(
+                0,
+                false,
+                Some("debug,sqlx_postgres::options[connect]=error")
+            ),
+            "sqlx_postgres::options=error,debug,sqlx_postgres::options[connect]=error"
+        );
+        assert_eq!(
+            resolve_filter(0, false, Some("debug,sqlx_postgres::options[{key}]=error")),
+            "sqlx_postgres::options=error,debug,sqlx_postgres::options[{key}]=error"
         );
         assert!(
             super::EnvFilter::try_new(resolve_filter(

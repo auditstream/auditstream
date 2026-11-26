@@ -149,15 +149,34 @@ fn redact_url_password(raw: &str) -> String {
     if let Some(scheme_end) = normalized.find(':')
         && is_valid_uri_scheme(&normalized[..scheme_end])
     {
-        return redact_authorityless_uri_query(&normalized, scheme_end);
+        let uri_redacted = redact_authorityless_uri(&normalized, scheme_end);
+        if uri_redacted.chars().any(char::is_whitespace) {
+            return redact_libpq_kv_password(&uri_redacted);
+        }
+        return uri_redacted;
     }
     redact_libpq_kv_password(raw)
 }
 
-fn redact_authorityless_uri_query(raw: &str, scheme_end: usize) -> String {
+fn redact_authorityless_uri(raw: &str, scheme_end: usize) -> String {
+    let after_scheme = &raw[scheme_end + 1..];
+    let q_or_hash = after_scheme.find(['?', '#']).unwrap_or(after_scheme.len());
+    let head = &after_scheme[..q_or_hash];
+    let tail = &after_scheme[q_or_hash..];
+
     let mut out = String::with_capacity(raw.len());
     out.push_str(&raw[..=scheme_end]);
-    append_redacted_uri_tail(&mut out, &raw[scheme_end + 1..]);
+    if !head.chars().any(char::is_whitespace)
+        && let Some(at_pos) = head.rfind('@')
+        && let Some(colon_pos) = head[..at_pos].find(':')
+    {
+        out.push_str(&head[..=colon_pos]);
+        out.push_str("***");
+        out.push_str(&head[at_pos..]);
+    } else {
+        out.push_str(head);
+    }
+    append_redacted_uri_tail(&mut out, tail);
     out
 }
 
@@ -181,9 +200,11 @@ fn is_host_port_authority(authority: &str) -> bool {
 }
 
 fn tail_at_is_query_value(tail: &str, at_in_tail: usize) -> bool {
-    tail[..at_in_tail]
-        .find('?')
-        .is_some_and(|q_pos| tail[q_pos + 1..at_in_tail].contains('='))
+    let prefix = &tail[..at_in_tail];
+    !prefix.contains('#')
+        && prefix
+            .find('?')
+            .is_some_and(|q_pos| prefix[q_pos + 1..].contains('='))
 }
 
 fn append_redacted_uri_tail(out: &mut String, tail: &str) {
@@ -976,6 +997,14 @@ batch_size = 250
             ),
             format!("postgresql:?host=localhost&password={pw1}&sslpassword={pw2}"),
             format!("postgres:prod?oauth_client_secret={pw1}"),
+            format!("postgresql:app:{pw1}@db.example.com:5432/prod"),
+            format!("postgresql:app:1234/{pw1}@db.example.com:5432/prod?sslpassword={pw2}"),
+            format!("{scheme}app:1234#frag?k={pw1}@db.example.com:5432/prod"),
+            format!("{scheme}app:p1@p2#frag?k={pw1}@db.example.com:5432/prod"),
+            format!("foo:bar password={pw1}"),
+            format!("db.example.com:5432 password={pw1}"),
+            format!("postgresql: host=localhost password={pw1}"),
+            format!("foo:bar?baz=1 password={pw1}"),
             format!(
                 "{scheme}app@db.example.com:5432/prod?ssl\tpassword={pw1}&ssl-password={pw2}&oauth_client_secret={pw1}"
             ),
