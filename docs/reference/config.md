@@ -21,10 +21,10 @@ Values resolve in strict order (first non-empty source wins):
 
 | Key | Type | Default | Flag | Environment |
 | --- | --- | --- | --- | --- |
-| `database_url` | string | none | `--database-url` | `AUDITSTREAM_DATABASE_URL`, then `DATABASE_URL` |
+| `database_url` | string | none | `--database-url` | `AUDITSTREAM_DATABASE_URL`, then `DATABASE_URL` (use `sslmode=verify-full` for non-loopback hosts) |
 | `schema` | string | `auditstream` | `--schema` | `AUDITSTREAM_SCHEMA` |
 | `capture.tables` | list of `schema.table` | `[]` | `init --table` | none |
-| `capture.exclude` | list of `schema.table.column` | `[]` | `init --exclude` | none |
+| `capture.exclude` | list of `schema.table.column` (non-primary-key columns only) | `[]` | `init --exclude` | none |
 | `migrations.format` | `prisma`, `drizzle` or `sql` | none | `init --migrations` | none |
 | `migrations.dir` | path | per format | `init --out` | none |
 | `export.cursor_file` | path | none | `export --cursor-file` | none |
