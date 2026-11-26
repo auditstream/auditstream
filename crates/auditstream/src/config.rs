@@ -881,15 +881,15 @@ batch_size = 250
         );
 
         // 9. Unencoded `/`, `?`, or `#` inside URI authority passwords never leak credentials.
-        for bad_uri in [
-            format!("postgresql://app:abc/{pw1}@db.example.com:5432/prod"),
-            format!("postgresql://app:abc?{pw1}@db.example.com:5432/prod"),
-            format!("postgresql://app:abc#{pw1}@db.example.com:5432/prod"),
-            format!("postgresql://app:{pw1}/no-at-sign"),
-        ] {
+        let prefix = "part1";
+        for sep in ['/', '?', '#'] {
+            let bad_uri = format!("postgresql://app:{prefix}{sep}{pw1}@db.example.com:5432/prod");
             let red = RedactedUrl::new(bad_uri).redacted();
-            assert!(!red.contains(pw1) && !red.contains("abc"), "leaked: {red}");
+            assert!(!red.contains(pw1) && !red.contains(prefix), "leaked: {red}");
         }
+        let no_at = format!("postgresql://app:{pw1}/no-at-sign");
+        let red_no_at = RedactedUrl::new(no_at).redacted();
+        assert!(!red_no_at.contains(pw1), "leaked: {red_no_at}");
 
         // 10. Libpq KV empty unquoted value or unclosed single quote before `password=` never leaks.
         let kv_empty_prev = format!("host=db.example.com sslrootcert= password={pw1} dbname=prod");

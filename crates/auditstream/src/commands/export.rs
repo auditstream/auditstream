@@ -625,14 +625,21 @@ async fn export_with_pool(
         .restore_output(args.from_start)
         .context("recovering export output")
         .exit_code(Exit::Io)?;
-    if let Some(path) = sink_path(&opened.checkpoint.sink)
-        && fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
-    {
-        return Err(anyhow!(
-            "opening export output: {} is a directory",
-            path.display()
-        ))
-        .exit_code(Exit::Io);
+    if let Some(path) = sink_path(&opened.checkpoint.sink) {
+        let check_path = path.to_path_buf();
+        let is_dir = tokio::task::spawn_blocking(move || {
+            fs::symlink_metadata(&check_path).is_ok_and(|meta| meta.file_type().is_dir())
+        })
+        .await
+        .context("checking export output path")
+        .exit_code(Exit::Io)?;
+        if is_dir {
+            return Err(anyhow!(
+                "opening export output: {} is a directory",
+                path.display()
+            ))
+            .exit_code(Exit::Io);
+        }
     }
 
     let had_saved = opened.had_saved;
