@@ -100,7 +100,7 @@ Requirements:
 - **Partition creation under owner role (`ALTER DEFAULT PRIVILEGES` immunity):** `auditstream.changes`, `changes_default`, and every `changes_YYYY_MM` partition MUST be created under `auditstream_owner` (via `SET LOCAL ROLE auditstream_owner`). Child partitions and `changes_id_seq` MUST NOT grant any privileges to `PUBLIC` or non-owner roles, `auditstream.changes` MUST NOT grant write privileges (`INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`, `TRIGGER`, or `MAINTAIN`), column-level write grants, or `WITH GRANT OPTION` to `PUBLIC` or non-owner roles, and `auditstream.capture()` / `auditstream.resolve_actor()` MUST NOT grant `EXECUTE` to `PUBLIC` or non-owner roles, even when the migration role has `ALTER DEFAULT PRIVILEGES ... GRANT ALL ON TABLES/SEQUENCES/FUNCTIONS TO <app_role>`.
 - **`SECURITY DEFINER`, `search_path`, and parent validation:** `auditstream.capture()`, `auditstream.log_event()`, and any helper invoked by them MUST be `SECURITY DEFINER`, owned by `auditstream_owner`, declared with `SET search_path = pg_catalog, pg_temp`, and MUST reference all objects by schema-qualified names. When `auditstream.capture()` receives explicit parent table arguments (`TG_NARGS >= 4`), it MUST verify that `TG_RELID` equals or is a partition descendant (`pg_catalog.pg_partition_ancestors(TG_RELID)`) of that parent table and raise `42501` otherwise.
 - **Application role grants:** application roles MUST receive `USAGE` on `auditstream`, `SELECT` on `auditstream.changes`, and `EXECUTE` on `auditstream.log_event(text, jsonb, jsonb)`. Application roles MUST NOT receive `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, or `WITH GRANT OPTION` on `auditstream.changes` or any grant on child partitions or `changes_id_seq`; their writes to audited tables are still captured through the `SECURITY DEFINER` trigger.
-- **Managed PostgreSQL self-grant rule (PostgreSQL 16+):** on managed PostgreSQL (such as Neon and Supabase), migrations run as a `CREATEROLE` non-superuser role. Starting in PostgreSQL 16 (`createrole_self_grant = ''`), creating a role grants only `ADMIN`, not `USAGE` or `SET`. Setup MUST run inside a single transaction, check `pg_has_role(current_user, 'auditstream_owner', 'USAGE')` and `'SET'` on PostgreSQL 16+ (`'MEMBER'` on PostgreSQL 15), explicitly specify both `INHERIT` and `SET` when creating a temporary self-grant row on PostgreSQL 16+ (so PostgreSQL never defaults an omitted option to `TRUE`), record the temporary grant mode in a transaction-local GUC (`set_config(..., true)`), and revoke only that temporary grant before commit so failed or interrupted migrations never persist elevated role membership.
+- **Managed PostgreSQL self-grant rule (PostgreSQL 16+):** on managed PostgreSQL (such as Neon and Supabase), migrations run as a `CREATEROLE` non-superuser role. Starting in PostgreSQL 16 (`createrole_self_grant = ''`), creating a role grants only `ADMIN`, not `USAGE` or `SET`. Setup MUST run inside a single transaction, clear `createrole_self_grant` locally while creating `auditstream_owner`, check `pg_has_role(current_user, 'auditstream_owner', 'SET')` on PostgreSQL 16+ (`'MEMBER'` on PostgreSQL 15), explicitly specify `WITH INHERIT FALSE, SET TRUE` (and `GRANTED BY`) when creating a temporary self-grant row on PostgreSQL 16+ (so PostgreSQL never defaults `INHERIT` to `TRUE` or clobbers group-granted memberships), record the temporary grant mode in a transaction-local GUC (`set_config(..., true)`), and revoke only that temporary grant before commit so failed or interrupted migrations never persist elevated role membership.
 - **Role reuse rule:** setup MUST reuse existing roles (`auditstream_owner` and application roles) and MUST NEVER drop and recreate them. Connection poolers retain sessions authenticated as the original role OID, causing subsequent queries to fail with `permission denied` if the role is dropped.
 
 ## Export cursor contract
@@ -133,8 +133,6 @@ DECLARE
   grant_mode text := 'none';
   grantor_role text := '';
   grantor_oid oid;
-  need_inherit boolean := false;
-  need_set boolean := false;
   has_grantor_row boolean := false;
   prev_self_grant text;
 BEGIN
@@ -154,9 +152,7 @@ BEGIN
   END IF;
 
   IF pg_catalog.current_setting('server_version_num')::int >= 160000 THEN
-    need_inherit := NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'USAGE');
-    need_set := NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'SET');
-    IF need_inherit OR need_set THEN
+    IF NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'SET') THEN
       SELECT m.member
         INTO grantor_oid
         FROM pg_catalog.pg_auth_members m
@@ -169,10 +165,8 @@ BEGIN
        LIMIT 1;
       IF grantor_oid IS NULL THEN
         EXECUTE pg_catalog.format(
-          'GRANT auditstream_owner TO %I WITH INHERIT %s, SET %s',
-          current_user,
-          CASE WHEN need_inherit THEN 'TRUE' ELSE 'FALSE' END,
-          CASE WHEN need_set THEN 'TRUE' ELSE 'FALSE' END
+          'GRANT auditstream_owner TO %I WITH INHERIT FALSE, SET TRUE',
+          current_user
         );
         grant_mode := 'self_row';
       ELSE
@@ -188,27 +182,11 @@ BEGIN
         ) INTO has_grantor_row;
         IF NOT has_grantor_row THEN
           EXECUTE pg_catalog.format(
-            'GRANT auditstream_owner TO %I WITH INHERIT %s, SET %s GRANTED BY %I',
+            'GRANT auditstream_owner TO %I WITH INHERIT FALSE, SET TRUE GRANTED BY %I',
             current_user,
-            CASE WHEN need_inherit THEN 'TRUE' ELSE 'FALSE' END,
-            CASE WHEN need_set THEN 'TRUE' ELSE 'FALSE' END,
             grantor_role
           );
           grant_mode := 'self_row';
-        ELSIF need_inherit AND need_set THEN
-          EXECUTE pg_catalog.format(
-            'GRANT auditstream_owner TO %I WITH INHERIT TRUE, SET TRUE GRANTED BY %I',
-            current_user,
-            grantor_role
-          );
-          grant_mode := 'both';
-        ELSIF need_inherit THEN
-          EXECUTE pg_catalog.format(
-            'GRANT auditstream_owner TO %I WITH INHERIT TRUE GRANTED BY %I',
-            current_user,
-            grantor_role
-          );
-          grant_mode := 'inherit';
         ELSE
           EXECUTE pg_catalog.format(
             'GRANT auditstream_owner TO %I WITH SET TRUE GRANTED BY %I',
@@ -577,11 +555,6 @@ BEGIN
   END IF;
   IF grant_mode = 'self_row' THEN
     EXECUTE pg_catalog.format('REVOKE auditstream_owner FROM %I', current_user) || granted_by;
-  ELSIF grant_mode = 'both' THEN
-    EXECUTE pg_catalog.format('REVOKE INHERIT OPTION FOR auditstream_owner FROM %I', current_user) || granted_by;
-    EXECUTE pg_catalog.format('REVOKE SET OPTION FOR auditstream_owner FROM %I', current_user) || granted_by;
-  ELSIF grant_mode = 'inherit' THEN
-    EXECUTE pg_catalog.format('REVOKE INHERIT OPTION FOR auditstream_owner FROM %I', current_user) || granted_by;
   ELSIF grant_mode = 'set' THEN
     EXECUTE pg_catalog.format('REVOKE SET OPTION FOR auditstream_owner FROM %I', current_user) || granted_by;
   END IF;
