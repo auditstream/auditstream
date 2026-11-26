@@ -444,8 +444,8 @@ async fn ensure_ahead_under_alter_default_privileges_keeps_child_partitions_appe
         }
     }
 
-    // No-op ensure_ahead (when all target months already exist) must succeed without requiring
-    // auditstream_owner elevation (even as app_role, which holds zero membership in auditstream_owner).
+    // No-op ensure_ahead, history_stats, and coverage must all succeed as least-privilege
+    // app_role (USAGE on schema + SELECT on parent changes, zero grants on child partitions).
     let app_pool = auditstream_pg::connect(&app_url)
         .await
         .expect("connect app_pool");
@@ -454,6 +454,15 @@ async fn ensure_ahead_under_alter_default_privileges_keeps_child_partitions_appe
         .expect("no-op ensure_ahead must not require auditstream_owner membership");
     assert_eq!(noop.created, Vec::new());
     assert_eq!(noop.skipped.len(), 6);
+    let history = partitions::history_stats(&app_pool, DEFAULT_SCHEMA)
+        .await
+        .expect("history_stats must succeed as SELECT-only app_role without child grants");
+    assert!(history.exists);
+    assert!(!history.default_has_rows);
+    let cov = partitions::coverage(&app_pool, DEFAULT_SCHEMA)
+        .await
+        .expect("coverage must succeed as SELECT-only app_role without child grants");
+    assert_eq!(cov.default_row_count, 0);
     app_pool.close().await;
 
     app_conn.close().await.expect("close app_conn");
@@ -465,6 +474,126 @@ async fn ensure_ahead_under_alter_default_privileges_keeps_child_partitions_appe
         .execute(AssertSqlSafe(format!(
             "DROP ROLE IF EXISTS {}",
             quote_ident(&app_role)
+        )))
+        .await;
+    let _ = admin.close().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn partition_bot_with_admin_only_never_gains_permanent_inherit_on_ensure_ahead() {
+    let _lock = TestDb::cluster_lock().await.expect("acquire cluster lock");
+    let db = TestDb::new().await.expect("create TestDb");
+    let admin_url = db.admin_url().to_owned();
+    let ddl_stmts = ddl::generate(&DdlOptions::new(DEFAULT_SCHEMA, vec![]));
+    {
+        let mut tx = db.pool().begin().await.expect("begin ddl tx");
+        for stmt in ddl_stmts {
+            tx.execute(AssertSqlSafe(stmt)).await.expect("apply D2 DDL");
+        }
+        tx.commit().await.expect("commit ddl tx");
+    }
+
+    let pg_version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+        .fetch_one(db.pool())
+        .await
+        .expect("read server_version_num");
+
+    let bot_role = format!("part_bot_{}", db.database_name());
+    let bot_pw = "part_bot_pw";
+    db.execute(&format!(
+        "CREATE ROLE {} LOGIN PASSWORD '{}'",
+        quote_ident(&bot_role),
+        bot_pw,
+    ))
+    .await
+    .expect("create partition_bot role");
+    if pg_version >= 160_000 {
+        db.execute(&format!(
+            "GRANT {} TO {} WITH ADMIN OPTION, INHERIT FALSE, SET FALSE",
+            quote_ident(OWNER_ROLE),
+            quote_ident(&bot_role),
+        ))
+        .await
+        .expect("grant admin-only membership on PG 16+");
+    } else {
+        db.execute(&format!("ALTER ROLE {} CREATEROLE", quote_ident(&bot_role)))
+            .await
+            .expect("grant CREATEROLE on PG 15");
+    }
+
+    let base = db.url();
+    let (scheme, rest) = base.split_once("://").expect("valid postgres URL");
+    let (_, host_and_db) = rest.split_once('@').expect("URL has credentials");
+    let bot_url = format!("{scheme}://{bot_role}:{bot_pw}@{host_and_db}");
+    let bot_pool = auditstream_pg::connect(&bot_url)
+        .await
+        .expect("connect bot_pool");
+
+    let report = partitions::ensure_ahead(&bot_pool, DEFAULT_SCHEMA, 5)
+        .await
+        .expect("partition_bot ensure_ahead succeeds");
+    assert_eq!(report.created.len(), 2);
+
+    // After commit, partition_bot must NOT inherit auditstream_owner or retain SET/zombie rows.
+    let has_usage: bool = sqlx::query_scalar("SELECT pg_catalog.pg_has_role($1, $2, 'USAGE')")
+        .bind(&bot_role)
+        .bind(OWNER_ROLE)
+        .fetch_one(db.pool())
+        .await
+        .expect("check bot USAGE");
+    assert!(
+        !has_usage,
+        "ensure_ahead must never leave partition_bot with permanent INHERIT/USAGE on {OWNER_ROLE}"
+    );
+    if pg_version >= 160_000 {
+        let has_set: bool = sqlx::query_scalar("SELECT pg_catalog.pg_has_role($1, $2, 'SET')")
+            .bind(&bot_role)
+            .bind(OWNER_ROLE)
+            .fetch_one(db.pool())
+            .await
+            .expect("check bot SET");
+        assert!(
+            !has_set,
+            "ensure_ahead must never leave partition_bot with permanent SET on {OWNER_ROLE}"
+        );
+        let has_self_zombie: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+               SELECT 1 FROM pg_catalog.pg_auth_members m \
+               JOIN pg_catalog.pg_roles r ON r.oid = m.roleid \
+               JOIN pg_catalog.pg_roles u ON u.oid = m.member \
+              WHERE r.rolname = $2 AND u.rolname = $1 AND m.grantor = u.oid \
+             )",
+        )
+        .bind(&bot_role)
+        .bind(OWNER_ROLE)
+        .fetch_one(db.pool())
+        .await
+        .expect("check self-granted zombie row");
+        assert!(
+            !has_self_zombie,
+            "ensure_ahead must not leave a self-granted zombie row in pg_auth_members"
+        );
+    }
+
+    let del_err = bot_pool
+        .execute("DELETE FROM auditstream.changes")
+        .await
+        .expect_err("partition_bot must not be able to DELETE from auditstream.changes");
+    assert!(
+        del_err.to_string().contains("permission denied"),
+        "expected permission denied for bot DELETE, got {del_err}"
+    );
+
+    bot_pool.close().await;
+    drop(db);
+    let mut admin = PgConnection::connect(&admin_url)
+        .await
+        .expect("admin cleanup");
+    let _ = admin
+        .execute(AssertSqlSafe(format!(
+            "DROP ROLE IF EXISTS {}",
+            quote_ident(&bot_role)
         )))
         .await;
     let _ = admin.close().await;

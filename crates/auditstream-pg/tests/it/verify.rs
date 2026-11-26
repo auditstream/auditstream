@@ -473,30 +473,83 @@ async fn reports_error_when_primary_key_column_is_excluded() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn reports_unsafe_privileges_and_invalid_ownership_across_history_objects() {
-    let db = TestDb::new().await.expect("create TestDb");
-    create_invoice_table(&db).await;
-    let specs = vec![invoice_spec(vec!["password_hash"])];
-    install_fixture(&db, &specs).await;
+    use auditstream_pg::ddl::quote_ident;
+    use sqlx::Connection;
 
-    // Inject unsafe ACLs across schema, parent changes, child partition, identity sequence, and functions,
-    // plus wrong owner on changes_default.
+    let db = TestDb::new().await.expect("create TestDb");
+    let admin_url = db.admin_url().to_owned();
+    create_invoice_table(&db).await;
+    // Also exercise unsorted excluded_columns in triggers::generate + verify::check parity.
+    let specs = vec![invoice_spec(vec!["password_hash", "status"])];
+    let unsorted_specs = vec![invoice_spec(vec!["status", "password_hash"])];
+    install_fixture(&db, &unsorted_specs).await;
+
+    // 1. Legitimate least-privilege app_role (USAGE + parent SELECT + EXECUTE log_event, zero
+    //    child grants) must produce zero findings AND run `verify::check` itself cleanly!
+    let app_role = format!("verify_app_{}", db.database_name());
+    let app_pw = "verify_app_pw";
+    db.execute(&format!(
+        "CREATE ROLE {} LOGIN PASSWORD '{}'; \
+         GRANT USAGE ON SCHEMA auditstream TO {}; \
+         GRANT SELECT ON TABLE auditstream.changes TO {}; \
+         GRANT EXECUTE ON FUNCTION auditstream.log_event(text, jsonb, jsonb) TO {};",
+        quote_ident(&app_role),
+        app_pw,
+        quote_ident(&app_role),
+        quote_ident(&app_role),
+        quote_ident(&app_role),
+    ))
+    .await
+    .expect("create least-privilege app_role");
+
+    let base = db.url();
+    let (scheme, rest) = base.split_once("://").expect("valid postgres URL");
+    let (_, host_and_db) = rest.split_once('@').expect("URL has credentials");
+    let app_url = format!("{scheme}://{app_role}:{app_pw}@{host_and_db}");
+    let app_pool = auditstream_pg::connect(&app_url)
+        .await
+        .expect("connect app_pool");
+
+    let clean_as_app = verify::check(&app_pool, &specs)
+        .await
+        .expect("verify::check must succeed as least-privilege app_role without child grants");
+    assert!(
+        clean_as_app.is_clean(),
+        "legitimate app_role grants and unsorted triggers::generate excludes must be clean, got: {:?}",
+        clean_as_app.findings
+    );
+    app_pool.close().await;
+
+    // 2. Inject unsafe named-role ACLs (including column-level attacl and GRANT OPTION) across all
+    //    7 history object types, plus wrong ownership across schema, changes (+ sequence),
+    //    changes_default, capture(), resolve_actor(), and log_event().
+    let app_q = quote_ident(&app_role);
     for sql in [
-        "GRANT CREATE ON SCHEMA auditstream TO PUBLIC",
-        "GRANT INSERT ON TABLE auditstream.changes TO PUBLIC",
-        "GRANT DELETE ON TABLE auditstream.changes_default TO PUBLIC",
-        "GRANT USAGE ON SEQUENCE auditstream.changes_id_seq TO PUBLIC",
-        "GRANT EXECUTE ON FUNCTION auditstream.capture() TO PUBLIC",
-        "GRANT EXECUTE ON FUNCTION auditstream.resolve_actor() TO PUBLIC",
-        "GRANT EXECUTE ON FUNCTION auditstream.log_event(text, jsonb, jsonb) TO PUBLIC",
-        "ALTER TABLE auditstream.changes_default OWNER TO CURRENT_USER",
+        format!("GRANT CREATE ON SCHEMA auditstream TO {app_q}"),
+        format!("GRANT UPDATE (actor) ON TABLE auditstream.changes TO {app_q}"),
+        format!("GRANT SELECT ON TABLE auditstream.changes TO {app_q} WITH GRANT OPTION"),
+        format!("GRANT SELECT ON TABLE auditstream.changes_default TO {app_q}"),
+        format!("GRANT USAGE ON SEQUENCE auditstream.changes_id_seq TO {app_q}"),
+        format!("GRANT EXECUTE ON FUNCTION auditstream.capture() TO {app_q}"),
+        format!("GRANT EXECUTE ON FUNCTION auditstream.resolve_actor() TO {app_q}"),
+        format!(
+            "GRANT EXECUTE ON FUNCTION auditstream.log_event(text, jsonb, jsonb) TO {app_q} WITH GRANT OPTION"
+        ),
+        "ALTER SCHEMA auditstream OWNER TO CURRENT_USER".to_owned(),
+        "ALTER TABLE auditstream.changes OWNER TO CURRENT_USER".to_owned(),
+        "ALTER TABLE auditstream.changes_default OWNER TO CURRENT_USER".to_owned(),
+        "ALTER FUNCTION auditstream.capture() OWNER TO CURRENT_USER".to_owned(),
+        "ALTER FUNCTION auditstream.resolve_actor() OWNER TO CURRENT_USER".to_owned(),
+        "ALTER FUNCTION auditstream.log_event(text, jsonb, jsonb) OWNER TO CURRENT_USER".to_owned(),
     ] {
-        db.execute(sql).await.expect(sql);
+        db.execute(&sql).await.expect(&sql);
     }
 
     let report = verify::check(db.pool(), &specs)
         .await
-        .expect("verify unsafe privileges");
+        .expect("verify unsafe privileges and ownership");
     assert!(report.has_errors());
 
     for expected_obj in [
@@ -517,18 +570,27 @@ async fn reports_unsafe_privileges_and_invalid_ownership_across_history_objects(
             "expected UnsafePrivileges finding for {expected_obj}, got: {:?}",
             report.findings
         );
+        assert!(
+            report.findings.iter().any(|f| {
+                f.kind == FindingKind::InvalidOwnership
+                    && f.severity == Severity::Error
+                    && f.object == expected_obj
+            }),
+            "expected InvalidOwnership finding for {expected_obj}, got: {:?}",
+            report.findings
+        );
     }
     assert!(
         report.findings.iter().any(|f| {
-            f.kind == FindingKind::InvalidOwnership
-                && f.severity == Severity::Error
-                && f.object == "auditstream.changes_default"
+            f.kind == FindingKind::UnsafePrivileges
+                && f.object == "auditstream.changes"
+                && f.detail.contains("UPDATE (actor)")
         }),
-        "expected InvalidOwnership finding for changes_default, got: {:?}",
+        "expected column-level attacl finding for UPDATE (actor), got: {:?}",
         report.findings
     );
 
-    // Re-applying DDL + triggers heals every ownership and ACL finding.
+    // 3. Re-applying DDL + triggers heals every ownership and ACL finding (including attacl).
     install_fixture(&db, &specs).await;
     let healed = verify::check(db.pool(), &specs)
         .await
@@ -538,4 +600,29 @@ async fn reports_unsafe_privileges_and_invalid_ownership_across_history_objects(
         "expected clean verify after re-applying DDL + triggers, got: {:?}",
         healed.findings
     );
+
+    // 4. Dropping log_event is reported as Missing.
+    db.execute("DROP FUNCTION auditstream.log_event(text, jsonb, jsonb)")
+        .await
+        .expect("drop log_event");
+    let missing_log_event = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify missing log_event");
+    assert!(
+        missing_log_event.findings.iter().any(|f| {
+            f.kind == FindingKind::Missing
+                && f.object == "auditstream.log_event(text, jsonb, jsonb)"
+        }),
+        "expected Missing finding for dropped log_event, got: {:?}",
+        missing_log_event.findings
+    );
+
+    drop(db);
+    let mut admin = sqlx::postgres::PgConnection::connect(&admin_url)
+        .await
+        .expect("admin cleanup");
+    let _ = admin
+        .execute(AssertSqlSafe(format!("DROP ROLE IF EXISTS {app_q}")))
+        .await;
+    let _ = admin.close().await;
 }

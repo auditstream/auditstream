@@ -170,24 +170,41 @@ const fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
-/// Strips unrecognized secret query parameters (`sslpassword` and non-lowercase `PASSWORD`
-/// variants) before passing a PostgreSQL URI to `sqlx::PgConnectOptions::from_str`.
+fn is_unrecognized_sqlx_secret_key(raw_key: &str) -> bool {
+    let normalized: String = percent_decode_form_key(raw_key)
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    normalized.eq_ignore_ascii_case("sslpassword")
+        || normalized.eq_ignore_ascii_case("ssl-password")
+        || normalized.eq_ignore_ascii_case("oauth_client_secret")
+        || (normalized.eq_ignore_ascii_case("password") && normalized != "password")
+}
+
+/// Strips unrecognized secret query parameters (`sslpassword`, `ssl-password`,
+/// `oauth_client_secret`, and non-lowercase `PASSWORD` variants) before passing a PostgreSQL URI
+/// to `sqlx::PgConnectOptions::from_str`.
 ///
-/// `sqlx-postgres` logs unrecognized query parameters at `tracing::warn!` with their raw values,
-/// which would otherwise leak `sslpassword` or uppercase `PASSWORD` onto stderr at default
-/// verbosity. Lowercase `password` is preserved so normal authentication continues to work.
+/// Accounts for WHATWG URL normalization (leading/trailing C0+space trimming and `\t`/`\n`/`\r`
+/// stripping) performed by `url::Url::parse` inside `sqlx-postgres`. Lowercase `password` is
+/// preserved so normal authentication continues to work without triggering `sqlx` warnings.
 fn sanitize_database_url_for_sqlx(database_url: &str) -> Cow<'_, str> {
-    let Some(scheme_end) = database_url.find("://") else {
+    let trimmed = database_url.trim_matches(|c: char| c <= ' ');
+    let Some(scheme_end) = trimmed.find("://") else {
         return Cow::Borrowed(database_url);
     };
-    if !is_valid_uri_scheme(&database_url[..scheme_end]) {
+    let scheme_clean: String = trimmed[..scheme_end]
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    if !is_valid_uri_scheme(&scheme_clean) {
         return Cow::Borrowed(database_url);
     }
-    let Some(q_rel) = database_url[scheme_end + 3..].find('?') else {
+    let Some(q_rel) = trimmed[scheme_end + 3..].find('?') else {
         return Cow::Borrowed(database_url);
     };
     let q_pos = scheme_end + 3 + q_rel;
-    let after_q = &database_url[q_pos + 1..];
+    let after_q = &trimmed[q_pos + 1..];
     let (query, fragment) = match after_q.find('#') {
         Some(hash_pos) => (&after_q[..hash_pos], &after_q[hash_pos..]),
         None => (after_q, ""),
@@ -196,14 +213,11 @@ fn sanitize_database_url_for_sqlx(database_url: &str) -> Cow<'_, str> {
     let mut stripped = false;
     let mut kept = Vec::new();
     for pair in query.split('&') {
-        if let Some(eq_pos) = pair.find('=') {
-            let decoded_key = percent_decode_form_key(&pair[..eq_pos]);
-            let is_unrecognized_secret = decoded_key.eq_ignore_ascii_case("sslpassword")
-                || (decoded_key.eq_ignore_ascii_case("password") && decoded_key != "password");
-            if is_unrecognized_secret {
-                stripped = true;
-                continue;
-            }
+        if let Some(eq_pos) = pair.find('=')
+            && is_unrecognized_sqlx_secret_key(&pair[..eq_pos])
+        {
+            stripped = true;
+            continue;
         }
         kept.push(pair);
     }
@@ -212,8 +226,8 @@ fn sanitize_database_url_for_sqlx(database_url: &str) -> Cow<'_, str> {
         return Cow::Borrowed(database_url);
     }
 
-    let mut out = String::with_capacity(database_url.len());
-    out.push_str(&database_url[..q_pos]);
+    let mut out = String::with_capacity(trimmed.len());
+    out.push_str(&trimmed[..q_pos]);
     if !kept.is_empty() {
         out.push('?');
         out.push_str(&kept.join("&"));
@@ -225,15 +239,23 @@ fn sanitize_database_url_for_sqlx(database_url: &str) -> Cow<'_, str> {
 /// Resolves the effective non-local TCP host target for TLS checks, returning `None` for Unix
 /// domain sockets and loopback TCP addresses.
 ///
-/// Accounts for `pg_opts.get_socket()` (which overrides `host`/`PGHOST`) and for `hostaddr` /
-/// `PGHOSTADDR` (which overrides `host` as the actual TCP destination in `sqlx-postgres`).
+/// Accounts for `pg_opts.get_socket()` and slash-prefixed Unix socket hosts (which override
+/// `hostaddr`), and inspects `hostaddr` / `PGHOSTADDR` via a sanitized clone so `sqlx`'s
+/// `to_url_lossy()` can neither panic on local socket/malformed hosts nor suffer `?hostaddr=`
+/// username query injection (and never copies the real password into a `Url` buffer).
 fn effective_remote_tcp_host(pg_opts: &PgConnectOptions) -> Option<String> {
-    if pg_opts.get_socket().is_some() {
+    let host = pg_opts.get_host();
+    if pg_opts.get_socket().is_some() || host.starts_with('/') {
         return None;
     }
 
-    // `to_url_lossy` reflects both `?hostaddr=` and `PGHOSTADDR`. Never log this URL!
-    let lossy = pg_opts.to_url_lossy();
+    let probe = pg_opts
+        .clone()
+        .username("u")
+        .host("localhost")
+        .database("")
+        .password("");
+    let lossy = probe.to_url_lossy();
     let hostaddr = lossy
         .query_pairs()
         .find_map(|(k, v)| (k == "hostaddr" && !v.is_empty()).then(|| v.into_owned()));
@@ -242,7 +264,6 @@ fn effective_remote_tcp_host(pg_opts: &PgConnectOptions) -> Option<String> {
         return (!is_local_host(&addr)).then_some(addr);
     }
 
-    let host = pg_opts.get_host();
     (!is_local_host(host)).then(|| host.to_owned())
 }
 
@@ -443,14 +464,21 @@ mod tests {
 
     #[test]
     fn sanitize_strips_unrecognized_secret_query_params_before_sqlx() {
-        let raw = "postgresql://app@db.example.com:5432/prod?sslmode=verify-full&sslpassword=KEY_SECRET&PASSWORD=UPPER_SECRET&%53slPassword=PCT_SECRET&password=REAL_PW#frag";
+        let raw = " \tpostgresql://app@db.example.com:5432/prod?sslmode=verify-full&sslpassword=KEY_SECRET&ssl-password=DASH_SECRET&oauth_client_secret=OAUTH_SECRET&PASSWORD=UPPER_SECRET&ssl\tpassword=TAB_SECRET&%53slPassword=PCT_SECRET&password=REAL_PW#frag ";
         let sanitized = sanitize_database_url_for_sqlx(raw);
-        assert!(
-            !sanitized.contains("KEY_SECRET")
-                && !sanitized.contains("UPPER_SECRET")
-                && !sanitized.contains("PCT_SECRET"),
-            "unrecognized secret params leaked into sanitized URL: {sanitized}"
-        );
+        for leaked in [
+            "KEY_SECRET",
+            "DASH_SECRET",
+            "OAUTH_SECRET",
+            "UPPER_SECRET",
+            "TAB_SECRET",
+            "PCT_SECRET",
+        ] {
+            assert!(
+                !sanitized.contains(leaked),
+                "unrecognized secret param {leaked} leaked into sanitized URL: {sanitized}"
+            );
+        }
         assert!(
             sanitized.contains("password=REAL_PW"),
             "lowercase password param must be preserved for auth: {sanitized}"
@@ -459,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn tls_policy_handles_hostaddr_bypass_and_unix_socket_with_remote_host() {
+    fn tls_policy_handles_hostaddr_bypass_username_injection_and_unix_sockets() {
         // Remote ?hostaddr= overrides localhost and must be treated as non-local!
         let hostaddr_opts = PgConnectOptions::from_str(
             "postgresql://app:pw@localhost/prod?hostaddr=203.0.113.10&sslmode=disable",
@@ -476,13 +504,43 @@ mod tests {
             ConnectError::InsecureTls { ref host, ssl_mode: "disable" } if host == "203.0.113.10"
         ));
 
-        // Explicit Unix socket overrides a remote host and must be treated as local!
+        // Username query-injection (`?hostaddr=127.0.0.1&`) must NOT bypass remote TLS enforcement.
+        for injected in [
+            "postgresql://app%3Fhostaddr%3D127.0.0.1%26@db.example.com:5432/prod?sslmode=disable",
+            "postgresql://db.example.com:5432/prod?user=app?hostaddr=127.0.0.1%26&sslmode=disable",
+            "postgresql://app%3Fhostaddr%3D127.0.0.1%26@localhost:5432/prod?hostaddr=203.0.113.10&sslmode=disable",
+        ] {
+            let opts = PgConnectOptions::from_str(injected).expect("parse injected URL");
+            let err = enforce_tls_policy(&opts, TlsPolicy::RequireVerifyFull)
+                .expect_err("username query injection must not bypass RequireVerifyFull");
+            assert!(
+                matches!(err, ConnectError::InsecureTls { .. }),
+                "expected InsecureTls for {injected}, got {err:?}"
+            );
+        }
+
+        // Local Unix socket URIs (both `socket(...)` and slash-prefixed `host("/var/run/...")`)
+        // and malformed `?host=` values must NEVER panic in `effective_remote_tcp_host`.
         let uds_opts = PgConnectOptions::new()
             .host("db.example.com")
             .socket("/var/run/postgresql");
         assert_eq!(effective_remote_tcp_host(&uds_opts), None);
         enforce_tls_policy(&uds_opts, TlsPolicy::RequireVerifyFull)
             .expect("unix domain socket must never be rejected by TCP TLS policy");
+
+        let slash_host_opts = PgConnectOptions::new().host("/var/run/postgresql");
+        assert_eq!(effective_remote_tcp_host(&slash_host_opts), None);
+        enforce_tls_policy(&slash_host_opts, TlsPolicy::RequireVerifyFull)
+            .expect("slash-prefixed socket host must not panic or fail TLS policy");
+
+        for weird in [
+            "postgresql:///mydb",
+            "postgresql:///?host=bad%20host&sslmode=disable",
+            "postgresql:///?user=%5Bbad/&host=db.example.com&sslmode=disable",
+        ] {
+            let opts = PgConnectOptions::from_str(weird).expect("parse edge URL");
+            let _ = effective_remote_tcp_host(&opts);
+        }
 
         // Loopback host is allowed under RequireVerifyFull even with sslmode=disable.
         let local_opts =

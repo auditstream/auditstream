@@ -317,7 +317,6 @@ pub async fn check_with_options(
         &options.audit_schema,
         FunctionCheckSpec {
             name: "resolve_actor",
-            identity_args: "",
             pronargs: 0,
             expected_body: &expected_bodies.resolve_actor,
             allow_non_owner_execute: false,
@@ -330,7 +329,6 @@ pub async fn check_with_options(
         &options.audit_schema,
         FunctionCheckSpec {
             name: "capture",
-            identity_args: "",
             pronargs: 0,
             expected_body: &expected_bodies.capture,
             allow_non_owner_execute: false,
@@ -343,7 +341,6 @@ pub async fn check_with_options(
         &options.audit_schema,
         FunctionCheckSpec {
             name: "log_event",
-            identity_args: "action text, target jsonb, data jsonb",
             pronargs: 3,
             expected_body: &expected_bodies.log_event,
             allow_non_owner_execute: true,
@@ -492,7 +489,6 @@ struct ProcRow {
 
 struct FunctionCheckSpec<'a> {
     name: &'a str,
-    identity_args: &'a str,
     pronargs: i16,
     expected_body: &'a str,
     allow_non_owner_execute: bool,
@@ -600,18 +596,35 @@ async fn check_parent_changes_security(
     }
 
     let unsafe_grants: Vec<AclGrantRow> = sqlx::query_as(
-        "SELECT \
-           CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END AS grantee, \
-           a.privilege_type::text AS privilege_type, \
-           a.is_grantable \
-         FROM pg_catalog.pg_class c \
-         CROSS JOIN LATERAL pg_catalog.aclexplode( \
-           COALESCE(c.relacl, pg_catalog.acldefault('r', c.relowner)) \
-         ) AS a \
-        WHERE c.oid = $1::oid \
-          AND a.grantee <> c.relowner \
-          AND (a.grantee = 0 OR a.privilege_type <> 'SELECT' OR a.is_grantable) \
-        ORDER BY 1, 2",
+        "SELECT grantee, privilege_type, is_grantable FROM ( \
+           SELECT \
+             CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END AS grantee, \
+             a.privilege_type::text AS privilege_type, \
+             a.is_grantable \
+           FROM pg_catalog.pg_class c \
+           CROSS JOIN LATERAL pg_catalog.aclexplode( \
+             COALESCE(c.relacl, pg_catalog.acldefault('r', c.relowner)) \
+           ) AS a \
+          WHERE c.oid = $1::oid \
+            AND a.grantee <> c.relowner \
+            AND (a.grantee = 0 OR a.privilege_type <> 'SELECT' OR a.is_grantable) \
+           UNION ALL \
+           SELECT \
+             CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END AS grantee, \
+             a.privilege_type::text || ' (' || att.attname || ')' AS privilege_type, \
+             a.is_grantable \
+           FROM pg_catalog.pg_class c \
+           JOIN pg_catalog.pg_attribute att \
+             ON att.attrelid = c.oid \
+            AND att.attnum > 0 \
+            AND NOT att.attisdropped \
+            AND att.attacl IS NOT NULL \
+           CROSS JOIN LATERAL pg_catalog.aclexplode(att.attacl) AS a \
+          WHERE c.oid = $1::oid \
+            AND a.grantee <> c.relowner \
+            AND (a.grantee = 0 OR a.privilege_type <> 'SELECT' OR a.is_grantable) \
+         ) AS all_unsafe \
+         ORDER BY 1, 2",
     )
     .bind(parent.oid)
     .fetch_all(&mut **tx)
@@ -675,17 +688,33 @@ async fn check_child_partitions_security(
         }
 
         let unsafe_grants: Vec<AclGrantRow> = sqlx::query_as(
-            "SELECT \
-               CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END AS grantee, \
-               a.privilege_type::text AS privilege_type, \
-               a.is_grantable \
-             FROM pg_catalog.pg_class c \
-             CROSS JOIN LATERAL pg_catalog.aclexplode( \
-               COALESCE(c.relacl, pg_catalog.acldefault('r', c.relowner)) \
-             ) AS a \
-            WHERE c.oid = $1::oid \
-              AND a.grantee <> c.relowner \
-            ORDER BY 1, 2",
+            "SELECT grantee, privilege_type, is_grantable FROM ( \
+               SELECT \
+                 CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END AS grantee, \
+                 a.privilege_type::text AS privilege_type, \
+                 a.is_grantable \
+               FROM pg_catalog.pg_class c \
+               CROSS JOIN LATERAL pg_catalog.aclexplode( \
+                 COALESCE(c.relacl, pg_catalog.acldefault('r', c.relowner)) \
+               ) AS a \
+              WHERE c.oid = $1::oid \
+                AND a.grantee <> c.relowner \
+               UNION ALL \
+               SELECT \
+                 CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END AS grantee, \
+                 a.privilege_type::text || ' (' || att.attname || ')' AS privilege_type, \
+                 a.is_grantable \
+               FROM pg_catalog.pg_class c \
+               JOIN pg_catalog.pg_attribute att \
+                 ON att.attrelid = c.oid \
+                AND att.attnum > 0 \
+                AND NOT att.attisdropped \
+                AND att.attacl IS NOT NULL \
+               CROSS JOIN LATERAL pg_catalog.aclexplode(att.attacl) AS a \
+              WHERE c.oid = $1::oid \
+                AND a.grantee <> c.relowner \
+             ) AS all_unsafe \
+             ORDER BY 1, 2",
         )
         .bind(child.oid)
         .fetch_all(&mut **tx)
@@ -716,7 +745,11 @@ async fn check_identity_sequences_security(
            pg_catalog.pg_get_userbyid(s.relowner)::text AS owner_name \
          FROM pg_catalog.pg_class c \
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-         JOIN pg_catalog.pg_depend d ON d.refobjid = c.oid AND d.deptype = 'i' \
+         JOIN pg_catalog.pg_depend d \
+           ON d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass \
+          AND d.refobjid = c.oid \
+          AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass \
+          AND d.deptype IN ('a', 'i') \
          JOIN pg_catalog.pg_class s ON s.oid = d.objid AND s.relkind = 'S' \
          JOIN pg_catalog.pg_namespace sn ON sn.oid = s.relnamespace \
         WHERE n.nspname = $1 \
@@ -827,13 +860,20 @@ async fn check_function(
          JOIN pg_catalog.pg_language l ON l.oid = p.prolang \
         WHERE n.nspname = $1 \
           AND p.proname = $2 \
+          AND p.prokind = 'f' \
           AND p.pronargs = $3 \
-          AND ($3 = 0 OR pg_catalog.pg_get_function_identity_arguments(p.oid) = $4)",
+          AND ( \
+            $3 = 0 \
+            OR p.proargtypes = (ARRAY[ \
+              'pg_catalog.text'::pg_catalog.regtype::pg_catalog.oid, \
+              'pg_catalog.jsonb'::pg_catalog.regtype::pg_catalog.oid, \
+              'pg_catalog.jsonb'::pg_catalog.regtype::pg_catalog.oid \
+            ])::pg_catalog.oidvector \
+          )",
     )
     .bind(audit_schema)
     .bind(spec.name)
     .bind(spec.pronargs)
-    .bind(spec.identity_args)
     .fetch_optional(&mut **tx)
     .await?;
 
@@ -968,18 +1008,22 @@ async fn check_default_partition(
     .fetch_optional(&mut **tx)
     .await?;
 
-    if default_exists.is_none() {
+    let Some(default_oid) = default_exists else {
         return Ok(None);
-    }
+    };
 
     let schema_q = quote_ident(audit_schema);
-    // Query ONLY the DEFAULT partition so monthly partitions are never scanned.
+    // Query through parent `{schema}.changes` filtered by the literal `changes_default` OID:
+    // PostgreSQL checks SELECT only on the parent table (so non-superusers with parent SELECT
+    // succeed while child partitions stay zero-grant) and constant-folds `tableoid = <oid>` so
+    // monthly partitions are never scanned.
     let sql = format!(
         "SELECT \
            count(*)::bigint AS row_count, \
            to_char(min(occurred_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS oldest, \
            to_char(max(occurred_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS newest \
-         FROM ONLY {schema_q}.changes_default"
+         FROM {schema_q}.changes \
+        WHERE tableoid = {default_oid}::pg_catalog.oid"
     );
 
     let row: DefaultPartitionRow = sqlx::query_as(AssertSqlSafe(sql))

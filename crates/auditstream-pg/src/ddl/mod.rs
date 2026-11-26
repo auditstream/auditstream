@@ -113,33 +113,49 @@ pub(crate) fn role_grant_setup_sql(
 DECLARE\n  \
   grant_mode text := 'none';\n  \
   need_inherit boolean := false;\n  \
-  need_set boolean := false;\n\
+  need_set boolean := false;\n  \
+  has_self_row boolean := false;\n\
 BEGIN\n  \
   IF pg_catalog.current_setting('{TX_GUARD_SETTING}', true) IS DISTINCT FROM 'on' THEN\n    \
     RAISE EXCEPTION '{context_label} must run inside a single transaction'\n      \
       USING HINT = 'Wrap the generated statements in BEGIN; ... COMMIT; or use a transactional migrator.';\n  \
   END IF;\n\
 {create_clause}  \
-  IF NOT pg_catalog.pg_has_role(current_user, {owner_lit}, 'MEMBER') THEN\n    \
-    IF pg_catalog.current_setting('server_version_num')::int >= 160000 THEN\n      \
-      EXECUTE pg_catalog.format('GRANT {owner_q} TO %I WITH INHERIT TRUE, SET TRUE', current_user);\n    \
-    ELSE\n      \
-      EXECUTE pg_catalog.format('GRANT {owner_q} TO %I', current_user);\n    \
-    END IF;\n    \
-    grant_mode := 'member';\n  \
-  ELSIF pg_catalog.current_setting('server_version_num')::int >= 160000 THEN\n    \
+  IF pg_catalog.current_setting('server_version_num')::int >= 160000 THEN\n    \
     need_inherit := NOT pg_catalog.pg_has_role(current_user, {owner_lit}, 'USAGE');\n    \
     need_set := NOT pg_catalog.pg_has_role(current_user, {owner_lit}, 'SET');\n    \
-    IF need_inherit AND need_set THEN\n      \
-      EXECUTE pg_catalog.format('GRANT {owner_q} TO %I WITH INHERIT TRUE, SET TRUE', current_user);\n      \
-      grant_mode := 'both';\n    \
-    ELSIF need_inherit THEN\n      \
-      EXECUTE pg_catalog.format('GRANT {owner_q} TO %I WITH INHERIT TRUE', current_user);\n      \
-      grant_mode := 'inherit';\n    \
-    ELSIF need_set THEN\n      \
-      EXECUTE pg_catalog.format('GRANT {owner_q} TO %I WITH SET TRUE', current_user);\n      \
-      grant_mode := 'set';\n    \
+    IF need_inherit OR need_set THEN\n      \
+      SELECT EXISTS (\n        \
+        SELECT 1\n          \
+          FROM pg_catalog.pg_auth_members m\n          \
+          JOIN pg_catalog.pg_roles r ON r.oid = m.roleid\n          \
+          JOIN pg_catalog.pg_roles u ON u.oid = m.member\n         \
+         WHERE r.rolname = {owner_lit}\n           \
+           AND u.rolname = current_user\n           \
+           AND m.grantor = u.oid\n      \
+      ) INTO has_self_row;\n      \
+      IF NOT has_self_row THEN\n        \
+        EXECUTE pg_catalog.format(\n          \
+          'GRANT {owner_q} TO %I WITH INHERIT %s, SET %s',\n          \
+          current_user,\n          \
+          CASE WHEN need_inherit THEN 'TRUE' ELSE 'FALSE' END,\n          \
+          CASE WHEN need_set THEN 'TRUE' ELSE 'FALSE' END\n        \
+        );\n        \
+        grant_mode := 'self_row';\n      \
+      ELSIF need_inherit AND need_set THEN\n        \
+        EXECUTE pg_catalog.format('GRANT {owner_q} TO %I WITH INHERIT TRUE, SET TRUE', current_user);\n        \
+        grant_mode := 'both';\n      \
+      ELSIF need_inherit THEN\n        \
+        EXECUTE pg_catalog.format('GRANT {owner_q} TO %I WITH INHERIT TRUE', current_user);\n        \
+        grant_mode := 'inherit';\n      \
+      ELSE\n        \
+        EXECUTE pg_catalog.format('GRANT {owner_q} TO %I WITH SET TRUE', current_user);\n        \
+        grant_mode := 'set';\n      \
+      END IF;\n    \
     END IF;\n  \
+  ELSIF NOT pg_catalog.pg_has_role(current_user, {owner_lit}, 'MEMBER') THEN\n    \
+    EXECUTE pg_catalog.format('GRANT {owner_q} TO %I', current_user);\n    \
+    grant_mode := 'self_row';\n  \
   END IF;\n  \
   PERFORM pg_catalog.set_config('{setting_name}', grant_mode, true);\n\
 END\n\
@@ -154,7 +170,7 @@ pub(crate) fn role_grant_cleanup_sql(owner_q: &str, setting_name: &str) -> Strin
 DECLARE\n  \
   grant_mode text := pg_catalog.current_setting('{setting_name}', true);\n\
 BEGIN\n  \
-  IF grant_mode = 'member' THEN\n    \
+  IF grant_mode = 'self_row' THEN\n    \
     EXECUTE pg_catalog.format('REVOKE {owner_q} FROM %I', current_user);\n  \
   ELSIF grant_mode = 'both' THEN\n    \
     EXECUTE pg_catalog.format('REVOKE INHERIT OPTION FOR {owner_q} FROM %I', current_user);\n    \
@@ -249,6 +265,9 @@ pub(crate) fn generate_parts(options: &DdlOptions) -> GeneratedDdl {
     let schema_lit = quote_literal(&options.schema);
     let owner_q = quote_ident(OWNER_ROLE);
     let owner_lit = quote_literal(OWNER_ROLE);
+    let mut app_roles = options.app_roles.clone();
+    app_roles.sort();
+    app_roles.dedup();
 
     let setup = vec![
         role_grant_setup_sql(
@@ -285,7 +304,7 @@ pub(crate) fn generate_parts(options: &DdlOptions) -> GeneratedDdl {
             "USING hash (record_id) WHERE record_id IS NOT NULL",
         ),
         log_event_sql(&schema_q),
-        harden_ddl_acls_sql(&schema_lit, &options.app_roles),
+        harden_ddl_acls_sql(&schema_lit, &app_roles),
         restore_prev_role_sql(),
     ];
 
@@ -296,9 +315,9 @@ pub(crate) fn generate_parts(options: &DdlOptions) -> GeneratedDdl {
     }
 }
 
-/// Reconciles pre-existing ownership of the audit schema, `changes`, all attached child
-/// partitions, identity sequences, and `log_event()` as the caller role *before* switching to
-/// `SET LOCAL ROLE auditstream_owner`.
+/// Reconciles pre-existing ownership of the audit schema, `changes` (which cascades to owned
+/// identity sequences), all attached child partitions, and `log_event()` as the caller role
+/// *before* switching to `SET LOCAL ROLE auditstream_owner`.
 fn reconcile_ddl_ownership_sql(schema_lit: &str, owner_lit: &str) -> String {
     do_block(&format!(
         "DECLARE
@@ -337,28 +356,18 @@ BEGIN
     EXECUTE pg_catalog.format('ALTER TABLE %I.%I OWNER TO %I', obj_schema, obj_name, {owner_lit});
   END LOOP;
 
-  FOR obj_schema, obj_name IN
-    SELECT sn.nspname, s.relname
-      FROM pg_catalog.pg_class c
-      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-      JOIN pg_catalog.pg_depend d ON d.refobjid = c.oid AND d.deptype = 'i'
-      JOIN pg_catalog.pg_class s ON s.oid = d.objid AND s.relkind = 'S'
-      JOIN pg_catalog.pg_namespace sn ON sn.oid = s.relnamespace
-     WHERE n.nspname = {schema_lit}
-       AND c.relname = 'changes'
-       AND s.relowner <> {owner_lit}::pg_catalog.regrole
-     ORDER BY sn.nspname, s.relname
-  LOOP
-    EXECUTE pg_catalog.format('ALTER SEQUENCE %I.%I OWNER TO %I', obj_schema, obj_name, {owner_lit});
-  END LOOP;
-
   SELECT p.oid INTO fn_oid
     FROM pg_catalog.pg_proc p
     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
    WHERE n.nspname = {schema_lit}
      AND p.proname = 'log_event'
+     AND p.prokind = 'f'
      AND p.pronargs = 3
-     AND pg_catalog.pg_get_function_identity_arguments(p.oid) = 'action text, target jsonb, data jsonb';
+     AND p.proargtypes = (ARRAY[
+       'pg_catalog.text'::pg_catalog.regtype::pg_catalog.oid,
+       'pg_catalog.jsonb'::pg_catalog.regtype::pg_catalog.oid,
+       'pg_catalog.jsonb'::pg_catalog.regtype::pg_catalog.oid
+     ])::pg_catalog.oidvector;
   IF fn_oid IS NOT NULL AND EXISTS (
     SELECT 1 FROM pg_catalog.pg_proc
      WHERE oid = fn_oid AND proowner <> {owner_lit}::pg_catalog.regrole
@@ -438,16 +447,32 @@ fn partitions_sql(schema_lit: &str, owner_lit: &str, first_month: u32, last_mont
       SELECT i.inhrelid
         FROM tree
         JOIN pg_catalog.pg_inherits i ON i.inhparent = tree.relid
+    ),
+    child_grants AS (
+      SELECT cn.nspname AS rel_schema, c.relname AS rel_name, a.grantee
+        FROM tree
+        JOIN pg_catalog.pg_class c ON c.oid = tree.relid
+        JOIN pg_catalog.pg_namespace cn ON cn.oid = c.relnamespace
+        CROSS JOIN LATERAL pg_catalog.aclexplode(
+          COALESCE(c.relacl, pg_catalog.acldefault('r', c.relowner))
+        ) AS a
+       WHERE a.grantee <> c.relowner
+      UNION
+      SELECT cn.nspname AS rel_schema, c.relname AS rel_name, a.grantee
+        FROM tree
+        JOIN pg_catalog.pg_class c ON c.oid = tree.relid
+        JOIN pg_catalog.pg_namespace cn ON cn.oid = c.relnamespace
+        JOIN pg_catalog.pg_attribute att
+          ON att.attrelid = c.oid
+         AND att.attnum > 0
+         AND NOT att.attisdropped
+         AND att.attacl IS NOT NULL
+        CROSS JOIN LATERAL pg_catalog.aclexplode(att.attacl) AS a
+       WHERE a.grantee <> c.relowner
     )
-    SELECT DISTINCT cn.nspname, c.relname, a.grantee
-      FROM tree
-      JOIN pg_catalog.pg_class c ON c.oid = tree.relid
-      JOIN pg_catalog.pg_namespace cn ON cn.oid = c.relnamespace
-      CROSS JOIN LATERAL pg_catalog.aclexplode(
-        COALESCE(c.relacl, pg_catalog.acldefault('r', c.relowner))
-      ) AS a
-     WHERE a.grantee <> c.relowner
-     ORDER BY cn.nspname, c.relname, a.grantee
+    SELECT child_grants.rel_schema, child_grants.rel_name, child_grants.grantee
+      FROM child_grants
+     ORDER BY child_grants.rel_schema, child_grants.rel_name, child_grants.grantee
   LOOP
     IF grantee_oid = 0 THEN
       EXECUTE pg_catalog.format('REVOKE ALL ON TABLE %I.%I FROM PUBLIC CASCADE', obj_schema, part_name);
@@ -462,17 +487,33 @@ fn partitions_sql(schema_lit: &str, owner_lit: &str, first_month: u32, last_mont
   END LOOP;
 
   FOR grantee_oid IN
-    SELECT DISTINCT a.grantee
-      FROM pg_catalog.pg_class c
-      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-      CROSS JOIN LATERAL pg_catalog.aclexplode(
-        COALESCE(c.relacl, pg_catalog.acldefault('r', c.relowner))
-      ) AS a
-     WHERE n.nspname = {schema_lit}
-       AND c.relname = 'changes'
-       AND a.grantee <> c.relowner
-       AND (a.grantee = 0 OR a.privilege_type <> 'SELECT' OR a.is_grantable)
-     ORDER BY a.grantee
+    SELECT parent_grants.grantee FROM (
+      SELECT a.grantee
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        CROSS JOIN LATERAL pg_catalog.aclexplode(
+          COALESCE(c.relacl, pg_catalog.acldefault('r', c.relowner))
+        ) AS a
+       WHERE n.nspname = {schema_lit}
+         AND c.relname = 'changes'
+         AND a.grantee <> c.relowner
+         AND (a.grantee = 0 OR a.privilege_type <> 'SELECT' OR a.is_grantable)
+      UNION
+      SELECT a.grantee
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_catalog.pg_attribute att
+          ON att.attrelid = c.oid
+         AND att.attnum > 0
+         AND NOT att.attisdropped
+         AND att.attacl IS NOT NULL
+        CROSS JOIN LATERAL pg_catalog.aclexplode(att.attacl) AS a
+       WHERE n.nspname = {schema_lit}
+         AND c.relname = 'changes'
+         AND a.grantee <> c.relowner
+         AND (a.grantee = 0 OR a.privilege_type <> 'SELECT' OR a.is_grantable)
+    ) AS parent_grants
+     ORDER BY parent_grants.grantee
   LOOP
     IF grantee_oid = 0 THEN
       EXECUTE pg_catalog.format('REVOKE ALL ON TABLE %I.changes FROM PUBLIC CASCADE', {schema_lit});
@@ -501,7 +542,11 @@ fn partitions_sql(schema_lit: &str, owner_lit: &str, first_month: u32, last_mont
     SELECT DISTINCT sn.nspname, s.relname, a.grantee
       FROM pg_catalog.pg_class c
       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-      JOIN pg_catalog.pg_depend d ON d.refobjid = c.oid AND d.deptype = 'i'
+      JOIN pg_catalog.pg_depend d
+        ON d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+       AND d.refobjid = c.oid
+       AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+       AND d.deptype IN ('a', 'i')
       JOIN pg_catalog.pg_class s ON s.oid = d.objid AND s.relkind = 'S'
       JOIN pg_catalog.pg_namespace sn ON sn.oid = s.relnamespace
       CROSS JOIN LATERAL pg_catalog.aclexplode(
@@ -527,16 +572,31 @@ fn partitions_sql(schema_lit: &str, owner_lit: &str, first_month: u32, last_mont
     } else {
         format!(
             "  FOR part_name, grantee_oid IN
-    SELECT DISTINCT c.relname, a.grantee
-      FROM pg_catalog.pg_class c
-      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-      CROSS JOIN LATERAL pg_catalog.aclexplode(
-        COALESCE(c.relacl, pg_catalog.acldefault('r', c.relowner))
-      ) AS a
-     WHERE n.nspname = {schema_lit}
-       AND c.relname = ANY (managed_tables)
-       AND a.grantee <> c.relowner
-     ORDER BY c.relname, a.grantee
+    SELECT future_grants.rel_name, future_grants.grantee FROM (
+      SELECT c.relname AS rel_name, a.grantee
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        CROSS JOIN LATERAL pg_catalog.aclexplode(
+          COALESCE(c.relacl, pg_catalog.acldefault('r', c.relowner))
+        ) AS a
+       WHERE n.nspname = {schema_lit}
+         AND c.relname = ANY (managed_tables)
+         AND a.grantee <> c.relowner
+      UNION
+      SELECT c.relname AS rel_name, a.grantee
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_catalog.pg_attribute att
+          ON att.attrelid = c.oid
+         AND att.attnum > 0
+         AND NOT att.attisdropped
+         AND att.attacl IS NOT NULL
+        CROSS JOIN LATERAL pg_catalog.aclexplode(att.attacl) AS a
+       WHERE n.nspname = {schema_lit}
+         AND c.relname = ANY (managed_tables)
+         AND a.grantee <> c.relowner
+    ) AS future_grants
+     ORDER BY future_grants.rel_name, future_grants.grantee
   LOOP
     IF grantee_oid = 0 THEN
       EXECUTE pg_catalog.format('REVOKE ALL ON TABLE %I.%I FROM PUBLIC CASCADE', {schema_lit}, part_name);
@@ -617,7 +677,8 @@ fn harden_ddl_acls_sql(schema_lit: &str, app_roles: &[String]) -> String {
         COALESCE(n.nspacl, pg_catalog.acldefault('n', n.nspowner))
       ) AS a
        WHERE n.nspname = {schema_lit}
-         AND a.grantee = target_role::pg_catalog.regrole
+         AND a.grantee <> 0
+         AND pg_catalog.pg_get_userbyid(a.grantee)::text = target_role
          AND a.privilege_type = 'USAGE'
     ) THEN
       EXECUTE pg_catalog.format('GRANT USAGE ON SCHEMA %I TO %I', {schema_lit}, target_role);
@@ -630,7 +691,8 @@ fn harden_ddl_acls_sql(schema_lit: &str, app_roles: &[String]) -> String {
       ) AS a
        WHERE n.nspname = {schema_lit}
          AND c.relname = 'changes'
-         AND a.grantee = target_role::pg_catalog.regrole
+         AND a.grantee <> 0
+         AND pg_catalog.pg_get_userbyid(a.grantee)::text = target_role
          AND a.privilege_type = 'SELECT'
     ) THEN
       EXECUTE pg_catalog.format('GRANT SELECT ON TABLE %I.changes TO %I', {schema_lit}, target_role);
@@ -643,9 +705,15 @@ fn harden_ddl_acls_sql(schema_lit: &str, app_roles: &[String]) -> String {
       ) AS a
        WHERE n.nspname = {schema_lit}
          AND p.proname = 'log_event'
+         AND p.prokind = 'f'
          AND p.pronargs = 3
-         AND pg_catalog.pg_get_function_identity_arguments(p.oid) = 'action text, target jsonb, data jsonb'
-         AND a.grantee = target_role::pg_catalog.regrole
+         AND p.proargtypes = (ARRAY[
+           'pg_catalog.text'::pg_catalog.regtype::pg_catalog.oid,
+           'pg_catalog.jsonb'::pg_catalog.regtype::pg_catalog.oid,
+           'pg_catalog.jsonb'::pg_catalog.regtype::pg_catalog.oid
+         ])::pg_catalog.oidvector
+         AND a.grantee <> 0
+         AND pg_catalog.pg_get_userbyid(a.grantee)::text = target_role
          AND a.privilege_type = 'EXECUTE'
     ) THEN
       EXECUTE pg_catalog.format(
@@ -683,18 +751,35 @@ fn harden_ddl_acls_sql(schema_lit: &str, app_roles: &[String]) -> String {
     let changes_extra_revoke = if authoritative {
         format!(
             "\n  FOR grantee_oid IN
-    SELECT DISTINCT a.grantee
-      FROM pg_catalog.pg_class c
-      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-      CROSS JOIN LATERAL pg_catalog.aclexplode(
-        COALESCE(c.relacl, pg_catalog.acldefault('r', c.relowner))
-      ) AS a
-     WHERE n.nspname = {schema_lit}
-       AND c.relname = 'changes'
-       AND a.grantee <> c.relowner
-       AND a.grantee <> 0
-       AND pg_catalog.pg_get_userbyid(a.grantee)::text <> ALL (allowed_roles)
-     ORDER BY a.grantee
+    SELECT extra_changes_grants.grantee FROM (
+      SELECT a.grantee
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        CROSS JOIN LATERAL pg_catalog.aclexplode(
+          COALESCE(c.relacl, pg_catalog.acldefault('r', c.relowner))
+        ) AS a
+       WHERE n.nspname = {schema_lit}
+         AND c.relname = 'changes'
+         AND a.grantee <> c.relowner
+         AND a.grantee <> 0
+         AND pg_catalog.pg_get_userbyid(a.grantee)::text <> ALL (allowed_roles)
+      UNION
+      SELECT a.grantee
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_catalog.pg_attribute att
+          ON att.attrelid = c.oid
+         AND att.attnum > 0
+         AND NOT att.attisdropped
+         AND att.attacl IS NOT NULL
+        CROSS JOIN LATERAL pg_catalog.aclexplode(att.attacl) AS a
+       WHERE n.nspname = {schema_lit}
+         AND c.relname = 'changes'
+         AND a.grantee <> c.relowner
+         AND a.grantee <> 0
+         AND pg_catalog.pg_get_userbyid(a.grantee)::text <> ALL (allowed_roles)
+    ) AS extra_changes_grants
+     ORDER BY extra_changes_grants.grantee
   LOOP
     EXECUTE pg_catalog.format(
       'REVOKE ALL ON TABLE %I.changes FROM %I CASCADE',
@@ -768,8 +853,13 @@ BEGIN
       ) AS a
      WHERE n.nspname = {schema_lit}
        AND p.proname = 'log_event'
+       AND p.prokind = 'f'
        AND p.pronargs = 3
-       AND pg_catalog.pg_get_function_identity_arguments(p.oid) = 'action text, target jsonb, data jsonb'
+       AND p.proargtypes = (ARRAY[
+         'pg_catalog.text'::pg_catalog.regtype::pg_catalog.oid,
+         'pg_catalog.jsonb'::pg_catalog.regtype::pg_catalog.oid,
+         'pg_catalog.jsonb'::pg_catalog.regtype::pg_catalog.oid
+       ])::pg_catalog.oidvector
        AND a.grantee <> p.proowner
        AND ({log_event_filter})
      ORDER BY a.grantee
@@ -872,4 +962,35 @@ BEGIN\n  \
 END\n\
 {tag}"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dollar_tag_avoids_delimiter_collision_in_schema_name() {
+        let stmts = generate(&DdlOptions::new("audit$fn$stream", vec![]));
+        let log_event = stmts
+            .iter()
+            .find(|s| s.starts_with("CREATE OR REPLACE FUNCTION "))
+            .expect("log_event emitted");
+        assert!(
+            log_event.contains("AS $auditfn$"),
+            "expected fallback tag $auditfn$, got: {log_event}"
+        );
+    }
+
+    #[test]
+    fn generate_canonicalizes_app_roles_order_and_duplicates() {
+        let a = generate(&DdlOptions::new(
+            DEFAULT_SCHEMA,
+            vec!["z_app".into(), "a_app".into(), "z_app".into()],
+        ));
+        let b = generate(&DdlOptions::new(
+            DEFAULT_SCHEMA,
+            vec!["a_app".into(), "z_app".into()],
+        ));
+        assert_eq!(a, b);
+    }
 }

@@ -13,31 +13,47 @@ DECLARE
   grant_mode text := 'none';
   need_inherit boolean := false;
   need_set boolean := false;
+  has_self_row boolean := false;
 BEGIN
   IF pg_catalog.current_setting('auditstream._migration_tx', true) IS DISTINCT FROM 'on' THEN
     RAISE EXCEPTION 'Auditstream trigger statements must run inside a single transaction'
       USING HINT = 'Wrap the generated statements in BEGIN; ... COMMIT; or use a transactional migrator.';
   END IF;
-  IF NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'MEMBER') THEN
-    IF pg_catalog.current_setting('server_version_num')::int >= 160000 THEN
-      EXECUTE pg_catalog.format('GRANT "auditstream_owner" TO %I WITH INHERIT TRUE, SET TRUE', current_user);
-    ELSE
-      EXECUTE pg_catalog.format('GRANT "auditstream_owner" TO %I', current_user);
-    END IF;
-    grant_mode := 'member';
-  ELSIF pg_catalog.current_setting('server_version_num')::int >= 160000 THEN
+  IF pg_catalog.current_setting('server_version_num')::int >= 160000 THEN
     need_inherit := NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'USAGE');
     need_set := NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'SET');
-    IF need_inherit AND need_set THEN
-      EXECUTE pg_catalog.format('GRANT "auditstream_owner" TO %I WITH INHERIT TRUE, SET TRUE', current_user);
-      grant_mode := 'both';
-    ELSIF need_inherit THEN
-      EXECUTE pg_catalog.format('GRANT "auditstream_owner" TO %I WITH INHERIT TRUE', current_user);
-      grant_mode := 'inherit';
-    ELSIF need_set THEN
-      EXECUTE pg_catalog.format('GRANT "auditstream_owner" TO %I WITH SET TRUE', current_user);
-      grant_mode := 'set';
+    IF need_inherit OR need_set THEN
+      SELECT EXISTS (
+        SELECT 1
+          FROM pg_catalog.pg_auth_members m
+          JOIN pg_catalog.pg_roles r ON r.oid = m.roleid
+          JOIN pg_catalog.pg_roles u ON u.oid = m.member
+         WHERE r.rolname = 'auditstream_owner'
+           AND u.rolname = current_user
+           AND m.grantor = u.oid
+      ) INTO has_self_row;
+      IF NOT has_self_row THEN
+        EXECUTE pg_catalog.format(
+          'GRANT "auditstream_owner" TO %I WITH INHERIT %s, SET %s',
+          current_user,
+          CASE WHEN need_inherit THEN 'TRUE' ELSE 'FALSE' END,
+          CASE WHEN need_set THEN 'TRUE' ELSE 'FALSE' END
+        );
+        grant_mode := 'self_row';
+      ELSIF need_inherit AND need_set THEN
+        EXECUTE pg_catalog.format('GRANT "auditstream_owner" TO %I WITH INHERIT TRUE, SET TRUE', current_user);
+        grant_mode := 'both';
+      ELSIF need_inherit THEN
+        EXECUTE pg_catalog.format('GRANT "auditstream_owner" TO %I WITH INHERIT TRUE', current_user);
+        grant_mode := 'inherit';
+      ELSE
+        EXECUTE pg_catalog.format('GRANT "auditstream_owner" TO %I WITH SET TRUE', current_user);
+        grant_mode := 'set';
+      END IF;
     END IF;
+  ELSIF NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'MEMBER') THEN
+    EXECUTE pg_catalog.format('GRANT "auditstream_owner" TO %I', current_user);
+    grant_mode := 'self_row';
   END IF;
   PERFORM pg_catalog.set_config('auditstream._triggers_granted_self', grant_mode, true);
 END
@@ -53,6 +69,7 @@ BEGIN
       JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
        WHERE n.nspname = 'auditstream'
          AND p.proname = fn_name
+         AND p.prokind = 'f'
          AND p.pronargs = 0
          AND p.proowner <> 'auditstream_owner'::pg_catalog.regrole
     ) THEN
@@ -539,6 +556,7 @@ BEGIN
       ) AS a
      WHERE n.nspname = 'auditstream'
        AND p.proname IN ('resolve_actor', 'capture')
+       AND p.prokind = 'f'
        AND p.pronargs = 0
        AND a.grantee <> p.proowner
      ORDER BY p.proname, a.grantee
@@ -583,7 +601,8 @@ BEGIN
         COALESCE(n.nspacl, pg_catalog.acldefault('n', n.nspowner))
       ) AS a
        WHERE n.nspname = 'auditstream'
-         AND a.grantee = caller::pg_catalog.regrole
+         AND a.grantee <> 0
+         AND pg_catalog.pg_get_userbyid(a.grantee)::text = caller::text
          AND a.privilege_type = 'USAGE'
     ) THEN
       EXECUTE pg_catalog.format('GRANT USAGE ON SCHEMA %I TO %I', 'auditstream', caller);
@@ -654,7 +673,7 @@ DO $$
 DECLARE
   grant_mode text := pg_catalog.current_setting('auditstream._triggers_granted_self', true);
 BEGIN
-  IF grant_mode = 'member' THEN
+  IF grant_mode = 'self_row' THEN
     EXECUTE pg_catalog.format('REVOKE "auditstream_owner" FROM %I', current_user);
   ELSIF grant_mode = 'both' THEN
     EXECUTE pg_catalog.format('REVOKE INHERIT OPTION FOR "auditstream_owner" FROM %I', current_user);

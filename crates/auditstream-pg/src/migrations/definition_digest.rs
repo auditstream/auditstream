@@ -50,5 +50,23 @@ mod tests {
         let when = "FOR EACH ROW WHEN (OLD.* IS DISTINCT FROM NEW.*)";
         let revised = digest_after_edit(&statements, trigger, "FOR EACH ROW", when);
         assert_ne!(original, revised, "{trigger}");
+
+        // Editing a DDL/ACL statement must change the digest so security upgrades refresh.
+        let ddl_revised = digest_after_edit(
+            &statements,
+            "CREATE SCHEMA IF NOT EXISTS ",
+            "AUTHORIZATION",
+            "AUTHORIZATION /* changed */",
+        );
+        assert_ne!(original, ddl_revised, "DDL/ACL edit must change digest");
+
+        // Selection-history-dependent DROP TRIGGER IF EXISTS statements are excluded.
+        let mut with_drop = statements.clone();
+        with_drop.push("DROP TRIGGER IF EXISTS auditstream_insert ON \"public\".\"old\"".into());
+        assert_eq!(
+            original,
+            from_statements(&with_drop),
+            "DROP TRIGGER IF EXISTS must not perturb digest"
+        );
     }
 }

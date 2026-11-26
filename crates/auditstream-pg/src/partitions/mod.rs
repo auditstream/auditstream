@@ -531,6 +531,7 @@ pub struct HistoryTableStats {
 
 #[derive(Debug, FromRow)]
 struct HistoryChildStatRow {
+    oid: i64,
     relname: String,
     est_rows: i64,
     total_bytes: i64,
@@ -579,6 +580,7 @@ pub async fn history_stats(
     let current_month = fetch_db_utc_month(&mut tx).await?;
     let children: Vec<HistoryChildStatRow> = sqlx::query_as(
         "SELECT \
+           child.oid::bigint AS oid, \
            child.relname, \
            GREATEST(child.reltuples::bigint, 0) AS est_rows, \
            pg_catalog.pg_total_relation_size(child.oid)::bigint AS total_bytes \
@@ -595,7 +597,7 @@ pub async fn history_stats(
     .await?;
 
     let mut monthly_partitions = Vec::new();
-    let mut has_default_table = false;
+    let mut default_oid: Option<i64> = None;
     let mut estimated_rows: i64 = 0;
     let mut total_size_bytes: i64 = 0;
 
@@ -603,7 +605,7 @@ pub async fn history_stats(
         estimated_rows = estimated_rows.saturating_add(child.est_rows);
         total_size_bytes = total_size_bytes.saturating_add(child.total_bytes);
         if child.relname == "changes_default" {
-            has_default_table = true;
+            default_oid = Some(child.oid);
         } else if let Some(ym) = YearMonth::parse_partition_name(&child.relname) {
             monthly_partitions.push(ym);
         }
@@ -619,9 +621,14 @@ pub async fn history_stats(
         probe = probe.next();
     }
 
-    let default_has_rows = if has_default_table {
+    // Query through parent `{schema}.changes` filtered by the literal `changes_default` OID:
+    // PostgreSQL checks SELECT only on the parent table (child partitions remain zero-grant)
+    // and constant-folds `tableoid = <oid>` so monthly partitions are never scanned.
+    let default_has_rows = if let Some(oid) = default_oid {
         let schema_q = quote_ident(schema);
-        let sql = format!("SELECT EXISTS (SELECT 1 FROM ONLY {schema_q}.changes_default LIMIT 1)");
+        let sql = format!(
+            "SELECT EXISTS (SELECT 1 FROM {schema_q}.changes WHERE tableoid = {oid}::pg_catalog.oid LIMIT 1)"
+        );
         sqlx::query_scalar(AssertSqlSafe(sql))
             .fetch_one(&mut *tx)
             .await?
@@ -678,12 +685,14 @@ async fn count_all_default_rows(
     .fetch_optional(&mut **tx)
     .await?;
 
-    if exists.is_none() {
+    let Some(default_oid) = exists else {
         return Ok(0);
-    }
+    };
 
     let schema_q = quote_ident(schema);
-    let sql = format!("SELECT count(*)::bigint FROM ONLY {schema_q}.changes_default");
+    let sql = format!(
+        "SELECT count(*)::bigint FROM {schema_q}.changes WHERE tableoid = {default_oid}::pg_catalog.oid"
+    );
     sqlx::query_scalar(AssertSqlSafe(sql))
         .fetch_one(&mut **tx)
         .await
@@ -724,16 +733,32 @@ async fn sanitize_child_partition_acl(
     part_name: &str,
 ) -> Result<(), sqlx::Error> {
     let grantees: Vec<(i64, Option<String>)> = sqlx::query_as(
-        "SELECT DISTINCT a.grantee::bigint, \
-                CASE WHEN a.grantee = 0 THEN NULL ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END \
-           FROM pg_catalog.pg_class c \
-           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-           CROSS JOIN LATERAL pg_catalog.aclexplode( \
-             COALESCE(c.relacl, pg_catalog.acldefault('r', c.relowner)) \
-           ) AS a \
-          WHERE n.nspname = $1 \
-            AND c.relname = $2 \
-            AND a.grantee <> c.relowner \
+        "SELECT grantee::bigint, \
+                CASE WHEN grantee = 0 THEN NULL ELSE pg_catalog.pg_get_userbyid(grantee)::text END \
+           FROM ( \
+             SELECT a.grantee \
+               FROM pg_catalog.pg_class c \
+               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+               CROSS JOIN LATERAL pg_catalog.aclexplode( \
+                 COALESCE(c.relacl, pg_catalog.acldefault('r', c.relowner)) \
+               ) AS a \
+              WHERE n.nspname = $1 \
+                AND c.relname = $2 \
+                AND a.grantee <> c.relowner \
+             UNION \
+             SELECT a.grantee \
+               FROM pg_catalog.pg_class c \
+               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+               JOIN pg_catalog.pg_attribute att \
+                 ON att.attrelid = c.oid \
+                AND att.attnum > 0 \
+                AND NOT att.attisdropped \
+                AND att.attacl IS NOT NULL \
+               CROSS JOIN LATERAL pg_catalog.aclexplode(att.attacl) AS a \
+              WHERE n.nspname = $1 \
+                AND c.relname = $2 \
+                AND a.grantee <> c.relowner \
+           ) AS all_grants \
           ORDER BY 1",
     )
     .bind(schema)
@@ -764,7 +789,7 @@ async fn sanitize_child_partition_acl(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OwnerGrantMode {
     None,
-    Member,
+    SelfRow,
     SetOption,
 }
 
@@ -775,26 +800,7 @@ async fn ensure_owner_membership(
         sqlx::query_scalar("SELECT pg_catalog.current_setting('server_version_num')::int")
             .fetch_one(&mut **tx)
             .await?;
-    let has_member: bool =
-        sqlx::query_scalar("SELECT pg_catalog.pg_has_role(current_user, $1, 'MEMBER')")
-            .bind(OWNER_ROLE)
-            .fetch_one(&mut **tx)
-            .await?;
-
     let owner_q = quote_ident(OWNER_ROLE);
-    if !has_member {
-        let sql = if server_version_num >= 160_000 {
-            format!(
-                "DO $$ BEGIN EXECUTE pg_catalog.format('GRANT {owner_q} TO %I WITH SET TRUE', current_user); END $$"
-            )
-        } else {
-            format!(
-                "DO $$ BEGIN EXECUTE pg_catalog.format('GRANT {owner_q} TO %I', current_user); END $$"
-            )
-        };
-        sqlx::query(AssertSqlSafe(sql)).execute(&mut **tx).await?;
-        return Ok(OwnerGrantMode::Member);
-    }
 
     if server_version_num >= 160_000 {
         let has_set: bool =
@@ -802,13 +808,54 @@ async fn ensure_owner_membership(
                 .bind(OWNER_ROLE)
                 .fetch_one(&mut **tx)
                 .await?;
-        if !has_set {
+        if has_set {
+            return Ok(OwnerGrantMode::None);
+        }
+
+        // Check whether a self-granted `pg_auth_members` row already exists. When none exists,
+        // specify `WITH INHERIT FALSE, SET TRUE` explicitly so PG 16+ never defaults `INHERIT` to
+        // `rolinherit` (`TRUE`), then delete only that self-granted row via `REVOKE` at cleanup.
+        let has_self_row: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+               SELECT 1 \
+                 FROM pg_catalog.pg_auth_members m \
+                 JOIN pg_catalog.pg_roles r ON r.oid = m.roleid \
+                 JOIN pg_catalog.pg_roles u ON u.oid = m.member \
+                WHERE r.rolname = $1 \
+                  AND u.rolname = current_user \
+                  AND m.grantor = u.oid \
+             )",
+        )
+        .bind(OWNER_ROLE)
+        .fetch_one(&mut **tx)
+        .await?;
+
+        if !has_self_row {
             let sql = format!(
-                "DO $$ BEGIN EXECUTE pg_catalog.format('GRANT {owner_q} TO %I WITH SET TRUE', current_user); END $$"
+                "DO $$ BEGIN EXECUTE pg_catalog.format('GRANT {owner_q} TO %I WITH INHERIT FALSE, SET TRUE', current_user); END $$"
             );
             sqlx::query(AssertSqlSafe(sql)).execute(&mut **tx).await?;
-            return Ok(OwnerGrantMode::SetOption);
+            return Ok(OwnerGrantMode::SelfRow);
         }
+
+        let sql = format!(
+            "DO $$ BEGIN EXECUTE pg_catalog.format('GRANT {owner_q} TO %I WITH SET TRUE', current_user); END $$"
+        );
+        sqlx::query(AssertSqlSafe(sql)).execute(&mut **tx).await?;
+        return Ok(OwnerGrantMode::SetOption);
+    }
+
+    let has_member: bool =
+        sqlx::query_scalar("SELECT pg_catalog.pg_has_role(current_user, $1, 'MEMBER')")
+            .bind(OWNER_ROLE)
+            .fetch_one(&mut **tx)
+            .await?;
+    if !has_member {
+        let sql = format!(
+            "DO $$ BEGIN EXECUTE pg_catalog.format('GRANT {owner_q} TO %I', current_user); END $$"
+        );
+        sqlx::query(AssertSqlSafe(sql)).execute(&mut **tx).await?;
+        return Ok(OwnerGrantMode::SelfRow);
     }
 
     Ok(OwnerGrantMode::None)
@@ -821,7 +868,7 @@ async fn revoke_owner_membership(
     let owner_q = quote_ident(OWNER_ROLE);
     let sql = match mode {
         OwnerGrantMode::None => return Ok(()),
-        OwnerGrantMode::Member => format!(
+        OwnerGrantMode::SelfRow => format!(
             "DO $$ BEGIN EXECUTE pg_catalog.format('REVOKE {owner_q} FROM %I', current_user); END $$"
         ),
         OwnerGrantMode::SetOption => format!(

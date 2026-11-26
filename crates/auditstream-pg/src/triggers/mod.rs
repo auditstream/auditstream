@@ -194,7 +194,10 @@ fn append_table_triggers(stmts: &mut Vec<String>, schema_q: &str, table: &TableT
         quote_ident(&table.table)
     );
     let pk_arg = quote_literal(&encode_json_string_array(&table.primary_key));
-    let ex_arg = quote_literal(&encode_json_string_array(&table.excluded_columns));
+    let mut excluded_sorted = table.excluded_columns.clone();
+    excluded_sorted.sort();
+    excluded_sorted.dedup();
+    let ex_arg = quote_literal(&encode_json_string_array(&excluded_sorted));
     let args = if table.is_partitioned {
         format!(
             "{pk_arg}, {ex_arg}, {}, {}",
@@ -276,6 +279,7 @@ BEGIN
       JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
        WHERE n.nspname = {schema_lit}
          AND p.proname = fn_name
+         AND p.prokind = 'f'
          AND p.pronargs = 0
          AND p.proowner <> {owner_lit}::pg_catalog.regrole
     ) THEN
@@ -303,6 +307,7 @@ BEGIN
       ) AS a
      WHERE n.nspname = {schema_lit}
        AND p.proname IN ('resolve_actor', 'capture')
+       AND p.prokind = 'f'
        AND p.pronargs = 0
        AND a.grantee <> p.proowner
      ORDER BY p.proname, a.grantee
@@ -341,7 +346,8 @@ BEGIN
         COALESCE(n.nspacl, pg_catalog.acldefault('n', n.nspowner))
       ) AS a
        WHERE n.nspname = {schema_lit}
-         AND a.grantee = caller::pg_catalog.regrole
+         AND a.grantee <> 0
+         AND pg_catalog.pg_get_userbyid(a.grantee)::text = caller::text
          AND a.privilege_type = 'USAGE'
     ) THEN
       EXECUTE pg_catalog.format('GRANT USAGE ON SCHEMA %I TO %I', {schema_lit}, caller);

@@ -708,7 +708,8 @@ async fn alter_default_privileges_cannot_grant_writes_on_changes_or_child_partit
         );
 
         // Also inject leaked grants on a historical partition, SELECT WITH GRANT OPTION on changes,
-        // sequence grants, and function grants to verify re-running DDL heals all of them.
+        // column-level UPDATE on changes, sequence grants, and function grants to verify re-running
+        // DDL heals all of them (including mixed-case/hyphenated app_roles).
         db_admin
             .execute(AssertSqlSafe(format!(
                 "CREATE TABLE auditstream.changes_2025_01 PARTITION OF auditstream.changes \
@@ -716,32 +717,98 @@ async fn alter_default_privileges_cannot_grant_writes_on_changes_or_child_partit
                  ALTER TABLE auditstream.changes_2025_01 OWNER TO auditstream_owner; \
                  GRANT ALL ON TABLE auditstream.changes, auditstream.changes_default, \
                    auditstream.changes_2025_01, {current_part} TO {} WITH GRANT OPTION; \
+                 GRANT UPDATE (actor, after) ON TABLE auditstream.changes TO {}; \
                  GRANT ALL ON SEQUENCE auditstream.changes_id_seq TO {}; \
                  GRANT EXECUTE ON FUNCTION auditstream.capture() TO {};",
+                quote_ident(&app_role),
                 quote_ident(&app_role),
                 quote_ident(&app_role),
                 quote_ident(&app_role),
             )))
             .await
             .expect("inject legacy leaked grants");
+        let special_role = format!("App-Role-{}", db.database_name());
+        db_admin
+            .execute(AssertSqlSafe(format!(
+                "CREATE ROLE {} NOLOGIN",
+                quote_ident(&special_role)
+            )))
+            .await
+            .expect("create mixed-case hyphenated role");
         db_admin.close().await.expect("close db_admin");
 
         let mut migrator = PgConnection::connect(db.url())
             .await
             .expect("migrator reconnect");
+        let heal_stmts = ddl::generate(&DdlOptions::new(
+            DEFAULT_SCHEMA,
+            vec![special_role.clone(), app_role.clone()],
+        ));
         let trig_stmts = auditstream_pg::triggers::generate(
             &auditstream_pg::triggers::TriggerOptions::new(DEFAULT_SCHEMA, vec![]),
         );
         let mut tx = migrator.begin().await.expect("begin healing tx");
-        run_statements(&mut tx, &stmts)
+        run_statements(&mut tx, &heal_stmts)
             .await
-            .expect("re-apply DDL to heal leaked grants");
+            .expect("re-apply DDL with hyphenated/mixed-case app_roles to heal leaked grants");
         run_statements(&mut tx, &trig_stmts)
             .await
             .expect("re-apply triggers to heal function grants");
         tx.commit().await.expect("commit healing tx");
         migrator.close().await.expect("close migrator");
+
+        let mut cleanup_admin = PgConnection::connect(&admin_url)
+            .await
+            .expect("admin drop special role");
+        // Keep app_role; remove special_role from ACLs first so DROP ROLE succeeds cleanly.
+        let (base, _) = admin_url.rsplit_once('/').expect("admin url slash");
+        let mut special_db_admin = PgConnection::connect(&format!("{base}/{}", db.database_name()))
+            .await
+            .expect("db admin revoke special role");
+        let mut tx = special_db_admin.begin().await.expect("begin re-heal");
+        run_statements(&mut tx, &stmts)
+            .await
+            .expect("re-apply default app_roles");
+        tx.commit().await.expect("commit re-heal");
+        special_db_admin.close().await.expect("close db admin");
+        let _ = cleanup_admin
+            .execute(AssertSqlSafe(format!(
+                "DROP ROLE IF EXISTS {}",
+                quote_ident(&special_role)
+            )))
+            .await;
+        cleanup_admin.close().await.expect("close cleanup_admin");
     }
+
+    // Re-assert column-level UPDATE, changes_id_seq, and capture() are all denied after healing.
+    let col_upd_err = app_conn
+        .execute("UPDATE auditstream.changes SET actor = NULL")
+        .await
+        .expect_err("column-level UPDATE on changes must be revoked after healing");
+    assert!(
+        col_upd_err.to_string().contains("permission denied"),
+        "expected permission denied for column UPDATE, got {col_upd_err}"
+    );
+    let healed_seq_err = app_conn
+        .execute("SELECT setval('auditstream.changes_id_seq', 1)")
+        .await
+        .expect_err("changes_id_seq must be revoked after healing");
+    assert!(
+        healed_seq_err.to_string().contains("permission denied"),
+        "expected permission denied on healed sequence, got {healed_seq_err}"
+    );
+    let healed_cap_err = app_conn
+        .execute(
+            "CREATE TRIGGER spoof_healed AFTER INSERT ON evil \
+             REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT \
+             EXECUTE FUNCTION auditstream.capture('[\"id\"]', '[]', 'public', 'invoice')",
+        )
+        .await
+        .expect_err("capture() EXECUTE must be revoked after healing");
+    assert!(
+        healed_cap_err.to_string().contains("permission denied"),
+        "expected permission denied on healed capture(), got {healed_cap_err}"
+    );
 
     for target in [
         "auditstream.changes",
@@ -880,9 +947,17 @@ async fn autocommit_and_failed_tx_never_leave_migrator_holding_auditstream_owner
         let mut tx = conn.begin().await.expect("begin failing tx");
         let mut failing_stmts = stmts.clone();
         failing_stmts.insert(failing_stmts.len() - 1, "SELECT 1 / 0".to_owned());
-        let _ = run_statements(&mut tx, &failing_stmts)
+        let div_err = run_statements(&mut tx, &failing_stmts)
             .await
             .expect_err("injected error fails tx");
+        assert_eq!(
+            div_err
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("22012"),
+            "expected division_by_zero (22012) after role setup ran, got: {div_err}"
+        );
         tx.rollback().await.expect("rollback failed tx");
     }
 
@@ -967,6 +1042,23 @@ async fn autocommit_and_failed_tx_never_leave_migrator_holding_auditstream_owner
         assert!(
             !has_set_after_noinherit,
             "NOINHERIT migrator must not retain SET on {OWNER_ROLE} after commit"
+        );
+        let has_self_zombie: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+               SELECT 1 FROM pg_catalog.pg_auth_members m \
+               JOIN pg_catalog.pg_roles r ON r.oid = m.roleid \
+               JOIN pg_catalog.pg_roles u ON u.oid = m.member \
+              WHERE r.rolname = $2 AND u.rolname = $1 AND m.grantor = u.oid \
+             )",
+        )
+        .bind(&migrator_role)
+        .bind(OWNER_ROLE)
+        .fetch_one(&mut conn)
+        .await
+        .expect("check self-granted zombie row");
+        assert!(
+            !has_self_zombie,
+            "PG 16+ cleanup must delete temporary self-granted row without leaving a zombie tuple"
         );
     } else {
         let has_member_after_noinherit: bool =
