@@ -7,7 +7,7 @@
 | Code | Name | Meaning |
 | --- | --- | --- |
 | `0` | Success | Command succeeded (including `--help`, `--version` and closed stdout pipe `BrokenPipe`) |
-| `1` | Check failed | Verification or health check found problems (for example `auditstream verify` drift or rows in `DEFAULT` partition) |
+| `1` | Check failed | Verification or health check found problems (for example `auditstream verify` drift, unsafe privileges, invalid ownership, primary-key exclusions, or rows in `DEFAULT` partition) |
 | `2` | Usage or config error | Invalid CLI arguments (clap), missing `--config` file, unknown config key or invalid config value type |
 | `3` | Database error | Postgres connection, permission, query or migration failure |
 | `4` | Output or cursor error | Failure reading or writing an output file, migration directory or cursor file |

@@ -9,6 +9,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - `auditstream_update` MUST NOT have a `WHEN` clause; `capture()` compares the JSONB row images after removing excluded columns and writes no history row when they are equal. `UPDATE` capture now works on tables with `json`, `xml`, or `point` columns and records changes that type equality ignores, such as a case-only change in a `citext` column. Added the `json-column-updates` capture conformance case.
+- Strings and object keys in actor, `onBehalfOf`, `context`, and `request.jwt.claims` payloads MUST NOT contain NUL (`U+0000`, raw `0x00` or `\u0000`). Encoders MUST reject payloads containing NUL; readers and decoders MUST yield `actor = NULL`, `context = NULL`, `actor_source = 'invalid'`. Updated `spec/schemas/actor.schema.json`, `spec/schemas/event.schema.json`, and `spec/conformance/transport/{encode,decode,precedence}.json`.
+- Clarified in `spec/history-table.md` that primary key columns MUST NOT be excluded, that `auditstream.changes` and its child partitions MUST be created under `auditstream_owner` (protected from `ALTER DEFAULT PRIVILEGES`), and that temporary `auditstream_owner` elevation MUST be transaction-scoped.
 
 ## [0.1.1] - 2026-11-24
 

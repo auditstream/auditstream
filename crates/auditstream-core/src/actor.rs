@@ -59,13 +59,26 @@ impl NestedActor {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::EmptyActorId`] or [`CoreError::EmptyTenant`] if invalid.
+    /// Returns [`CoreError::EmptyActorId`], [`CoreError::EmptyTenant`], or
+    /// [`CoreError::NullByteInField`] if invalid.
     pub fn validate(&self) -> Result<(), CoreError> {
         if self.id.is_empty() {
             return Err(CoreError::EmptyActorId);
         }
-        if self.tenant.as_deref().is_some_and(str::is_empty) {
-            return Err(CoreError::EmptyTenant);
+        if self.id.contains('\0') {
+            return Err(CoreError::NullByteInField {
+                field: "onBehalfOf.id",
+            });
+        }
+        if let Some(tenant) = self.tenant.as_deref() {
+            if tenant.is_empty() {
+                return Err(CoreError::EmptyTenant);
+            }
+            if tenant.contains('\0') {
+                return Err(CoreError::NullByteInField {
+                    field: "onBehalfOf.tenant",
+                });
+            }
         }
         Ok(())
     }
@@ -106,6 +119,7 @@ fn parse_non_empty_field<'de, A>(
     slot: &mut Option<String>,
     field: &'static str,
     empty_error: &'static str,
+    nul_error: &'static str,
     map: &mut A,
 ) -> Result<(), A::Error>
 where
@@ -118,22 +132,161 @@ where
     if value.is_empty() {
         return Err(de::Error::custom(empty_error));
     }
+    if value.contains('\0') {
+        return Err(de::Error::custom(nul_error));
+    }
     *slot = Some(value);
     Ok(())
+}
+
+/// Discards an unknown forward-compatible JSON value while still rejecting NUL (`U+0000`)
+/// characters anywhere inside nested strings, arrays, or object keys/values (`spec/actor.md`).
+pub(crate) struct NoNulIgnoredAny;
+
+struct NoNulIgnoredKey;
+
+impl<'de> Deserialize<'de> for NoNulIgnoredKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct NoNulKeyVisitor;
+
+        impl Visitor<'_> for NoNulKeyVisitor {
+            type Value = NoNulIgnoredKey;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a JSON object key without NUL characters")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if v.contains('\0') {
+                    return Err(de::Error::custom(
+                        "payload object keys must not contain NUL characters",
+                    ));
+                }
+                Ok(NoNulIgnoredKey)
+            }
+        }
+
+        deserializer.deserialize_str(NoNulKeyVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for NoNulIgnoredAny {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct NoNulIgnoredVisitor;
+
+        impl<'de> Visitor<'de> for NoNulIgnoredVisitor {
+            type Value = NoNulIgnoredAny;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("any JSON value without NUL characters")
+            }
+
+            fn visit_bool<E>(self, _v: bool) -> Result<Self::Value, E> {
+                Ok(NoNulIgnoredAny)
+            }
+
+            fn visit_i64<E>(self, _v: i64) -> Result<Self::Value, E> {
+                Ok(NoNulIgnoredAny)
+            }
+
+            fn visit_i128<E>(self, _v: i128) -> Result<Self::Value, E> {
+                Ok(NoNulIgnoredAny)
+            }
+
+            fn visit_u64<E>(self, _v: u64) -> Result<Self::Value, E> {
+                Ok(NoNulIgnoredAny)
+            }
+
+            fn visit_u128<E>(self, _v: u128) -> Result<Self::Value, E> {
+                Ok(NoNulIgnoredAny)
+            }
+
+            fn visit_f64<E>(self, _v: f64) -> Result<Self::Value, E> {
+                Ok(NoNulIgnoredAny)
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if v.contains('\0') {
+                    return Err(de::Error::custom(
+                        "payload string values must not contain NUL characters",
+                    ));
+                }
+                Ok(NoNulIgnoredAny)
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(NoNulIgnoredAny)
+            }
+
+            fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+            where
+                D2: Deserializer<'de>,
+            {
+                NoNulIgnoredAny::deserialize(deserializer)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(NoNulIgnoredAny)
+            }
+
+            fn visit_newtype_struct<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+            where
+                D2: Deserializer<'de>,
+            {
+                NoNulIgnoredAny::deserialize(deserializer)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                while seq.next_element::<NoNulIgnoredAny>()?.is_some() {}
+                Ok(NoNulIgnoredAny)
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                while map.next_key::<NoNulIgnoredKey>()?.is_some() {
+                    let _: NoNulIgnoredAny = map.next_value()?;
+                }
+                Ok(NoNulIgnoredAny)
+            }
+        }
+
+        deserializer.deserialize_any(NoNulIgnoredVisitor)
+    }
 }
 
 fn parse_actor_map<'de, A>(mut map: A, kind: ActorMapKind) -> Result<ParsedActorMap, A::Error>
 where
     A: MapAccess<'de>,
 {
-    let (empty_id_msg, empty_tenant_msg) = match kind {
+    let (empty_id_msg, nul_id_msg, empty_tenant_msg, nul_tenant_msg) = match kind {
         ActorMapKind::Nested => (
             "onBehalfOf.id must not be empty",
+            "onBehalfOf.id must not contain NUL characters",
             "onBehalfOf.tenant must not be empty",
+            "onBehalfOf.tenant must not contain NUL characters",
         ),
         ActorMapKind::Primary | ActorMapKind::Payload => (
             "actor.id must not be empty",
+            "actor.id must not contain NUL characters",
             "actor.tenant must not be empty",
+            "actor.tenant must not contain NUL characters",
         ),
     };
 
@@ -144,10 +297,21 @@ where
     let mut context: Option<Context> = None;
 
     while let Some(key) = map.next_key::<String>()? {
+        if key.contains('\0') {
+            return Err(de::Error::custom(
+                "actor object keys must not contain NUL characters",
+            ));
+        }
         match key.as_str() {
             "type" => parse_unique_field(&mut actor_type, "type", &mut map)?,
-            "id" => parse_non_empty_field(&mut id, "id", empty_id_msg, &mut map)?,
-            "tenant" => parse_non_empty_field(&mut tenant, "tenant", empty_tenant_msg, &mut map)?,
+            "id" => parse_non_empty_field(&mut id, "id", empty_id_msg, nul_id_msg, &mut map)?,
+            "tenant" => parse_non_empty_field(
+                &mut tenant,
+                "tenant",
+                empty_tenant_msg,
+                nul_tenant_msg,
+                &mut map,
+            )?,
             "onBehalfOf" if kind == ActorMapKind::Nested => {
                 let _: IgnoredAny = map.next_value()?;
                 return Err(de::Error::custom(
@@ -159,7 +323,7 @@ where
                 parse_unique_field(&mut context, "context", &mut map)?;
             }
             _ => {
-                let _: IgnoredAny = map.next_value()?;
+                let _: NoNulIgnoredAny = map.next_value()?;
             }
         }
     }
@@ -254,13 +418,24 @@ impl Actor {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError`] if `id` is empty, `tenant` is empty, or `on_behalf_of` is invalid.
+    /// Returns [`CoreError`] if `id` or `tenant` is empty or contains a NUL character, or
+    /// `on_behalf_of` is invalid.
     pub fn validate(&self) -> Result<(), CoreError> {
         if self.id.is_empty() {
             return Err(CoreError::EmptyActorId);
         }
-        if self.tenant.as_deref().is_some_and(str::is_empty) {
-            return Err(CoreError::EmptyTenant);
+        if self.id.contains('\0') {
+            return Err(CoreError::NullByteInField { field: "actor.id" });
+        }
+        if let Some(tenant) = self.tenant.as_deref() {
+            if tenant.is_empty() {
+                return Err(CoreError::EmptyTenant);
+            }
+            if tenant.contains('\0') {
+                return Err(CoreError::NullByteInField {
+                    field: "actor.tenant",
+                });
+            }
         }
         if let Some(nested) = &self.on_behalf_of {
             nested.validate()?;

@@ -182,15 +182,54 @@ fn is_valid_context_object(value: &Value) -> bool {
         .all(|key| is_valid_optional_non_empty_string(ctx, key))
 }
 
+/// Returns `true` if a syntactically valid JSON text `raw` contains a raw NUL byte (`0x00`)
+/// or an unescaped `\u0000` escape inside any JSON string literal (object key or string value).
+///
+/// Scanning the raw JSON text rather than only the deduplicated `serde_json::Value` tree catches
+/// `\u0000` even inside overwritten duplicate object keys, matching PostgreSQL's `::jsonb` lexer
+/// (`SQLSTATE 22P05`) without heap allocations. Escaped backslashes (`\\u0000`) are skipped cleanly.
+pub(crate) fn raw_json_contains_nul(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    if bytes.contains(&0) {
+        return true;
+    }
+    let len = bytes.len();
+    let mut i = 0;
+    let mut in_string = false;
+
+    while i < len {
+        match bytes[i] {
+            0 => return true,
+            b'"' => {
+                in_string = !in_string;
+                i += 1;
+            }
+            b'\\' if in_string => {
+                if bytes.get(i + 1..i + 6) == Some(b"u0000") {
+                    return true;
+                }
+                // Advance past the escaped byte so `\\u0000` is treated as literal `\` + `u0000`.
+                i = (i + 2).min(len);
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
 /// Validates and splits a JSON string using the full `spec/actor.md` and `spec/transport.md` rules:
 /// JSON object with valid enum `type`, non-empty string `id`, optional valid `tenant` and
-/// single-level `onBehalfOf`, and optional `context` object with non-empty known fields.
+/// single-level `onBehalfOf`, optional `context` object with non-empty known fields, and no
+/// NUL characters (`U+0000`) anywhere in the payload.
 pub(crate) fn parse_trigger_actor_json(raw_json: &str) -> DecodedActor {
-    if raw_json.len() > MAX_PAYLOAD_BYTES {
+    if raw_json.len() > MAX_PAYLOAD_BYTES || raw_json_contains_nul(raw_json) {
         return DecodedActor::Invalid;
     }
 
-    let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(raw_json) else {
+    let Ok(val) = serde_json::from_str::<Value>(raw_json) else {
+        return DecodedActor::Invalid;
+    };
+    let Value::Object(mut map) = val else {
         return DecodedActor::Invalid;
     };
 

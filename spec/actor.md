@@ -13,9 +13,9 @@ An actor payload MUST be a JSON object describing who initiated a database write
 | Field | JSON type | Presence | Meaning |
 | --- | --- | --- | --- |
 | `type` | `string` | MUST | Actor category. MUST be one of `user`, `api_key`, `ai_agent`, `service`, `system`. |
-| `id` | `string` | MUST | Non-empty opaque identifier for the actor (`minLength: 1`). No other format rule is imposed. |
+| `id` | `string` | MUST | Non-empty opaque identifier for the actor (`minLength: 1`). MUST NOT contain NUL (`U+0000`). No other format rule is imposed. |
 | `onBehalfOf` | `object` | MAY | One nested actor on whose behalf the primary actor acted (for example, an `ai_agent` acting for a `user`). |
-| `tenant` | `string` | MAY | Non-empty opaque tenant or organization identifier (`minLength: 1`). No other format rule is imposed. |
+| `tenant` | `string` | MAY | Non-empty opaque tenant or organization identifier (`minLength: 1`). MUST NOT contain NUL (`U+0000`). No other format rule is imposed. |
 | `context` | `object` | MAY | Request or execution context traveling in the same payload as the actor. |
 
 ### `onBehalfOf` nesting limit
@@ -33,13 +33,22 @@ When present, `context` MUST be a JSON object carried under the `context` key of
 | `ip` | `string` | MAY (opt-in) | Client IP address. SHOULD NOT be sent unless explicitly enabled by the application. |
 | `userAgent` | `string` | MAY (opt-in) | Client user-agent string. SHOULD NOT be sent unless explicitly enabled by the application. |
 
+## Character restrictions (NUL prohibition)
+
+String values and object keys anywhere in an actor or context payload (including `onBehalfOf` and additional forward-compatible keys) MUST NOT contain the Unicode NUL character (`U+0000`), whether encoded as a raw `0x00` byte or as a JSON `\u0000` escape sequence.
+
+- Encoders MUST reject any payload containing `U+0000` with an error before sending SQL.
+- Readers and decoders MUST treat any payload containing `U+0000` as malformed (`actor = NULL`, `context = NULL`, `actor_source = 'invalid'`).
+
+*(Informative)* PostgreSQL `jsonb` cannot store `U+0000` (`SQLSTATE 22P05`). Allowing encoders to emit `\u0000` causes database writes to succeed while silently erasing attribution (`actor = NULL`, `actor_source = 'invalid'`). Host languages with UTF-16 strings (such as JavaScript) should also reject lone UTF-16 surrogates, which cannot be encoded as valid UTF-8 for PostgreSQL.
+
 ## Privacy rule (IDs only)
 
 Actor payloads SHOULD carry opaque identifiers only. Personal data such as names, email addresses, and IP addresses SHOULD NOT be sent by default, because SQL comments appear in `pg_stat_activity`, PostgreSQL server logs, and the first query sample kept by `pg_stat_statements`. The `context.ip` and `context.userAgent` fields are opt-in only.
 
 ## Forward compatibility and unknown keys
 
-Readers MUST ignore unknown keys in both actor and context objects. Adding a new optional field to the contract is therefore a backwards-compatible minor specification release. Accordingly, [spec/schemas/actor.schema.json](schemas/actor.schema.json) sets `additionalProperties: true` on actor and context objects (while explicitly forbidding `onBehalfOf` inside `onBehalfOf`).
+Readers MUST ignore unknown keys in both actor and context objects. Adding a new optional field to the contract is therefore a backwards-compatible minor specification release. Accordingly, [spec/schemas/actor.schema.json](schemas/actor.schema.json) permits additional properties on actor and context objects as long as object keys and string values contain no `U+0000` (while explicitly forbidding `onBehalfOf` inside `onBehalfOf`).
 
 ## Size limit
 

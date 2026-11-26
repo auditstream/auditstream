@@ -138,6 +138,159 @@ fn payload_size_limit_enforces_exact_512_and_513_utf8_bytes() {
 }
 
 #[test]
+fn actor_and_context_reject_nul_characters_across_all_fields() {
+    let bad_id = Actor::new(ActorType::User, "usr\0_1");
+    assert!(matches!(
+        bad_id.validate(),
+        Err(CoreError::NullByteInField { field: "actor.id" })
+    ));
+
+    let mut bad_tenant = Actor::new(ActorType::User, "usr_1");
+    bad_tenant.tenant = Some("org\0acme".to_owned());
+    assert!(matches!(
+        bad_tenant.validate(),
+        Err(CoreError::NullByteInField {
+            field: "actor.tenant"
+        })
+    ));
+
+    let mut bad_obo_id = Actor::new(ActorType::AiAgent, "agent_1");
+    bad_obo_id.on_behalf_of = Some(NestedActor::new(ActorType::User, "usr\0_2"));
+    assert!(matches!(
+        bad_obo_id.validate(),
+        Err(CoreError::NullByteInField {
+            field: "onBehalfOf.id"
+        })
+    ));
+
+    let mut bad_obo_tenant_nested = NestedActor::new(ActorType::User, "usr_2");
+    bad_obo_tenant_nested.tenant = Some("t\u{0000}1".to_owned());
+    let mut bad_obo_tenant = Actor::new(ActorType::AiAgent, "agent_1");
+    bad_obo_tenant.on_behalf_of = Some(bad_obo_tenant_nested);
+    assert!(matches!(
+        bad_obo_tenant.validate(),
+        Err(CoreError::NullByteInField {
+            field: "onBehalfOf.tenant"
+        })
+    ));
+
+    let valid_actor = Actor::new(ActorType::User, "usr_1");
+    for (ctx, expected_field) in [
+        (
+            Context {
+                request_id: Some("req\0_1".to_owned()),
+                ..Context::default()
+            },
+            "context.requestId",
+        ),
+        (
+            Context {
+                source: Some("api\0".to_owned()),
+                ..Context::default()
+            },
+            "context.source",
+        ),
+        (
+            Context {
+                ip: Some("127.0.0.1\0".to_owned()),
+                ..Context::default()
+            },
+            "context.ip",
+        ),
+        (
+            Context {
+                user_agent: Some("ua\0/1".to_owned()),
+                ..Context::default()
+            },
+            "context.userAgent",
+        ),
+    ] {
+        let err = validate_actor_payload(&valid_actor, Some(&ctx)).expect_err("NUL must fail");
+        assert!(
+            matches!(err, CoreError::NullByteInField { field } if field == expected_field),
+            "expected NullByteInField({expected_field}), got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn deserialization_and_op_reject_nul_characters() {
+    // Deserialization must also reject NUL characters in keys, known fields, or unknown values.
+    assert!(serde_json::from_str::<Actor>(r#"{"type":"user","id":"u\u00001"}"#).is_err());
+    assert!(
+        serde_json::from_str::<Actor>(r#"{"type":"user","id":"u1","bad\u0000key":1}"#).is_err()
+    );
+    assert!(
+        serde_json::from_str::<Actor>(r#"{"type":"user","id":"u1","extra":"a\u0000b"}"#).is_err()
+    );
+    assert!(
+        serde_json::from_str::<Actor>(
+            r#"{"type":"user","id":"u1","context":{"requestId":"r\u00001"}}"#
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_str::<ActorPayload>(
+            r#"{"type":"user","id":"u1","extra":{"bad\u0000k":"v"}}"#
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_str::<ActorPayload>(r#"{"type":"user","id":"u1","extra":["a\u0000b"]}"#)
+            .is_err()
+    );
+    assert!(
+        serde_json::from_str::<NestedActor>(r#"{"type":"user","id":"u2","extra":"a\u0000b"}"#)
+            .is_err()
+    );
+    assert!(serde_json::from_str::<Context>(r#"{"requestId":"r\u00001"}"#).is_err());
+    assert!(serde_json::from_str::<Context>(r#"{"bad\u0000key":"v"}"#).is_err());
+    assert!(serde_json::from_str::<Context>(r#"{"extra":"a\u0000b"}"#).is_err());
+    assert!(serde_json::from_str::<Context>(r#"{"requestId":"r1","requestId":"r2"}"#).is_err());
+
+    // Application event action must also reject NUL characters.
+    assert!(matches!(
+        Op::app("invoice\0exported"),
+        Err(CoreError::NullByteInField { field: "action" })
+    ));
+}
+
+#[test]
+fn actor_schema_rejects_nul_in_keys_and_nested_values_while_allowing_escaped_backslash() {
+    let actor_validator = load_schema("schemas/actor.schema.json");
+    for invalid in [
+        serde_json::json!({"type": "user", "id": "u\u{0000}1"}),
+        serde_json::json!({"type": "user", "id": "u1", "bad\u{0000}key": 1}),
+        serde_json::json!({"type": "user", "id": "u1", "extra": "a\u{0000}b"}),
+        serde_json::json!({
+            "type": "ai_agent",
+            "id": "a1",
+            "onBehalfOf": {"type": "user", "id": "u2", "extra": "a\u{0000}b"}
+        }),
+        serde_json::json!({
+            "type": "user",
+            "id": "u1",
+            "context": {"requestId": "r\u{0000}1"}
+        }),
+        serde_json::json!({
+            "type": "user",
+            "id": "u1",
+            "context": {"extra": ["a\u{0000}b"], "nested": {"k\u{0000}1": "v"}}
+        }),
+    ] {
+        assert!(
+            !actor_validator.is_valid(&invalid),
+            "actor.schema.json must reject {invalid}"
+        );
+    }
+    assert!(actor_validator.is_valid(&serde_json::json!({
+        "type": "user",
+        "id": "usuário\\u0000\n🚀",
+        "extra": {"empty": "", "list": [1, true, null, "ok"]}
+    })));
+}
+
+#[test]
 fn op_maps_dml_variants_and_app_actions_in_both_directions() {
     for (wire, expected) in [
         ("INSERT", Op::Insert),
@@ -252,6 +405,11 @@ fn event_preserves_arbitrary_precision_numeric_and_validates_against_event_schem
         !validator.is_valid(&bad_obo),
         "event.schema.json must reject unknown actor.onBehalfOf.type"
     );
+    assert_event_schema_rejects_nul(&validator, &value);
+    assert!(serde_json::from_str::<Op>("\"invoice\\u0000exported\"").is_err());
+    let mut bad_op_event = value.clone();
+    bad_op_event["op"] = serde_json::json!("invoice\u{0000}exported");
+    assert!(serde_json::from_value::<Event>(bad_op_event).is_err());
 
     let round_tripped: Event = serde_json::from_str(&serialized).expect("deserialize event");
     assert_eq!(round_tripped, event);
@@ -263,6 +421,96 @@ fn event_preserves_arbitrary_precision_numeric_and_validates_against_event_schem
             .get()
             .contains("12345678901234567890.123456789")
     );
+}
+
+fn assert_event_schema_rejects_nul(validator: &jsonschema::Validator, base_event: &Value) {
+    for (field, payload) in [
+        ("op", serde_json::json!("invoice\u{0000}exported")),
+        ("schema_name", serde_json::json!("pub\u{0000}lic")),
+        ("table_name", serde_json::json!("inv\u{0000}oice")),
+        ("changed", serde_json::json!(["to\u{0000}tal"])),
+        ("db_user", serde_json::json!("app\u{0000}user")),
+        ("record_id", serde_json::json!({"id": "1\u{0000}2"})),
+        ("before", serde_json::json!({"k\u{0000}1": 1})),
+        ("after", serde_json::json!({"nested": ["a\u{0000}b"]})),
+        (
+            "actor",
+            serde_json::json!({"type": "user", "id": "u\u{0000}1"}),
+        ),
+        (
+            "actor",
+            serde_json::json!({"type": "user", "id": "u1", "bad\u{0000}k": 1}),
+        ),
+        (
+            "actor",
+            serde_json::json!({"type": "user", "id": "u1", "extra": "a\u{0000}b"}),
+        ),
+        ("context", serde_json::json!({"requestId": "r\u{0000}1"})),
+        ("context", serde_json::json!({"extra": ["a\u{0000}b"]})),
+    ] {
+        let mut bad_nul = base_event.clone();
+        bad_nul[field] = payload;
+        assert!(
+            !validator.is_valid(&bad_nul),
+            "event.schema.json must reject NUL in {field}: {bad_nul}"
+        );
+    }
+}
+
+#[test]
+fn unknown_fields_with_wide_integers_and_arbitrary_precision_round_trip_through_from_value() {
+    let raw = r#"{
+        "type": "user",
+        "id": "u1",
+        "u64_val": 42,
+        "i64_val": -42,
+        "neg_zero": -0,
+        "float_val": 1.5,
+        "u128_val": 18446744073709551616,
+        "i128_val": -9223372036854775809,
+        "huge_dec": 123456789012345678901234567890.123456789,
+        "bool_val": true,
+        "null_val": null,
+        "arr_val": [18446744073709551616, -9223372036854775809, "ok", null],
+        "obj_val": {"nested_u128": 18446744073709551616},
+        "context": {
+            "requestId": "r1",
+            "big_u128": 18446744073709551616,
+            "big_i128": -9223372036854775809
+        }
+    }"#;
+
+    let from_str_actor: Actor = serde_json::from_str(raw).expect("from_str Actor");
+    assert_eq!(from_str_actor.id, "u1");
+
+    let value: Value = serde_json::from_str(raw).expect("parse Value");
+    let from_val_actor: Actor = serde_json::from_value(value.clone()).expect("from_value Actor");
+    assert_eq!(from_val_actor, from_str_actor);
+
+    let from_val_payload: ActorPayload =
+        serde_json::from_value(value.clone()).expect("from_value ActorPayload");
+    assert_eq!(from_val_payload.id, "u1");
+    assert_eq!(
+        from_val_payload
+            .context
+            .as_ref()
+            .and_then(|c| c.request_id.as_deref()),
+        Some("r1")
+    );
+
+    let from_val_ctx: Context =
+        serde_json::from_value(value["context"].clone()).expect("from_value Context");
+    assert_eq!(from_val_ctx.request_id.as_deref(), Some("r1"));
+
+    // Verify DecodedActor::into_actor() via transport::decode with u128 unknown field.
+    let decoded = auditstream_core::transport::decode(
+        "UPDATE t SET x=1 /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidTEiLCJzZXEiOjE4NDQ2NzQ0MDczNzA5NTUxNjE2fQ'*/",
+    );
+    let actor = decoded
+        .into_actor()
+        .expect("DecodedActor::into_actor must handle u128 unknown fields")
+        .expect("valid actor");
+    assert_eq!(actor.id, "u1");
 }
 
 #[test]
@@ -279,6 +527,41 @@ fn cursor_orders_by_xact_id_then_id_and_batch_holds_cursor() {
     assert!(empty.is_empty());
     assert_eq!(empty.len(), 0);
     assert_eq!(empty.cursor, None);
+}
+
+fn assert_invalid_actor_examples(actor_validator: &jsonschema::Validator) {
+    let actor_invalid_dir = spec_dir().join("schemas/examples/actor/invalid");
+    let mut actor_invalid_count = 0usize;
+    for entry in fs::read_dir(&actor_invalid_dir).expect("read actor/invalid") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = fs::read_to_string(&path).expect("read invalid actor example");
+        let ok = serde_json::from_str::<ActorPayload>(&raw)
+            .ok()
+            .and_then(|p| p.validate().ok())
+            .is_some();
+        assert!(
+            !ok,
+            "invalid actor example {} unexpectedly passed",
+            path.display()
+        );
+        if let Ok(val) = serde_json::from_str::<Value>(&raw)
+            && !path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("oversized"))
+        {
+            assert!(
+                !actor_validator.is_valid(&val),
+                "invalid actor example {} unexpectedly passed actor.schema.json",
+                path.display()
+            );
+        }
+        actor_invalid_count += 1;
+    }
+    assert!(actor_invalid_count >= 7);
 }
 
 #[test]
@@ -323,27 +606,8 @@ fn deserializes_every_spec_example_and_validates_schemas_on_disk() {
     }
     assert!(actor_valid_count >= 7);
 
-    // Every invalid actor example on disk must fail deserialization or validation.
-    let actor_invalid_dir = spec_dir().join("schemas/examples/actor/invalid");
-    let mut actor_invalid_count = 0usize;
-    for entry in fs::read_dir(&actor_invalid_dir).expect("read actor/invalid") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
-        let raw = fs::read_to_string(&path).expect("read invalid actor example");
-        let ok = serde_json::from_str::<ActorPayload>(&raw)
-            .ok()
-            .and_then(|p| p.validate().ok())
-            .is_some();
-        assert!(
-            !ok,
-            "invalid actor example {} unexpectedly passed",
-            path.display()
-        );
-        actor_invalid_count += 1;
-    }
-    assert!(actor_invalid_count >= 7);
+    // Every invalid actor example on disk must fail deserialization, validation, and actor.schema.json.
+    assert_invalid_actor_examples(&actor_validator);
 
     // Every valid event example on disk.
     let event_valid_dir = spec_dir().join("schemas/examples/event/valid");

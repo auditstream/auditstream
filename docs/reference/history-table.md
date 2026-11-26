@@ -50,7 +50,7 @@ The primary key is `(id, occurred_at)` to satisfy PostgreSQL range partitioning.
 | `auditstream_delete` | `AFTER DELETE ... FOR EACH STATEMENT` | Resolves actor once per statement; records `before` |
 | `auditstream_truncate` | `AFTER TRUNCATE ... FOR EACH STATEMENT` | Records table and actor with `NULL` row images |
 
-Excluded columns never appear in `before`, `after`, or `changed`.
+Excluded columns never appear in `before`, `after`, or `changed`. Primary key columns cannot be excluded so `record_id` is never nullified.
 
 ## Application events (`auditstream.log_event`)
 
@@ -71,10 +71,12 @@ SELECT auditstream.log_event(
 
 ## Security model
 
-- A `NOLOGIN` role named `auditstream_owner` owns the schema, history table, partitions, and functions.
+- A `NOLOGIN` role named `auditstream_owner` owns the schema, history table, all child partitions, the `changes_id_seq` identity sequence, and all helper functions (`capture()`, `resolve_actor()`, and `log_event()`).
 - `auditstream.capture()`, `auditstream.resolve_actor()`, and `auditstream.log_event()` run as `SECURITY DEFINER` with `SET search_path = pg_catalog, pg_temp`.
+- `auditstream.capture()` verifies that `TG_RELID` matches or is a partition descendant (`pg_partition_ancestors`) of its configured parent table, preventing forged `source = 'db'` rows from triggers attached to unrelated tables.
+- Migrations and partition maintenance sanitize ACLs with `CASCADE` to neutralize permissive `ALTER DEFAULT PRIVILEGES` rules: `PUBLIC` has no grants, child partitions and `changes_id_seq` have zero non-owner grants, `capture()` and `resolve_actor()` have zero non-owner `EXECUTE` grants, and `changes` only permits non-grantable `SELECT` for non-owners.
 - Application roles should hold `USAGE` on `auditstream`, `SELECT` on `auditstream.changes`, and `EXECUTE` on `auditstream.log_event`.
-- Application roles hold no `INSERT`, `UPDATE`, `DELETE`, or `TRUNCATE` privileges on `auditstream.changes`.
+- Application roles hold no `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, or `WITH GRANT OPTION` privileges on `auditstream.changes` or its partitions.
 
 ## Export cursor contract
 

@@ -77,7 +77,21 @@ pub fn resolve_precedence(
     }
 
     if let Some(claims_str) = jwt_claims_raw.filter(|s| !s.is_empty()) {
-        let Ok(Value::Object(claims)) = serde_json::from_str::<Value>(claims_str) else {
+        if comment::raw_json_contains_nul(claims_str) {
+            return ResolvedActor {
+                actor: None,
+                context: None,
+                actor_source: Some(ActorSource::Invalid),
+            };
+        }
+        let Ok(claims_val) = serde_json::from_str::<Value>(claims_str) else {
+            return ResolvedActor {
+                actor: None,
+                context: None,
+                actor_source: Some(ActorSource::Invalid),
+            };
+        };
+        let Value::Object(claims) = claims_val else {
             return ResolvedActor {
                 actor: None,
                 context: None,

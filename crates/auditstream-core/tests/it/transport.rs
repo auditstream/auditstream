@@ -275,6 +275,93 @@ fn set_config_uses_bound_parameter_and_rejects_oversized_payload() {
         set_config(&oversized),
         Err(CoreError::PayloadTooLarge { .. })
     ));
+
+    let nul_actor = Actor::new(ActorType::User, "usr\0_42");
+    assert!(matches!(
+        encode(&nul_actor),
+        Err(CoreError::NullByteInField { field: "actor.id" })
+    ));
+    assert!(matches!(
+        set_config(&nul_actor),
+        Err(CoreError::NullByteInField { field: "actor.id" })
+    ));
+    assert!(matches!(
+        tag("SELECT 1", &nul_actor),
+        Err(CoreError::NullByteInField { field: "actor.id" })
+    ));
+
+    let nul_ctx = Context {
+        request_id: Some("req\0_1".to_owned()),
+        ..Context::default()
+    };
+    assert!(matches!(
+        encode_with_context(&actor, Some(&nul_ctx)),
+        Err(CoreError::NullByteInField {
+            field: "context.requestId"
+        })
+    ));
+    assert!(matches!(
+        set_config_with_context(&actor, Some(&nul_ctx)),
+        Err(CoreError::NullByteInField {
+            field: "context.requestId"
+        })
+    ));
+    assert!(matches!(
+        tag_with_context("SELECT 1", &actor, Some(&nul_ctx)),
+        Err(CoreError::NullByteInField {
+            field: "context.requestId"
+        })
+    ));
+
+    let mut nul_obo = Actor::new(ActorType::AiAgent, "agent_1");
+    nul_obo.on_behalf_of = Some(NestedActor::new(ActorType::User, "usr\0_9"));
+    assert!(matches!(
+        encode_with_context(&nul_obo, None),
+        Err(CoreError::NullByteInField {
+            field: "onBehalfOf.id"
+        })
+    ));
+
+    // Escaped backslash followed by literal `u0000` (`\\u0000`) is NOT a NUL escape and MUST succeed.
+    let res_literal_backslash = resolve_precedence(
+        "SELECT 1",
+        Some(r#"{"type":"user","id":"a\\u0000b"}"#),
+        None,
+    );
+    assert_eq!(
+        res_literal_backslash.actor_source,
+        Some(ActorSource::SetConfig)
+    );
+    assert_eq!(
+        res_literal_backslash.actor,
+        Some(serde_json::json!({"type": "user", "id": r"a\u0000b"}))
+    );
+
+    // Precedence rejects NUL in both set_config and jwt_claims (raw byte, JSON \u0000 escape,
+    // or shadowed duplicate keys).
+    let res_raw_sc = resolve_precedence(
+        "SELECT 1",
+        Some("{\"type\":\"user\",\"id\":\"u\u{0000}1\"}"),
+        None,
+    );
+    assert_eq!(res_raw_sc.actor_source, Some(ActorSource::Invalid));
+    assert_eq!(res_raw_sc.actor, None);
+
+    let res_dup_sc = resolve_precedence(
+        "SELECT 1",
+        Some(r#"{"type":"user","id":"u\u00001","id":"u1"}"#),
+        None,
+    );
+    assert_eq!(res_dup_sc.actor_source, Some(ActorSource::Invalid));
+    assert_eq!(res_dup_sc.actor, None);
+
+    let res_jwt_extra = resolve_precedence(
+        "SELECT 1",
+        None,
+        Some(r#"{"sub":"u1","extra":"bad\u0000val"}"#),
+    );
+    assert_eq!(res_jwt_extra.actor_source, Some(ActorSource::Invalid));
+    assert_eq!(res_jwt_extra.actor, None);
 }
 
 fn arb_actor_type() -> impl Strategy<Value = ActorType> {

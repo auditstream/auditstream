@@ -195,14 +195,30 @@ pub enum PreviewOutcome {
     },
 }
 
+fn validate_options(options: &MigrationOptions) -> Result<(), MigrationError> {
+    for spec in &options.tables {
+        let pk_excluded = spec.excluded_primary_key_columns();
+        if !pk_excluded.is_empty() {
+            return Err(MigrationError::InvalidMetadata(format!(
+                "cannot exclude primary key column(s) {} on `{}.{}`: primary key columns are required to build `record_id`",
+                pk_excluded.join(", "),
+                spec.schema,
+                spec.table,
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Renders the migration SQL that [`write()`] would generate without creating directories or
 /// writing any files on disk.
 ///
 /// # Errors
 ///
 /// Returns [`MigrationError::Io`] on filesystem read errors or [`MigrationError::InvalidMetadata`]
-/// if an existing Drizzle `meta/_journal.json` or Auditstream manifest cannot be parsed.
+/// if an existing Drizzle `meta/_journal.json`, Auditstream manifest, or table exclusion spec is invalid.
 pub fn preview(options: &MigrationOptions) -> Result<PreviewOutcome, MigrationError> {
+    validate_options(options)?;
     match options.format {
         MigrationFormat::Prisma => prisma::preview(options),
         MigrationFormat::Drizzle => drizzle::preview(options),
@@ -223,8 +239,9 @@ pub fn preview(options: &MigrationOptions) -> Result<PreviewOutcome, MigrationEr
 /// # Errors
 ///
 /// Returns [`MigrationError::Io`] on filesystem errors or [`MigrationError::InvalidMetadata`]
-/// if an existing Drizzle `meta/_journal.json` cannot be parsed.
+/// if an existing Drizzle `meta/_journal.json` or table exclusion spec is invalid.
 pub fn write(options: &MigrationOptions) -> Result<WriteOutcome, MigrationError> {
+    validate_options(options)?;
     match options.format {
         MigrationFormat::Prisma => prisma::write(options),
         MigrationFormat::Drizzle => drizzle::write(options),
@@ -353,7 +370,7 @@ pub(crate) fn compose_statements(
     let ddl_parts = ddl::generate_parts(&options.ddl);
     let tables_sorted = canonicalize_tables(&options.tables);
 
-    let trigger_stmts = triggers::generate(&TriggerOptions::new(
+    let trigger_stmts = triggers::generate_body(&TriggerOptions::new(
         options.ddl.schema.clone(),
         tables_sorted,
     ));
@@ -369,13 +386,8 @@ pub(crate) fn compose_statements(
         }
     }
 
-    let tx_check = matches!(
-        options.format,
-        MigrationFormat::Drizzle | MigrationFormat::Prisma
-    )
-    .then(|| REQUIRE_TRANSACTION.to_owned());
     std::iter::once(SET_LOCK_TIMEOUT.to_owned())
-        .chain(tx_check)
+        .chain(std::iter::once(REQUIRE_TRANSACTION.to_owned()))
         .chain(ddl_parts.setup)
         .chain(trigger_stmts)
         .chain(drop_stmts)

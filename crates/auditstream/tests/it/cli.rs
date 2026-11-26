@@ -165,4 +165,71 @@ fn database_password_never_appears_in_help_logs_or_errors() {
         .stderr(predicate::str::contains(
             "postgresql://app_user:***@db.internal:5432/auditdb",
         ));
+
+    // Unrecognized secret query params (`sslpassword`, `ssl-password`, `oauth_client_secret`,
+    // uppercase `PASSWORD`, percent-encoded keys, leading spaces) and libpq KV strings must never
+    // leak to stderr at default verbosity, `-vv`, or with `AUDITSTREAM_LOG=debug`.
+    // Use a local stub listener returning an immediate PostgreSQL auth ErrorResponse so `sqlx`
+    // parses the URL and fails in milliseconds instead of waiting for `acquire_timeout`.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind local tcp stub");
+    let port = listener.local_addr().expect("stub addr").port();
+    let stub = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        // Minimal PostgreSQL ErrorResponse (`E`) with SQLSTATE 28P01 (invalid_password).
+        let payload = b"SERROR\0C28P01\0Mdenied\0\0";
+        let len = u32::try_from(payload.len() + 4)
+            .expect("packet len")
+            .to_be_bytes();
+        let mut packet = Vec::with_capacity(1 + 4 + payload.len());
+        packet.push(b'E');
+        packet.extend_from_slice(&len);
+        packet.extend_from_slice(payload);
+        for stream in listener.incoming().flatten() {
+            let mut s = stream;
+            let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+            let mut buf = [0_u8; 256];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(&packet);
+            let _ = s.flush();
+        }
+    });
+    let _keep_stub_running = stub;
+
+    for variant in [
+        format!(
+            "postgresql://app_user@127.0.0.1:{port}/auditdb?sslmode=disable&sslpassword={secret}"
+        ),
+        format!(
+            "postgresql://app_user@127.0.0.1:{port}/auditdb?sslmode=disable&ssl-password={secret}"
+        ),
+        format!(
+            "postgresql://app_user@127.0.0.1:{port}/auditdb?sslmode=disable&oauth_client_secret={secret}"
+        ),
+        format!("postgresql://app_user@127.0.0.1:{port}/auditdb?sslmode=disable&PASSWORD={secret}"),
+        format!(
+            "postgresql://app_user@127.0.0.1:{port}/auditdb?sslmode=disable&%70assword={secret}"
+        ),
+        format!(
+            " postgresql://app_user@127.0.0.1:{port}/auditdb?sslmode=disable&ssl\tpassword={secret}"
+        ),
+        format!("host=127.0.0.1 port={port} password={secret} dbname=auditdb"),
+    ] {
+        for (args, env_log) in [
+            (&["status"][..], None),
+            (&["-vv", "status"][..], None),
+            (&["status"][..], Some("debug")),
+        ] {
+            let mut cmd = auditstream_cmd();
+            cmd.current_dir(dir.path())
+                .env("AUDITSTREAM_DATABASE_URL", &variant)
+                .args(args);
+            if let Some(level) = env_log {
+                cmd.env("AUDITSTREAM_LOG", level);
+            }
+            cmd.assert()
+                .code(3)
+                .stdout(predicate::str::is_empty())
+                .stderr(predicate::str::contains(secret).not());
+        }
+    }
 }

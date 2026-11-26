@@ -28,31 +28,48 @@
     },
     "schema_name": {
       "type": ["string", "null"],
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "^[^\\u0000]+$"
     },
     "table_name": {
       "type": ["string", "null"],
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "^[^\\u0000]+$"
     },
     "op": {
       "type": "string",
       "minLength": 1,
-      "maxLength": 64
+      "maxLength": 64,
+      "pattern": "^[^\\u0000]+$"
     },
     "record_id": {
-      "type": ["object", "null"]
+      "type": ["object", "null"],
+      "allOf": [
+        {
+          "$ref": "#/$defs/noNulValue"
+        }
+      ]
     },
     "before": {
-      "type": ["object", "null"]
+      "type": ["object", "null"],
+      "allOf": [
+        {
+          "$ref": "#/$defs/noNulValue"
+        }
+      ]
     },
     "after": {
-      "type": ["object", "null"]
+      "type": ["object", "null"],
+      "allOf": [
+        {
+          "$ref": "#/$defs/noNulValue"
+        }
+      ]
     },
     "changed": {
       "type": ["array", "null"],
       "items": {
-        "type": "string",
-        "minLength": 1
+        "$ref": "#/$defs/nonEmptyString"
       }
     },
     "actor": {
@@ -62,35 +79,39 @@
           "type": "object",
           "required": ["type", "id"],
           "additionalProperties": true,
+          "allOf": [
+            {
+              "$ref": "#/$defs/noNulValue"
+            }
+          ],
           "properties": {
             "type": {
-              "type": "string",
-              "enum": ["user", "api_key", "ai_agent", "service", "system"]
+              "$ref": "#/$defs/actorType"
             },
             "id": {
-              "type": "string",
-              "minLength": 1
+              "$ref": "#/$defs/nonEmptyString"
             },
             "tenant": {
-              "type": "string",
-              "minLength": 1
+              "$ref": "#/$defs/nonEmptyString"
             },
             "onBehalfOf": {
               "type": "object",
               "required": ["type", "id"],
               "additionalProperties": true,
+              "allOf": [
+                {
+                  "$ref": "#/$defs/noNulValue"
+                }
+              ],
               "properties": {
                 "type": {
-                  "type": "string",
-                  "enum": ["user", "api_key", "ai_agent", "service", "system"]
+                  "$ref": "#/$defs/actorType"
                 },
                 "id": {
-                  "type": "string",
-                  "minLength": 1
+                  "$ref": "#/$defs/nonEmptyString"
                 },
                 "tenant": {
-                  "type": "string",
-                  "minLength": 1
+                  "$ref": "#/$defs/nonEmptyString"
                 },
                 "onBehalfOf": false
               }
@@ -102,22 +123,23 @@
     "context": {
       "type": ["object", "null"],
       "additionalProperties": true,
+      "allOf": [
+        {
+          "$ref": "#/$defs/noNulValue"
+        }
+      ],
       "properties": {
         "requestId": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/nonEmptyString"
         },
         "source": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/nonEmptyString"
         },
         "ip": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/nonEmptyString"
         },
         "userAgent": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/nonEmptyString"
         }
       }
     },
@@ -126,12 +148,38 @@
       "enum": ["set_config", "comment", "jwt", "invalid", null]
     },
     "db_user": {
-      "type": "string",
-      "minLength": 1
+      "$ref": "#/$defs/nonEmptyString"
     },
     "schema_version": {
       "type": "integer",
       "minimum": 1
+    }
+  },
+  "$defs": {
+    "actorType": {
+      "type": "string",
+      "enum": ["user", "api_key", "ai_agent", "service", "system"]
+    },
+    "noNulKey": {
+      "type": "string",
+      "pattern": "^[^\\u0000]*$"
+    },
+    "noNulValue": {
+      "pattern": "^[^\\u0000]*$",
+      "items": {
+        "$ref": "#/$defs/noNulValue"
+      },
+      "propertyNames": {
+        "$ref": "#/$defs/noNulKey"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/noNulValue"
+      }
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^\\u0000]+$"
     }
   }
 }

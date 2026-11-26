@@ -70,7 +70,7 @@ Generated triggers on audited tables MUST use `auditstream.capture()` (and `audi
 
 Additional capture rules:
 
-- **Excluded columns:** configured excluded columns MUST NEVER appear in `before`, `after`, or `changed`.
+- **Excluded columns:** configured excluded columns MUST NEVER appear in `before`, `after`, or `changed`. Primary key columns MUST NOT be configured in excluded columns, so `record_id` is never silently nullified.
 - **`record_id`:** MUST be a JSON object mapping each primary key column name to its value (taken from `after` on `INSERT`/`UPDATE` and from `before` on `DELETE`, supporting single and composite primary keys), and MUST be `NULL` for tables without a primary key and for `TRUNCATE`.
 - **Partitioned user tables:** statement-level triggers (`auditstream_insert`, `auditstream_delete`, `auditstream_truncate`) attach to the parent partitioned table. A SQL statement that targets a child partition directly does not fire statement triggers attached to the parent, so `auditstream verify` MUST report audited partitioned tables and warn about direct partition writes.
 - **Error behavior:** malformed actor payloads MUST NEVER abort the write (per [spec/transport.md](transport.md#malformed-inputs-and-validation-parity)). Any other trigger error aborts the user's transaction so audit gaps are not silently ignored.
@@ -96,10 +96,11 @@ Requirements:
 
 ## Security model
 
-- **Owner role:** a `NOLOGIN` role named `auditstream_owner` MUST own the `auditstream` schema, `auditstream.changes` (and its partitions), and all functions in the schema.
-- **`SECURITY DEFINER` and `search_path`:** `auditstream.capture()`, `auditstream.log_event()`, and any helper invoked by them MUST be `SECURITY DEFINER`, owned by `auditstream_owner`, declared with `SET search_path = pg_catalog, pg_temp`, and MUST reference all objects by schema-qualified names.
-- **Application role grants:** application roles MUST receive `USAGE` on `auditstream`, `SELECT` on `auditstream.changes`, and `EXECUTE` on `auditstream.log_event(text, jsonb, jsonb)`. Application roles MUST NOT receive `INSERT`, `UPDATE`, `DELETE`, or `TRUNCATE` on `auditstream.changes`; their writes to audited tables are still captured through the `SECURITY DEFINER` trigger.
-- **Managed PostgreSQL self-grant rule (PostgreSQL 16+):** on managed PostgreSQL (such as Neon and Supabase), migrations run as a `CREATEROLE` non-superuser role. Starting in PostgreSQL 16 (`createrole_self_grant = ''`), creating a role grants only `ADMIN`, not `USAGE`. Setup MUST check `pg_has_role(current_user, 'auditstream_owner', 'USAGE')` and execute `GRANT auditstream_owner TO <current_user>` when false before creating objects owned by `auditstream_owner`, and SHOULD revoke that temporary grant at the end of setup when it added it.
+- **Owner role:** a `NOLOGIN` role named `auditstream_owner` MUST own the `auditstream` schema, `auditstream.changes` (and all attached child partitions), the implicit `changes_id_seq` identity sequence, and all functions in the schema.
+- **Partition creation under owner role (`ALTER DEFAULT PRIVILEGES` immunity):** `auditstream.changes`, `changes_default`, and every `changes_YYYY_MM` partition MUST be created under `auditstream_owner` (via `SET LOCAL ROLE auditstream_owner`). Child partitions and `changes_id_seq` MUST NOT grant any privileges to `PUBLIC` or non-owner roles, `auditstream.changes` MUST NOT grant write privileges (`INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`, `TRIGGER`, or `MAINTAIN`), column-level write grants, or `WITH GRANT OPTION` to `PUBLIC` or non-owner roles, and `auditstream.capture()` / `auditstream.resolve_actor()` MUST NOT grant `EXECUTE` to `PUBLIC` or non-owner roles, even when the migration role has `ALTER DEFAULT PRIVILEGES ... GRANT ALL ON TABLES/SEQUENCES/FUNCTIONS TO <app_role>`.
+- **`SECURITY DEFINER`, `search_path`, and parent validation:** `auditstream.capture()`, `auditstream.log_event()`, and any helper invoked by them MUST be `SECURITY DEFINER`, owned by `auditstream_owner`, declared with `SET search_path = pg_catalog, pg_temp`, and MUST reference all objects by schema-qualified names. When `auditstream.capture()` receives explicit parent table arguments (`TG_NARGS >= 4`), it MUST verify that `TG_RELID` equals or is a partition descendant (`pg_catalog.pg_partition_ancestors(TG_RELID)`) of that parent table and raise `42501` otherwise.
+- **Application role grants:** application roles MUST receive `USAGE` on `auditstream`, `SELECT` on `auditstream.changes`, and `EXECUTE` on `auditstream.log_event(text, jsonb, jsonb)`. Application roles MUST NOT receive `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, or `WITH GRANT OPTION` on `auditstream.changes` or any grant on child partitions or `changes_id_seq`; their writes to audited tables are still captured through the `SECURITY DEFINER` trigger.
+- **Managed PostgreSQL self-grant rule (PostgreSQL 16+):** on managed PostgreSQL (such as Neon and Supabase), migrations run as a `CREATEROLE` non-superuser role. Starting in PostgreSQL 16 (`createrole_self_grant = ''`), creating a role grants only `ADMIN`, not `USAGE` or `SET`. Setup MUST run inside a single transaction, clear `createrole_self_grant` locally while creating `auditstream_owner`, check `pg_has_role(current_user, 'auditstream_owner', 'SET')` on PostgreSQL 16+ (`'MEMBER'` on PostgreSQL 15), explicitly specify `WITH INHERIT FALSE, SET TRUE` (and `GRANTED BY`) when creating a temporary self-grant row on PostgreSQL 16+ (so PostgreSQL never defaults `INHERIT` to `TRUE` or clobbers group-granted memberships), record the temporary grant mode in a transaction-local GUC (`set_config(..., true)`), and revoke only that temporary grant before commit so failed or interrupted migrations never persist elevated role membership.
 - **Role reuse rule:** setup MUST reuse existing roles (`auditstream_owner` and application roles) and MUST NEVER drop and recreate them. Connection poolers retain sessions authenticated as the original role OID, causing subsequent queries to fail with `permission denied` if the role is dropped.
 
 ## Export cursor contract
@@ -125,32 +126,91 @@ ORDER BY xact_id ASC, id ASC
 The reference DDL below establishes the roles, schema, partitioned history table, monthly partitions (3-month horizon), `DEFAULT` partition, `BRIN` index, `resolve_actor()`, `log_event()`, and grants. It is verified on PostgreSQL 15 through 19 as both a `CREATEROLE` non-superuser and a superuser.
 
 ```sql
+BEGIN;
+
 DO $$
 DECLARE
-  granted_self boolean := false;
+  grant_mode text := 'none';
+  grantor_role text := '';
+  grantor_oid oid;
+  has_grantor_row boolean := false;
+  prev_self_grant text;
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'auditstream_owner') THEN
-    EXECUTE 'CREATE ROLE auditstream_owner NOLOGIN';
+    IF pg_catalog.current_setting('server_version_num')::int >= 160000 THEN
+      prev_self_grant := pg_catalog.current_setting('createrole_self_grant');
+      PERFORM pg_catalog.set_config('createrole_self_grant', '', true);
+      EXECUTE 'CREATE ROLE auditstream_owner NOLOGIN';
+      PERFORM pg_catalog.set_config('createrole_self_grant', prev_self_grant, true);
+    ELSE
+      EXECUTE 'CREATE ROLE auditstream_owner NOLOGIN';
+    END IF;
   END IF;
 
   IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'auditstream_app') THEN
     EXECUTE 'CREATE ROLE auditstream_app NOLOGIN';
   END IF;
 
-  IF NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'USAGE') THEN
+  IF pg_catalog.current_setting('server_version_num')::int >= 160000 THEN
+    IF NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'SET') THEN
+      SELECT m.member
+        INTO grantor_oid
+        FROM pg_catalog.pg_auth_members m
+        JOIN pg_catalog.pg_roles r ON r.oid = m.roleid
+        JOIN pg_catalog.pg_roles u ON u.rolname = current_user
+       WHERE r.rolname = 'auditstream_owner'
+         AND m.admin_option
+         AND (m.member = u.oid OR pg_catalog.pg_has_role(u.oid, m.member, 'USAGE'))
+       ORDER BY (m.member = u.oid) DESC, m.member
+       LIMIT 1;
+      IF grantor_oid IS NULL THEN
+        EXECUTE pg_catalog.format(
+          'GRANT auditstream_owner TO %I WITH INHERIT FALSE, SET TRUE',
+          current_user
+        );
+        grant_mode := 'self_row';
+      ELSE
+        grantor_role := pg_catalog.pg_get_userbyid(grantor_oid)::text;
+        SELECT EXISTS (
+          SELECT 1
+            FROM pg_catalog.pg_auth_members m
+            JOIN pg_catalog.pg_roles r ON r.oid = m.roleid
+            JOIN pg_catalog.pg_roles u ON u.oid = m.member
+           WHERE r.rolname = 'auditstream_owner'
+             AND u.rolname = current_user
+             AND m.grantor = grantor_oid
+        ) INTO has_grantor_row;
+        IF NOT has_grantor_row THEN
+          EXECUTE pg_catalog.format(
+            'GRANT auditstream_owner TO %I WITH INHERIT FALSE, SET TRUE GRANTED BY %I',
+            current_user,
+            grantor_role
+          );
+          grant_mode := 'self_row';
+        ELSE
+          EXECUTE pg_catalog.format(
+            'GRANT auditstream_owner TO %I WITH SET TRUE GRANTED BY %I',
+            current_user,
+            grantor_role
+          );
+          grant_mode := 'set';
+        END IF;
+      END IF;
+    END IF;
+  ELSIF NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'MEMBER') THEN
     EXECUTE pg_catalog.format('GRANT auditstream_owner TO %I', current_user);
-    granted_self := true;
+    grant_mode := 'self_row';
   END IF;
 
-  PERFORM pg_catalog.set_config(
-    'auditstream._granted_self',
-    CASE WHEN granted_self THEN '1' ELSE '0' END,
-    false
-  );
+  PERFORM pg_catalog.set_config('auditstream._granted_self', grant_mode, true);
+  PERFORM pg_catalog.set_config('auditstream._granted_self_grantor', grantor_role, true);
+  PERFORM pg_catalog.set_config('auditstream._prev_role', current_user, true);
 END
 $$;
 
 CREATE SCHEMA IF NOT EXISTS auditstream AUTHORIZATION auditstream_owner;
+
+SET LOCAL ROLE auditstream_owner;
 
 CREATE TABLE IF NOT EXISTS auditstream.changes (
   id bigint GENERATED ALWAYS AS IDENTITY,
@@ -179,31 +239,24 @@ CREATE TABLE IF NOT EXISTS auditstream.changes (
   CONSTRAINT changes_schema_version_check CHECK (schema_version >= 1)
 ) PARTITION BY RANGE (occurred_at);
 
-ALTER TABLE auditstream.changes OWNER TO auditstream_owner;
-
 CREATE TABLE IF NOT EXISTS auditstream.changes_2026_11
   PARTITION OF auditstream.changes
   FOR VALUES FROM ('2026-11-01 00:00:00+00') TO ('2026-12-01 00:00:00+00');
-ALTER TABLE auditstream.changes_2026_11 OWNER TO auditstream_owner;
 
 CREATE TABLE IF NOT EXISTS auditstream.changes_2026_12
   PARTITION OF auditstream.changes
   FOR VALUES FROM ('2026-12-01 00:00:00+00') TO ('2027-01-01 00:00:00+00');
-ALTER TABLE auditstream.changes_2026_12 OWNER TO auditstream_owner;
 
 CREATE TABLE IF NOT EXISTS auditstream.changes_2027_01
   PARTITION OF auditstream.changes
   FOR VALUES FROM ('2027-01-01 00:00:00+00') TO ('2027-02-01 00:00:00+00');
-ALTER TABLE auditstream.changes_2027_01 OWNER TO auditstream_owner;
 
 CREATE TABLE IF NOT EXISTS auditstream.changes_2027_02
   PARTITION OF auditstream.changes
   FOR VALUES FROM ('2027-02-01 00:00:00+00') TO ('2027-03-01 00:00:00+00');
-ALTER TABLE auditstream.changes_2027_02 OWNER TO auditstream_owner;
 
 CREATE TABLE IF NOT EXISTS auditstream.changes_default
   PARTITION OF auditstream.changes DEFAULT;
-ALTER TABLE auditstream.changes_default OWNER TO auditstream_owner;
 
 CREATE INDEX IF NOT EXISTS changes_occurred_at_brin_idx
   ON auditstream.changes USING brin (occurred_at);
@@ -404,8 +457,6 @@ BEGIN
 END
 $fn$;
 
-ALTER FUNCTION auditstream.resolve_actor() OWNER TO auditstream_owner;
-
 CREATE OR REPLACE FUNCTION auditstream.log_event(
   action text,
   target jsonb DEFAULT NULL,
@@ -472,23 +523,49 @@ BEGIN
 END
 $fn$;
 
-ALTER FUNCTION auditstream.log_event(text, jsonb, jsonb) OWNER TO auditstream_owner;
-
-REVOKE ALL ON SCHEMA auditstream FROM PUBLIC;
-REVOKE ALL ON auditstream.changes FROM PUBLIC;
-REVOKE ALL ON FUNCTION auditstream.resolve_actor() FROM PUBLIC;
-REVOKE ALL ON FUNCTION auditstream.log_event(text, jsonb, jsonb) FROM PUBLIC;
+REVOKE ALL ON SCHEMA auditstream FROM PUBLIC CASCADE;
+REVOKE ALL ON auditstream.changes FROM PUBLIC CASCADE;
+REVOKE ALL ON auditstream.changes_2026_11 FROM PUBLIC CASCADE;
+REVOKE ALL ON auditstream.changes_2026_12 FROM PUBLIC CASCADE;
+REVOKE ALL ON auditstream.changes_2027_01 FROM PUBLIC CASCADE;
+REVOKE ALL ON auditstream.changes_2027_02 FROM PUBLIC CASCADE;
+REVOKE ALL ON auditstream.changes_default FROM PUBLIC CASCADE;
+REVOKE ALL ON SEQUENCE auditstream.changes_id_seq FROM PUBLIC CASCADE;
+REVOKE ALL ON FUNCTION auditstream.resolve_actor() FROM PUBLIC CASCADE;
+REVOKE ALL ON FUNCTION auditstream.log_event(text, jsonb, jsonb) FROM PUBLIC CASCADE;
 
 GRANT USAGE ON SCHEMA auditstream TO auditstream_app;
 GRANT SELECT ON auditstream.changes TO auditstream_app;
 GRANT EXECUTE ON FUNCTION auditstream.log_event(text, jsonb, jsonb) TO auditstream_app;
 
 DO $$
+DECLARE
+  prev_role text := pg_catalog.current_setting('auditstream._prev_role', true);
+  grant_mode text := pg_catalog.current_setting('auditstream._granted_self', true);
+  grantor_role text := pg_catalog.current_setting('auditstream._granted_self_grantor', true);
+  granted_by text := '';
 BEGIN
-  IF pg_catalog.current_setting('auditstream._granted_self', true) = '1' THEN
-    EXECUTE pg_catalog.format('REVOKE auditstream_owner FROM %I', current_user);
-    PERFORM pg_catalog.set_config('auditstream._granted_self', '', false);
+  SET LOCAL ROLE NONE;
+  IF prev_role IS NOT NULL AND prev_role <> '' AND prev_role <> current_user THEN
+    EXECUTE pg_catalog.format('SET LOCAL ROLE %I', prev_role);
+  END IF;
+  PERFORM pg_catalog.set_config('auditstream._prev_role', '', true);
+  IF grantor_role IS NOT NULL AND grantor_role <> '' THEN
+    granted_by := pg_catalog.format(' GRANTED BY %I', grantor_role);
+  END IF;
+  IF grant_mode = 'self_row' THEN
+    EXECUTE pg_catalog.format('REVOKE auditstream_owner FROM %I', current_user) || granted_by;
+  ELSIF grant_mode = 'set' THEN
+    EXECUTE pg_catalog.format('REVOKE SET OPTION FOR auditstream_owner FROM %I', current_user) || granted_by;
+  END IF;
+  IF grant_mode IS NOT NULL AND grant_mode <> '' THEN
+    PERFORM pg_catalog.set_config('auditstream._granted_self', '', true);
+  END IF;
+  IF grantor_role IS NOT NULL AND grantor_role <> '' THEN
+    PERFORM pg_catalog.set_config('auditstream._granted_self_grantor', '', true);
   END IF;
 END
 $$;
+
+COMMIT;
 ```

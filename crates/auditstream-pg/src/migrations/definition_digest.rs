@@ -1,17 +1,15 @@
 use sha2::{Digest, Sha256};
 
-/// Hashes the generated function (`resolve_actor`, `capture`, `log_event`) and trigger
-/// definitions so changing any of them produces a refresh migration. Other statements are skipped:
-/// they are idempotent DDL wrappers or depend on the previous selection (`DROP TRIGGER` for
-/// removed tables).
+/// Hashes all deterministic generated DDL, ACL, function, and trigger statements so any engine
+/// security or capture change produces a refresh migration on the next `init` run. Only
+/// selection-history-dependent `DROP TRIGGER IF EXISTS` statements are skipped so removing a
+/// table once does not invalidate subsequent no-op checks.
 pub(super) fn from_statements(statements: &[String]) -> String {
     let mut digest = Sha256::new();
     for sql in statements {
-        if sql.starts_with("CREATE OR REPLACE FUNCTION ")
-            || sql.starts_with("CREATE OR REPLACE TRIGGER ")
-        {
+        if !sql.starts_with("DROP TRIGGER IF EXISTS ") {
             digest.update(sql.as_bytes());
-            // NUL separates definitions and cannot occur in a PostgreSQL statement.
+            // NUL separates statements and cannot occur in a PostgreSQL statement.
             digest.update([0]);
         }
     }
@@ -52,5 +50,23 @@ mod tests {
         let when = "FOR EACH ROW WHEN (OLD.* IS DISTINCT FROM NEW.*)";
         let revised = digest_after_edit(&statements, trigger, "FOR EACH ROW", when);
         assert_ne!(original, revised, "{trigger}");
+
+        // Editing a DDL/ACL statement must change the digest so security upgrades refresh.
+        let ddl_revised = digest_after_edit(
+            &statements,
+            "CREATE SCHEMA IF NOT EXISTS ",
+            "AUTHORIZATION",
+            "AUTHORIZATION /* changed */",
+        );
+        assert_ne!(original, ddl_revised, "DDL/ACL edit must change digest");
+
+        // Selection-history-dependent DROP TRIGGER IF EXISTS statements are excluded.
+        let mut with_drop = statements.clone();
+        with_drop.push("DROP TRIGGER IF EXISTS auditstream_insert ON \"public\".\"old\"".into());
+        assert_eq!(
+            original,
+            from_statements(&with_drop),
+            "DROP TRIGGER IF EXISTS must not perturb digest"
+        );
     }
 }

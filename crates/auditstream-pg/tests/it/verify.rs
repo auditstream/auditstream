@@ -15,12 +15,13 @@ async fn install_fixture(db: &TestDb, tables: &[TableTriggerSpec]) {
     let cleanup = ddl_stmts.pop();
     let trigger_stmts = triggers::generate(&TriggerOptions::new(DEFAULT_SCHEMA, tables.to_vec()));
 
-    let mut conn = db.pool().acquire().await.expect("acquire connection");
+    let mut tx = db.pool().begin().await.expect("begin fixture tx");
     for stmt in ddl_stmts.into_iter().chain(trigger_stmts).chain(cleanup) {
-        conn.execute(AssertSqlSafe(stmt))
+        tx.execute(AssertSqlSafe(stmt))
             .await
             .expect("install capture DDL/triggers");
     }
+    tx.commit().await.expect("commit fixture tx");
 }
 
 async fn create_invoice_table(db: &TestDb) {
@@ -267,6 +268,26 @@ async fn partitioned_table_warns_and_detects_disabled_child_partition_clone() {
     ];
     install_fixture(&db, &specs).await;
 
+    // An unrelated disabled user trigger cloned onto a child partition must NOT be flagged.
+    db.pool()
+        .execute(
+            "CREATE FUNCTION public.touch_orders() RETURNS trigger LANGUAGE plpgsql \
+             AS $$ BEGIN RETURN NEW; END $$",
+        )
+        .await
+        .expect("create unrelated trigger fn");
+    db.pool()
+        .execute(
+            "CREATE TRIGGER app_touch_orders BEFORE UPDATE ON public.orders \
+             FOR EACH ROW EXECUTE FUNCTION public.touch_orders()",
+        )
+        .await
+        .expect("create unrelated user trigger on partitioned parent");
+    db.pool()
+        .execute("ALTER TABLE public.orders_2026 DISABLE TRIGGER app_touch_orders")
+        .await
+        .expect("disable unrelated user trigger on child partition");
+
     // Clean partitioned install reports exactly one warning (no errors).
     let warn_report = verify::check(db.pool(), &specs)
         .await
@@ -428,4 +449,200 @@ async fn installed_captures_discovers_top_level_tables_args_and_trigger_states()
     assert_eq!(ord.excluded_columns, Vec::<String>::new());
     assert_eq!(ord.triggers.len(), 4);
     assert!(ord.triggers.iter().all(|(_, state)| state == "O"));
+}
+
+#[tokio::test]
+async fn reports_error_when_primary_key_column_is_excluded() {
+    let db = TestDb::new().await.expect("create TestDb");
+    create_invoice_table(&db).await;
+    let bad_specs = vec![invoice_spec(vec!["id"])];
+    install_fixture(&db, &bad_specs).await;
+
+    // 1. Config-side exclusion of a PK column reports InvalidExclusion.
+    let report = verify::check(db.pool(), &bad_specs)
+        .await
+        .expect("verify PK exclusion");
+    assert!(report.has_errors());
+    assert!(
+        report.findings.iter().any(|f| {
+            f.kind == FindingKind::InvalidExclusion
+                && f.severity == Severity::Error
+                && f.object == "public.invoice"
+                && f.detail.contains("id")
+        }),
+        "expected InvalidExclusion finding for config PK exclusion, got: {:?}",
+        report.findings
+    );
+
+    // 2. Live trigger excluding a PK column is also flagged even if config no longer excludes it.
+    let clean_specs = vec![invoice_spec(vec![])];
+    let live_report = verify::check(db.pool(), &clean_specs)
+        .await
+        .expect("verify live trigger PK exclusion");
+    assert!(live_report.has_errors());
+    assert!(
+        live_report.findings.iter().any(|f| {
+            f.kind == FindingKind::InvalidExclusion
+                && f.severity == Severity::Error
+                && f.object == "public.invoice.auditstream_update"
+                && f.detail.contains("id")
+        }),
+        "expected InvalidExclusion finding for live trigger PK exclusion, got: {:?}",
+        live_report.findings
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn reports_unsafe_privileges_and_invalid_ownership_across_history_objects() {
+    use auditstream_pg::ddl::quote_ident;
+    use sqlx::Connection;
+
+    let db = TestDb::new().await.expect("create TestDb");
+    let admin_url = db.admin_url().to_owned();
+    create_invoice_table(&db).await;
+    // Also exercise unsorted excluded_columns in triggers::generate + verify::check parity.
+    let specs = vec![invoice_spec(vec!["password_hash", "status"])];
+    let unsorted_specs = vec![invoice_spec(vec!["status", "password_hash"])];
+    install_fixture(&db, &unsorted_specs).await;
+
+    // 1. Legitimate least-privilege app_role (USAGE + parent SELECT + EXECUTE log_event, zero
+    //    child grants) must produce zero findings AND run `verify::check` itself cleanly!
+    let app_role = format!("verify_app_{}", db.database_name());
+    let app_pw = "verify_app_pw";
+    db.execute(&format!(
+        "CREATE ROLE {} LOGIN PASSWORD '{}'; \
+         GRANT USAGE ON SCHEMA auditstream TO {}; \
+         GRANT SELECT ON TABLE auditstream.changes TO {}; \
+         GRANT EXECUTE ON FUNCTION auditstream.log_event(text, jsonb, jsonb) TO {};",
+        quote_ident(&app_role),
+        app_pw,
+        quote_ident(&app_role),
+        quote_ident(&app_role),
+        quote_ident(&app_role),
+    ))
+    .await
+    .expect("create least-privilege app_role");
+
+    let base = db.url();
+    let (scheme, rest) = base.split_once("://").expect("valid postgres URL");
+    let (_, host_and_db) = rest.split_once('@').expect("URL has credentials");
+    let app_url = format!("{scheme}://{app_role}:{app_pw}@{host_and_db}");
+    let app_pool = auditstream_pg::connect(&app_url)
+        .await
+        .expect("connect app_pool");
+
+    let clean_as_app = verify::check(&app_pool, &specs)
+        .await
+        .expect("verify::check must succeed as least-privilege app_role without child grants");
+    assert!(
+        clean_as_app.is_clean(),
+        "legitimate app_role grants and unsorted triggers::generate excludes must be clean, got: {:?}",
+        clean_as_app.findings
+    );
+    app_pool.close().await;
+
+    // 2. Inject unsafe named-role ACLs (including column-level attacl and GRANT OPTION) across all
+    //    7 history object types, plus wrong ownership across schema, changes (+ sequence),
+    //    changes_default, capture(), resolve_actor(), and log_event().
+    let app_q = quote_ident(&app_role);
+    for sql in [
+        format!("GRANT CREATE ON SCHEMA auditstream TO {app_q}"),
+        format!("GRANT UPDATE (actor) ON TABLE auditstream.changes TO {app_q}"),
+        format!("GRANT SELECT ON TABLE auditstream.changes TO {app_q} WITH GRANT OPTION"),
+        format!("GRANT SELECT ON TABLE auditstream.changes_default TO {app_q}"),
+        format!("GRANT USAGE ON SEQUENCE auditstream.changes_id_seq TO {app_q}"),
+        format!("GRANT EXECUTE ON FUNCTION auditstream.capture() TO {app_q}"),
+        format!("GRANT EXECUTE ON FUNCTION auditstream.resolve_actor() TO {app_q}"),
+        format!(
+            "GRANT EXECUTE ON FUNCTION auditstream.log_event(text, jsonb, jsonb) TO {app_q} WITH GRANT OPTION"
+        ),
+        "ALTER SCHEMA auditstream OWNER TO CURRENT_USER".to_owned(),
+        "ALTER TABLE auditstream.changes OWNER TO CURRENT_USER".to_owned(),
+        "ALTER TABLE auditstream.changes_default OWNER TO CURRENT_USER".to_owned(),
+        "ALTER FUNCTION auditstream.capture() OWNER TO CURRENT_USER".to_owned(),
+        "ALTER FUNCTION auditstream.resolve_actor() OWNER TO CURRENT_USER".to_owned(),
+        "ALTER FUNCTION auditstream.log_event(text, jsonb, jsonb) OWNER TO CURRENT_USER".to_owned(),
+    ] {
+        db.execute(&sql).await.expect(&sql);
+    }
+
+    let report = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify unsafe privileges and ownership");
+    assert!(report.has_errors());
+
+    for expected_obj in [
+        "auditstream",
+        "auditstream.changes",
+        "auditstream.changes_default",
+        "auditstream.changes_id_seq",
+        "auditstream.capture()",
+        "auditstream.resolve_actor()",
+        "auditstream.log_event(text, jsonb, jsonb)",
+    ] {
+        assert!(
+            report.findings.iter().any(|f| {
+                f.kind == FindingKind::UnsafePrivileges
+                    && f.severity == Severity::Error
+                    && f.object == expected_obj
+            }),
+            "expected UnsafePrivileges finding for {expected_obj}, got: {:?}",
+            report.findings
+        );
+        assert!(
+            report.findings.iter().any(|f| {
+                f.kind == FindingKind::InvalidOwnership
+                    && f.severity == Severity::Error
+                    && f.object == expected_obj
+            }),
+            "expected InvalidOwnership finding for {expected_obj}, got: {:?}",
+            report.findings
+        );
+    }
+    assert!(
+        report.findings.iter().any(|f| {
+            f.kind == FindingKind::UnsafePrivileges
+                && f.object == "auditstream.changes"
+                && f.detail.contains("UPDATE (actor)")
+        }),
+        "expected column-level attacl finding for UPDATE (actor), got: {:?}",
+        report.findings
+    );
+
+    // 3. Re-applying DDL + triggers heals every ownership and ACL finding (including attacl).
+    install_fixture(&db, &specs).await;
+    let healed = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify healed install");
+    assert!(
+        healed.is_clean(),
+        "expected clean verify after re-applying DDL + triggers, got: {:?}",
+        healed.findings
+    );
+
+    // 4. Dropping log_event is reported as Missing.
+    db.execute("DROP FUNCTION auditstream.log_event(text, jsonb, jsonb)")
+        .await
+        .expect("drop log_event");
+    let missing_log_event = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify missing log_event");
+    assert!(
+        missing_log_event.findings.iter().any(|f| {
+            f.kind == FindingKind::Missing
+                && f.object == "auditstream.log_event(text, jsonb, jsonb)"
+        }),
+        "expected Missing finding for dropped log_event, got: {:?}",
+        missing_log_event.findings
+    );
+
+    drop(db);
+    let mut admin = sqlx::postgres::PgConnection::connect(&admin_url)
+        .await
+        .expect("admin cleanup");
+    let _ = admin
+        .execute(AssertSqlSafe(format!("DROP ROLE IF EXISTS {app_q}")))
+        .await;
+    let _ = admin.close().await;
 }

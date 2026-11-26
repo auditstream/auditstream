@@ -93,6 +93,40 @@ async fn unknown_table_and_unknown_excluded_column_exit_2_and_name_them() {
         .code(2)
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains("public.invoice.no_such_col"));
+
+    // Primary key columns must also be rejected in `--exclude` and in `auditstream.toml`.
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args([
+            "init",
+            "--migrations",
+            "sql",
+            "--table",
+            "public.invoice",
+            "--exclude",
+            "public.invoice.id",
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("primary key"))
+        .stderr(predicate::str::contains("public.invoice.id"));
+
+    fs::write(
+        dir.path().join("auditstream.toml"),
+        "[capture]\ntables = [\"public.invoice\"]\nexclude = [\"public.invoice.id\"]\n",
+    )
+    .expect("write config with PK exclusion");
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["init", "--migrations", "sql", "--dry-run"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("primary key"))
+        .stderr(predicate::str::contains("public.invoice.id"));
 }
 
 #[tokio::test]

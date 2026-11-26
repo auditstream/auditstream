@@ -1098,3 +1098,32 @@ async fn live_postgres_applies_each_format_twice_and_handles_removed_table_selec
         let _ = cleanup.close().await;
     }
 }
+
+#[test]
+fn rejects_primary_key_column_in_excluded_columns() {
+    let dir = ScratchDir::new("pk_exclude");
+    let opts = MigrationOptions::new(
+        MigrationFormat::Sql,
+        dir.path(),
+        fixed_time(),
+        DdlOptions::default(),
+        vec![TableTriggerSpec::new(
+            "public",
+            "invoice",
+            vec!["id".to_owned()],
+            vec!["id".to_owned()],
+        )],
+    );
+    let err =
+        migrations::preview(&opts).expect_err("preview must reject excluding a primary key column");
+    assert!(
+        err.to_string().contains("primary key"),
+        "unexpected error: {err}"
+    );
+    let err2 =
+        migrations::write(&opts).expect_err("write must reject excluding a primary key column");
+    assert!(
+        err2.to_string().contains("primary key"),
+        "unexpected error: {err2}"
+    );
+}

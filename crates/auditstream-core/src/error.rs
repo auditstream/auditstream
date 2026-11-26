@@ -9,6 +9,7 @@ pub type BoxError = Box<dyn StdError + Send + Sync + 'static>;
 
 /// Errors returned when constructing or validating Auditstream domain types.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum CoreError {
     /// Actor `id` was empty.
     #[error("actor id must not be empty")]
@@ -26,6 +27,13 @@ pub enum CoreError {
     #[error("context.{field} must not be empty")]
     EmptyContextField {
         /// The offending context field name.
+        field: &'static str,
+    },
+
+    /// A string field contained a NUL character (`U+0000`), which PostgreSQL `jsonb` rejects.
+    #[error("{field} must not contain NUL characters")]
+    NullByteInField {
+        /// The offending field path (for example `"actor.id"` or `"context.requestId"`).
         field: &'static str,
     },
 

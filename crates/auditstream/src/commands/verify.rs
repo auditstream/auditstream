@@ -115,6 +115,8 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
         .into_iter()
         .collect();
 
+    let excludes_by_table = group_excludes_by_table(&configured_excludes);
+
     let specs = if configured_tables.is_empty() {
         eprintln!("note: no capture.tables configured; verifying installed triggers only");
         let installed = verify::installed_captures(&pool, &config.schema)
@@ -143,10 +145,9 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
             .map(|t| ((t.schema.clone(), t.name.clone()), t))
             .collect();
 
-        build_installed_verify_specs(&installed, &introspected_map)
+        build_installed_verify_specs(&installed, &excludes_by_table, &introspected_map)
     } else {
         let configured_set: BTreeSet<(String, String)> = configured_tables.into_iter().collect();
-        let excludes_by_table = group_excludes_by_table(&configured_excludes);
 
         let target_schemas: Vec<&str> = configured_set
             .iter()
@@ -264,6 +265,25 @@ fn convert_finding(finding: &Finding) -> VerifyFinding {
             "default_partition_rows",
             "Move rows out of changes_default into monthly partitions, then run `auditstream verify --fix`."
                 .to_owned(),
+        ),
+        FindingKind::InvalidExclusion => (
+            "invalid_exclusion",
+            "Remove primary key column(s) from capture.exclude and re-run `auditstream init`."
+                .to_owned(),
+        ),
+        FindingKind::UnsafePrivileges => (
+            "unsafe_privileges",
+            "Re-run `auditstream init` and apply the generated migration (or revoke the extra privileges as `auditstream_owner`)."
+                .to_owned(),
+        ),
+        FindingKind::InvalidOwnership => (
+            "invalid_ownership",
+            "Re-run `auditstream init` and apply the generated migration so `auditstream_owner` owns all Auditstream objects."
+                .to_owned(),
+        ),
+        _ => (
+            "unknown",
+            "Inspect the finding details and re-run `auditstream init`.".to_owned(),
         ),
     };
 

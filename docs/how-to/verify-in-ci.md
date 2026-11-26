@@ -10,7 +10,7 @@ auditstream verify
 
 `verify` inspects live PostgreSQL catalogs inside a `READ ONLY` transaction and compares them against `capture.tables` and `capture.exclude` in `auditstream.toml`.
 It exits `0` when clean.
-It exits `1` on missing, disabled, or outdated triggers, rows in `changes_default`, or fewer than two future monthly partitions.
+It exits `1` on missing, disabled, or outdated triggers, primary-key exclusions (`invalid_exclusion`), unsafe privileges (`unsafe_privileges`), invalid ownership (`invalid_ownership`), rows in `changes_default`, or fewer than two future monthly partitions.
 
 Pass `--format json` for structured output:
 
@@ -30,7 +30,7 @@ Use `--fix` in scheduled maintenance jobs with a role authorized to create parti
 
 ## GitHub Actions workflow
 
-Run `verify` after migrations in deployment workflows and weekly on a schedule:
+Run `verify` after migrations in deployment workflows and weekly on a schedule (configure `sslmode=verify-full` in `AUDITSTREAM_DATABASE_URL` for non-loopback hosts):
 
 ```yaml
 name: Verify Auditstream

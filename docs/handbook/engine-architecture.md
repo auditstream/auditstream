@@ -20,8 +20,8 @@ docs/                       handbook, decisions, user guide
 | Crate | Owns | May depend on | Must not depend on |
 | --- | --- | --- | --- |
 | `auditstream-core` | Domain types, port traits, actor transport codec, diff and redaction | serde, thiserror | tokio, sqlx, any I/O crate |
-| `auditstream-pg` | Everything that speaks to Postgres | core, sqlx, tokio | export, the binary |
-| `auditstream-export` | Sinks: JSON Lines and CSV first | core, tokio | sqlx, pg |
+| `auditstream-pg` | Everything that speaks to Postgres | core, sqlx, tokio, tracing | export, the binary |
+| `auditstream-export` | Sinks: JSON Lines and CSV first | core, tokio, libc (Unix) | sqlx, pg |
 | `auditstream` (binary) | Commands, config, logging, exit codes | all crates above, clap, anyhow | Business logic of its own |
 
 - **Names.** The binary package is `auditstream`, which also names the release tag, the npm package and the Homebrew formula. Folder name equals crate name.

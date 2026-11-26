@@ -18,7 +18,11 @@
 //! Actor comment extraction uses pure SQL string builtins (no POSIX regexes),
 //! keeping length bounds explicit in SQL without hitting PostgreSQL's 255 quantifier cap.
 
-use crate::ddl::{DEFAULT_SCHEMA, OWNER_ROLE, function_owner_sql, quote_ident, quote_literal};
+use crate::ddl::{
+    DEFAULT_SCHEMA, OWNER_ROLE, do_block, dollar_tag, enter_owner_role_sql, quote_ident,
+    quote_literal, restore_prev_role_sql, role_grant_cleanup_sql, role_grant_setup_sql,
+    tx_begin_guard_sql,
+};
 
 /// Trigger specification for a single audited PostgreSQL table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +71,21 @@ impl TableTriggerSpec {
         self.is_partitioned = true;
         self
     }
+
+    /// Returns any primary key column names also listed in [`Self::excluded_columns`],
+    /// sorted and deduplicated for deterministic diagnostics.
+    #[must_use]
+    pub fn excluded_primary_key_columns(&self) -> Vec<&str> {
+        let mut bad: Vec<&str> = self
+            .excluded_columns
+            .iter()
+            .filter(|col| self.primary_key.iter().any(|pk| pk == *col))
+            .map(String::as_str)
+            .collect();
+        bad.sort_unstable();
+        bad.dedup();
+        bad
+    }
 }
 
 /// Configuration for [`generate`].
@@ -106,34 +125,65 @@ impl TriggerOptions {
 /// emit each statement cleanly. Re-running the returned statements succeeds and leaves
 /// exactly one trigger per event (`CREATE OR REPLACE TRIGGER`).
 ///
-/// Callers should execute the statements sequentially on a single connection so any
-/// temporary `auditstream_owner` self-grant acquired for a non-superuser migrator is
-/// cleanly revoked by the final statement.
+/// Callers MUST execute the returned statements sequentially inside a single transaction
+/// (`BEGIN; ... COMMIT;`) so any temporary `auditstream_owner` self-grant acquired for a
+/// non-superuser migrator is atomic and cleanly revoked before commit.
 pub fn generate(options: &TriggerOptions) -> Vec<String> {
-    let schema_q = quote_ident(&options.audit_schema);
     let owner_q = quote_ident(OWNER_ROLE);
     let owner_lit = quote_literal(OWNER_ROLE);
 
+    let body = generate_body(options);
+    let mut stmts = Vec::with_capacity(body.len() + 3);
+    stmts.push(tx_begin_guard_sql());
+    stmts.push(role_grant_setup_sql(
+        &owner_q,
+        &owner_lit,
+        "auditstream._triggers_granted_self",
+        "Auditstream trigger statements",
+        false,
+    ));
+    stmts.extend(body);
+    stmts.push(role_grant_cleanup_sql(
+        &owner_q,
+        "auditstream._triggers_granted_self",
+    ));
+    stmts
+}
+
+/// Generates trigger functions (created and ACL-sanitized under `auditstream_owner`) and
+/// per-table trigger definitions without transaction-marker or role self-grant wrapper blocks
+/// (used by migration composers that already manage a transaction-scoped `auditstream_owner`
+/// self-grant).
+pub(crate) fn generate_body(options: &TriggerOptions) -> Vec<String> {
+    let schema_q = quote_ident(&options.audit_schema);
+    let schema_lit = quote_literal(&options.audit_schema);
+    let owner_lit = quote_literal(OWNER_ROLE);
+
     let mut stmts = Vec::with_capacity(8 + options.tables.len() * 4);
-
-    stmts.push(role_grant_setup_sql(&owner_q, &owner_lit));
+    stmts.push(reconcile_trigger_functions_ownership_sql(
+        &schema_lit,
+        &owner_lit,
+    ));
+    stmts.push(enter_owner_role_sql(&owner_lit));
     stmts.push(resolve_actor_sql(&schema_q));
-    stmts.push(function_owner_sql(&schema_q, "resolve_actor()"));
-    stmts.push(format!(
-        "REVOKE ALL ON FUNCTION {schema_q}.resolve_actor() FROM PUBLIC"
-    ));
-
     stmts.push(capture_function_sql(&schema_q));
-    stmts.push(function_owner_sql(&schema_q, "capture()"));
-    stmts.push(format!(
-        "REVOKE ALL ON FUNCTION {schema_q}.capture() FROM PUBLIC"
-    ));
+    stmts.push(harden_trigger_functions_acls_sql(&schema_lit));
+    stmts.push(restore_prev_role_sql());
 
-    for table in &options.tables {
-        append_table_triggers(&mut stmts, &schema_q, table);
+    if !options.tables.is_empty() {
+        stmts.push(grant_temp_trigger_exec_if_noinherit_sql(
+            &schema_lit,
+            &owner_lit,
+        ));
+        for table in &options.tables {
+            append_table_triggers(&mut stmts, &schema_q, table);
+        }
+        stmts.push(revoke_temp_trigger_exec_if_noinherit_sql(
+            &schema_lit,
+            &owner_lit,
+        ));
     }
 
-    stmts.push(role_grant_cleanup_sql(&owner_q));
     stmts
 }
 
@@ -144,7 +194,10 @@ fn append_table_triggers(stmts: &mut Vec<String>, schema_q: &str, table: &TableT
         quote_ident(&table.table)
     );
     let pk_arg = quote_literal(&encode_json_string_array(&table.primary_key));
-    let ex_arg = quote_literal(&encode_json_string_array(&table.excluded_columns));
+    let mut excluded_sorted = table.excluded_columns.clone();
+    excluded_sorted.sort();
+    excluded_sorted.dedup();
+    let ex_arg = quote_literal(&encode_json_string_array(&excluded_sorted));
     let args = if table.is_partitioned {
         format!(
             "{pk_arg}, {ex_arg}, {}, {}",
@@ -186,7 +239,7 @@ fn append_table_triggers(stmts: &mut Vec<String>, schema_q: &str, table: &TableT
     ));
 }
 
-fn encode_json_string_array(items: &[String]) -> String {
+pub(crate) fn encode_json_string_array(items: &[String]) -> String {
     let mut out = String::from("[");
     for (idx, item) in items.iter().enumerate() {
         if idx > 0 {
@@ -213,41 +266,186 @@ fn encode_json_string_array(items: &[String]) -> String {
     out
 }
 
-fn role_grant_setup_sql(owner_q: &str, owner_lit: &str) -> String {
-    format!(
-        "DO $$\n\
-DECLARE\n  \
-  granted_self boolean := false;\n\
-BEGIN\n  \
-  IF NOT pg_catalog.pg_has_role(current_user, {owner_lit}, 'USAGE') THEN\n    \
-    EXECUTE pg_catalog.format('GRANT {owner_q} TO %I', current_user);\n    \
-    granted_self := true;\n  \
-  END IF;\n  \
-  PERFORM pg_catalog.set_config(\n    \
-    'auditstream._triggers_granted_self',\n    \
-    CASE WHEN granted_self THEN '1' ELSE '0' END,\n    \
-    false\n  \
-  );\n\
-END\n\
-$$"
-    )
+/// Reconciles pre-existing ownership of `resolve_actor()` and `capture()` as the caller role
+/// *before* entering `SET LOCAL ROLE auditstream_owner` for `CREATE OR REPLACE FUNCTION`.
+fn reconcile_trigger_functions_ownership_sql(schema_lit: &str, owner_lit: &str) -> String {
+    do_block(&format!(
+        "DECLARE
+  caller name := current_user;
+  fn_name name;
+  need_reconcile boolean := false;
+  granted_schema_usage boolean := false;
+BEGIN
+  SELECT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_proc p
+    JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = {schema_lit}
+       AND p.proname IN ('resolve_actor', 'capture')
+       AND p.prokind = 'f'
+       AND p.pronargs = 0
+       AND p.proowner <> {owner_lit}::pg_catalog.regrole
+  ) INTO need_reconcile;
+
+  IF NOT need_reconcile THEN
+    RETURN;
+  END IF;
+
+  IF NOT pg_catalog.pg_has_role(caller, {owner_lit}, 'USAGE') THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_catalog.pg_namespace n
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(n.nspacl, pg_catalog.acldefault('n', n.nspowner))
+      ) AS a
+       WHERE n.nspname = {schema_lit}
+         AND a.grantee <> 0
+         AND pg_catalog.pg_get_userbyid(a.grantee)::text = caller::text
+         AND a.privilege_type = 'USAGE'
+    ) THEN
+      EXECUTE pg_catalog.format('SET LOCAL ROLE %I', {owner_lit});
+      EXECUTE pg_catalog.format('GRANT USAGE ON SCHEMA %I TO %I', {schema_lit}, caller);
+      SET LOCAL ROLE NONE;
+      IF caller <> current_user THEN
+        EXECUTE pg_catalog.format('SET LOCAL ROLE %I', caller);
+      END IF;
+      granted_schema_usage := true;
+    END IF;
+  END IF;
+
+  FOREACH fn_name IN ARRAY ARRAY['resolve_actor', 'capture']::name[] LOOP
+    IF EXISTS (
+      SELECT 1 FROM pg_catalog.pg_proc p
+      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+       WHERE n.nspname = {schema_lit}
+         AND p.proname = fn_name
+         AND p.prokind = 'f'
+         AND p.pronargs = 0
+         AND p.proowner <> {owner_lit}::pg_catalog.regrole
+    ) THEN
+      EXECUTE pg_catalog.format('ALTER FUNCTION %I.%I() OWNER TO %I', {schema_lit}, fn_name, {owner_lit});
+    END IF;
+  END LOOP;
+
+  IF granted_schema_usage THEN
+    EXECUTE pg_catalog.format('SET LOCAL ROLE %I', {owner_lit});
+    EXECUTE pg_catalog.format('REVOKE USAGE ON SCHEMA %I FROM %I', {schema_lit}, caller);
+    SET LOCAL ROLE NONE;
+    IF caller <> current_user THEN
+      EXECUTE pg_catalog.format('SET LOCAL ROLE %I', caller);
+    END IF;
+  END IF;
+END"
+    ))
 }
 
-fn role_grant_cleanup_sql(owner_q: &str) -> String {
-    format!(
-        "DO $$\n\
-BEGIN\n  \
-  IF pg_catalog.current_setting('auditstream._triggers_granted_self', true) = '1' THEN\n    \
-    EXECUTE pg_catalog.format('REVOKE {owner_q} FROM %I', current_user);\n    \
-    PERFORM pg_catalog.set_config('auditstream._triggers_granted_self', '', false);\n  \
-  END IF;\n\
-END\n\
-$$"
-    )
+/// Revokes `PUBLIC` and every non-owner grant on `resolve_actor()` and `capture()` while running
+/// as `auditstream_owner` (neutralizing `ALTER DEFAULT PRIVILEGES ... ON FUNCTIONS`).
+fn harden_trigger_functions_acls_sql(schema_lit: &str) -> String {
+    do_block(&format!(
+        "DECLARE
+  fn_name name;
+  grantee_oid oid;
+BEGIN
+  FOR fn_name, grantee_oid IN
+    SELECT DISTINCT p.proname, a.grantee
+      FROM pg_catalog.pg_proc p
+      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(p.proacl, pg_catalog.acldefault('f', p.proowner))
+      ) AS a
+     WHERE n.nspname = {schema_lit}
+       AND p.proname IN ('resolve_actor', 'capture')
+       AND p.prokind = 'f'
+       AND p.pronargs = 0
+       AND a.grantee <> p.proowner
+     ORDER BY p.proname, a.grantee
+  LOOP
+    IF grantee_oid = 0 THEN
+      EXECUTE pg_catalog.format('REVOKE ALL ON FUNCTION %I.%I() FROM PUBLIC CASCADE', {schema_lit}, fn_name);
+    ELSE
+      EXECUTE pg_catalog.format(
+        'REVOKE ALL ON FUNCTION %I.%I() FROM %I CASCADE',
+        {schema_lit},
+        fn_name,
+        pg_catalog.pg_get_userbyid(grantee_oid)
+      );
+    END IF;
+  END LOOP;
+END"
+    ))
+}
+
+/// On PostgreSQL 15 with a `NOINHERIT` migrator role and PostgreSQL 16+ with a `SET`-only
+/// (`INHERIT FALSE, SET TRUE`) migrator role, temporarily grants `USAGE` on the audit schema and
+/// `EXECUTE` on `capture()` to `current_user` for the duration of `CREATE OR REPLACE TRIGGER` and
+/// revokes both immediately afterward inside the same transaction. No-op when `current_user`
+/// already has `USAGE` on `auditstream_owner` (superusers and `INHERIT` members).
+fn grant_temp_trigger_exec_if_noinherit_sql(schema_lit: &str, owner_lit: &str) -> String {
+    do_block(&format!(
+        "DECLARE
+  caller name := current_user;
+  granted_usage boolean := false;
+  granted_exec boolean := false;
+BEGIN
+  IF NOT pg_catalog.pg_has_role(caller, {owner_lit}, 'USAGE') THEN
+    EXECUTE pg_catalog.format('SET LOCAL ROLE %I', {owner_lit});
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_catalog.pg_namespace n
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(n.nspacl, pg_catalog.acldefault('n', n.nspowner))
+      ) AS a
+       WHERE n.nspname = {schema_lit}
+         AND a.grantee <> 0
+         AND pg_catalog.pg_get_userbyid(a.grantee)::text = caller::text
+         AND a.privilege_type = 'USAGE'
+    ) THEN
+      EXECUTE pg_catalog.format('GRANT USAGE ON SCHEMA %I TO %I', {schema_lit}, caller);
+      granted_usage := true;
+    END IF;
+    EXECUTE pg_catalog.format('GRANT EXECUTE ON FUNCTION %I.capture() TO %I', {schema_lit}, caller);
+    granted_exec := true;
+    SET LOCAL ROLE NONE;
+    IF caller <> current_user THEN
+      EXECUTE pg_catalog.format('SET LOCAL ROLE %I', caller);
+    END IF;
+  END IF;
+  PERFORM pg_catalog.set_config(
+    'auditstream._temp_trigger_privs',
+    CASE
+      WHEN granted_usage AND granted_exec THEN 'both'
+      WHEN granted_exec THEN 'exec'
+      ELSE 'none'
+    END,
+    true
+  );
+END"
+    ))
+}
+
+fn revoke_temp_trigger_exec_if_noinherit_sql(schema_lit: &str, owner_lit: &str) -> String {
+    do_block(&format!(
+        "DECLARE
+  caller name := current_user;
+  priv_mode text := pg_catalog.current_setting('auditstream._temp_trigger_privs', true);
+BEGIN
+  IF priv_mode IN ('both', 'exec') THEN
+    EXECUTE pg_catalog.format('SET LOCAL ROLE %I', {owner_lit});
+    EXECUTE pg_catalog.format('REVOKE EXECUTE ON FUNCTION %I.capture() FROM %I CASCADE', {schema_lit}, caller);
+    IF priv_mode = 'both' THEN
+      EXECUTE pg_catalog.format('REVOKE USAGE ON SCHEMA %I FROM %I CASCADE', {schema_lit}, caller);
+    END IF;
+    SET LOCAL ROLE NONE;
+    IF caller <> current_user THEN
+      EXECUTE pg_catalog.format('SET LOCAL ROLE %I', caller);
+    END IF;
+    PERFORM pg_catalog.set_config('auditstream._temp_trigger_privs', '', true);
+  END IF;
+END"
+    ))
 }
 
 #[allow(clippy::too_many_lines)]
 fn resolve_actor_sql(schema_q: &str) -> String {
+    let tag = dollar_tag(schema_q);
     format!(
         r"CREATE OR REPLACE FUNCTION {schema_q}.resolve_actor(
   OUT actor jsonb,
@@ -258,7 +456,7 @@ LANGUAGE plpgsql
 STABLE
 SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
-AS $fn$
+AS {tag}
 DECLARE
   raw_setting text;
   q_tail text;
@@ -442,19 +640,20 @@ BEGIN
   context := NULL;
   actor_source := NULL;
 END
-$fn$"
+{tag}"
     )
 }
 
 #[allow(clippy::too_many_lines)]
 fn capture_function_sql(schema_q: &str) -> String {
+    let tag = dollar_tag(schema_q);
     format!(
         "CREATE OR REPLACE FUNCTION {schema_q}.capture()\n\
 RETURNS trigger\n\
 LANGUAGE plpgsql\n\
 SECURITY DEFINER\n\
 SET search_path = pg_catalog, pg_temp\n\
-AS $fn$\n\
+AS {tag}\n\
 DECLARE\n  \
   resolved record;\n  \
   pk_json jsonb;\n  \
@@ -476,7 +675,24 @@ BEGIN\n  \
   IF TG_NARGS >= 4 THEN\n    \
     v_schema := TG_ARGV[2];\n    \
     v_table := TG_ARGV[3];\n    \
-    v_relid := pg_catalog.to_regclass(pg_catalog.format('%I.%I', v_schema, v_table));\n  \
+    SELECT c.oid\n      \
+      INTO v_relid\n      \
+      FROM pg_catalog.pg_class c\n      \
+      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n     \
+     WHERE n.nspname = v_schema\n       \
+       AND c.relname = v_table;\n    \
+    IF v_relid IS NULL OR (\n      \
+      v_relid <> TG_RELID\n      \
+      AND NOT EXISTS (\n        \
+        SELECT 1\n          \
+          FROM pg_catalog.pg_partition_ancestors(TG_RELID) AS a(relid)\n         \
+         WHERE a.relid = v_relid\n      \
+      )\n    \
+    ) THEN\n      \
+      RAISE EXCEPTION 'auditstream.capture: trigger relation % is not a partition of %.%',\n        \
+        TG_RELID::pg_catalog.regclass, v_schema, v_table\n        \
+        USING ERRCODE = '42501';\n    \
+    END IF;\n  \
   ELSE\n    \
     v_schema := TG_TABLE_SCHEMA;\n    \
     v_table := TG_TABLE_NAME;\n    \
@@ -690,6 +906,6 @@ BEGIN\n  \
   END IF;\n\n  \
   RETURN NULL;\n\
 END\n\
-$fn$"
+{tag}"
     )
 }

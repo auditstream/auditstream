@@ -14,7 +14,30 @@ use serde::{Deserialize, Serialize};
 use tokio as _;
 
 pub(crate) fn open_append_file(path: &Path) -> io::Result<std::fs::File> {
-    OpenOptions::new().create(true).append(true).open(path)
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let file_type = file.metadata()?.file_type();
+        if !(file_type.is_file() || file_type.is_char_device()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to write export to non-file target {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(file)
 }
 
 macro_rules! impl_opened_sink {
@@ -189,5 +212,55 @@ mod tests {
         assert_send(&write_fut);
         write_fut.await.expect("empty csv batch write succeeds");
         csv.flush().await.expect("csv stdout flush succeeds");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_append_file_creates_export_files_with_0600_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        for filename in ["events.jsonl", "events.csv"] {
+            let path = dir.path().join(filename);
+            let _file = super::open_append_file(&path).expect("open append file");
+            let mode = std::fs::metadata(&path)
+                .expect("stat file")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "export file {filename} must be created with mode 0600, got {mode:o}"
+            );
+        }
+
+        // Symlinked output path must be rejected via O_NOFOLLOW without modifying the target.
+        let victim = dir.path().join("victim.jsonl");
+        std::fs::write(&victim, "KEEP\n").expect("write victim");
+        let link = dir.path().join("link.jsonl");
+        std::os::unix::fs::symlink(&victim, &link).expect("create symlink");
+        let err = super::open_append_file(&link).expect_err("symlink output must be rejected");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "expected ELOOP from O_NOFOLLOW, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read victim"),
+            "KEEP\n"
+        );
+
+        // Named pipe (FIFO) with no reader must fail immediately (O_NONBLOCK) without hanging.
+        let fifo = dir.path().join("events.fifo");
+        if std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            assert!(
+                super::open_append_file(&fifo).is_err(),
+                "FIFO export target must be rejected immediately without hanging"
+            );
+        }
     }
 }

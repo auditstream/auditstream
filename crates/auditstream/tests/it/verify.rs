@@ -364,6 +364,125 @@ async fn verify_without_selection_checks_installed_triggers_only_and_notes_on_st
         .stderr(predicate::str::contains("installed triggers only"));
 }
 
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn verify_reports_invalid_exclusion_when_config_excludes_primary_key() {
+    let db = TestDb::new().await.expect("create TestDb");
+    create_invoice_table(&db).await;
+    install_capture(
+        &db,
+        &[TableTriggerSpec::new(
+            "public",
+            "invoice",
+            vec!["id".to_owned()],
+            vec!["password_hash".to_owned()],
+        )],
+    )
+    .await;
+
+    let dir = tempdir().expect("tempdir");
+    fs::write(
+        dir.path().join("auditstream.toml"),
+        "[capture]\ntables = [\"public.invoice\"]\nexclude = [\"public.invoice.id\"]\n",
+    )
+    .expect("write auditstream.toml");
+
+    let out = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["verify", "--format", "json"])
+        .output()
+        .expect("run verify json");
+    assert_eq!(out.status.code(), Some(1));
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse verify json");
+    assert_eq!(parsed["ok"], false);
+    assert!(
+        parsed["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .any(|f| f["kind"] == "invalid_exclusion" && f["severity"] == "error"),
+        "expected invalid_exclusion error finding, got: {parsed}"
+    );
+
+    // Also caught when `capture.tables` is omitted and `capture.exclude` targets an installed table's PK.
+    fs::write(
+        dir.path().join("auditstream.toml"),
+        "[capture]\nexclude = [\"public.invoice.id\"]\n",
+    )
+    .expect("write exclude-only auditstream.toml");
+    let out_installed = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["verify", "--format", "json"])
+        .output()
+        .expect("run verify json without capture.tables");
+    assert_eq!(out_installed.status.code(), Some(1));
+    let parsed_installed: serde_json::Value =
+        serde_json::from_slice(&out_installed.stdout).expect("parse verify json");
+    assert!(
+        parsed_installed["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .any(|f| f["kind"] == "invalid_exclusion" && f["severity"] == "error"),
+        "expected invalid_exclusion without capture.tables, got: {parsed_installed}"
+    );
+
+    // Without `capture.tables`, configured `capture.exclude` replaces (not unions) live excludes.
+    fs::write(
+        dir.path().join("auditstream.toml"),
+        "[capture]\nexclude = [\"public.invoice.status\"]\n",
+    )
+    .expect("write swapped exclude config without capture.tables");
+    let out_swapped = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["verify", "--format", "json"])
+        .output()
+        .expect("run verify json on swapped exclude");
+    assert_eq!(out_swapped.status.code(), Some(1));
+    let parsed_swapped: serde_json::Value =
+        serde_json::from_slice(&out_swapped.stdout).expect("parse verify swapped json");
+    assert!(
+        parsed_swapped["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .any(|f| {
+                f["kind"] == "outdated"
+                    && f["detail"]
+                        .as_str()
+                        .is_some_and(|d| d.contains(r#"expected ["status"]"#))
+            }),
+        "expected outdated finding with exact configured exclude [\"status\"], got: {parsed_swapped}"
+    );
+
+    // Leaked child-partition privileges and PUBLIC execute on capture() report `unsafe_privileges`.
+    fs::remove_file(dir.path().join("auditstream.toml")).expect("remove config");
+    db.execute("GRANT DELETE ON TABLE auditstream.changes_default TO PUBLIC")
+        .await
+        .expect("inject unsafe partition grant");
+    let out_acl = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["verify", "--format", "json"])
+        .output()
+        .expect("run verify json on unsafe ACL");
+    assert_eq!(out_acl.status.code(), Some(1));
+    let parsed_acl: serde_json::Value =
+        serde_json::from_slice(&out_acl.stdout).expect("parse verify acl json");
+    assert!(
+        parsed_acl["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .any(|f| f["kind"] == "unsafe_privileges"
+                && f["object"] == "auditstream.changes_default"),
+        "expected unsafe_privileges finding on changes_default, got: {parsed_acl}"
+    );
+}
+
 #[test]
 fn verify_unreachable_database_exits_3() {
     let dir = tempdir().expect("tempdir");

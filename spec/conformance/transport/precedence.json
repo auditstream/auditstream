@@ -195,6 +195,93 @@
         "context": null,
         "actor_source": "invalid"
       }
+    },
+    {
+      "name": "malformed-set-config-nul-does-not-fall-through",
+      "description": "set_config containing a JSON \\u0000 escape MUST yield invalid and MUST NOT fall through to a valid comment.",
+      "input": {
+        "sql": "UPDATE invoice SET status='paid' WHERE id=1 /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzQyIn0'*/;",
+        "set_config": "{\"type\":\"user\",\"id\":\"u\\u00001\"}",
+        "jwt_claims": null
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": "invalid"
+      }
+    },
+    {
+      "name": "jwt-nul-sub-invalid",
+      "description": "request.jwt.claims containing a JSON \\u0000 escape yields actor_source='invalid'.",
+      "input": {
+        "sql": "UPDATE invoice SET total=55 WHERE id=2;",
+        "set_config": null,
+        "jwt_claims": "{\"sub\":\"u\\u00001\"}"
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": "invalid"
+      }
+    },
+    {
+      "name": "jwt-nul-in-non-sub-claim-invalid",
+      "description": "request.jwt.claims containing a JSON \\u0000 escape outside sub yields actor_source='invalid' (matching PostgreSQL jsonb).",
+      "input": {
+        "sql": "UPDATE invoice SET total=55 WHERE id=2;",
+        "set_config": null,
+        "jwt_claims": "{\"sub\":\"u1\",\"extra\":\"a\\u0000b\"}"
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": "invalid"
+      }
+    },
+    {
+      "name": "jwt-nul-in-shadowed-duplicate-key-invalid",
+      "description": "request.jwt.claims containing a JSON \\u0000 escape in an overwritten duplicate key yields actor_source='invalid'.",
+      "input": {
+        "sql": "UPDATE invoice SET total=55 WHERE id=2;",
+        "set_config": null,
+        "jwt_claims": "{\"sub\":\"u\\u00001\",\"sub\":\"u1\"}"
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": "invalid"
+      }
+    },
+    {
+      "name": "set-config-escaped-backslash-before-u0000-valid",
+      "description": "set_config with an escaped backslash followed by literal u0000 (\\\\u0000 in JSON) is valid and MUST resolve as set_config.",
+      "input": {
+        "sql": "UPDATE invoice SET total=55 WHERE id=2;",
+        "set_config": "{\"type\":\"user\",\"id\":\"u\\\\u00001\"}",
+        "jwt_claims": null
+      },
+      "expected": {
+        "actor": {
+          "type": "user",
+          "id": "u\\u00001"
+        },
+        "context": null,
+        "actor_source": "set_config"
+      }
+    },
+    {
+      "name": "set-config-escaped-backslash-plus-nul-invalid",
+      "description": "set_config with an escaped backslash followed by a real \\u0000 escape (\\\\\\u0000 in JSON) MUST yield invalid.",
+      "input": {
+        "sql": "UPDATE invoice SET total=55 WHERE id=2;",
+        "set_config": "{\"type\":\"user\",\"id\":\"u\\\\\\u00001\"}",
+        "jwt_claims": null
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": "invalid"
+      }
     }
   ]
 }

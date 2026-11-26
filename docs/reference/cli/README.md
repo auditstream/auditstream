@@ -35,7 +35,8 @@ auditstream [GLOBAL OPTIONS] <COMMAND> [COMMAND OPTIONS]
 - **Data goes to stdout; logs and diagnostics go to stderr.** Running with `-vv` never writes log output to stdout.
 - **Broken pipe (`SIGPIPE`):** If stdout closes early (for example `auditstream export | head -n 1`), the CLI stops cleanly and exits `0`.
 - **Log filtering:** Default level is `warn`. `-v` sets `info`, `-vv` sets `debug`, `-q` sets `error`. Setting `AUDITSTREAM_LOG` overrides `-v` and `-q`.
-- **Secrets:** Database passwords are hidden from `--help` output and masked (`***`) in debug logs and error messages.
+- **Secrets:** Database passwords in URI authority (`user:pass@`), URI query parameters (`password`, `sslpassword`), and libpq key-value strings (`password=...`, `sslpassword=...`) are hidden from `--help` output and masked (`***`) in debug logs and error messages.
+- **TLS:** For non-loopback PostgreSQL hosts, configure `sslmode=verify-full` in your connection URL (for example `postgresql://user:pass@db.example.com:5432/prod?sslmode=verify-full`). Connecting to a non-loopback host with `sslmode=disable`, `allow`, `prefer`, `require`, or `verify-ca` emits a warning on stderr.
 
 ## Related references
 

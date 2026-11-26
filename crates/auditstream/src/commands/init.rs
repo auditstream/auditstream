@@ -5,8 +5,8 @@
 //! `auditstream.toml` using `toml_edit` without touching comments, other keys, or secrets.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
@@ -18,6 +18,7 @@ use auditstream_pg::migrations::{
 use clap::Args as ClapArgs;
 use time::OffsetDateTime;
 use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
+use uuid::Uuid;
 
 use crate::commands::common::{
     connect_database, parse_exclude_refs, parse_table_refs, require_database_url,
@@ -189,6 +190,12 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
             return Err(anyhow!("unknown column `{schema}.{table}.{column}`"))
                 .exit_code(Exit::Usage);
         }
+        if info.primary_key.iter().any(|pk| pk == column) {
+            return Err(anyhow!(
+                "cannot exclude primary key column `{schema}.{table}.{column}`: primary key columns are required to build `record_id`"
+            ))
+            .exit_code(Exit::Usage);
+        }
         excludes_by_table
             .entry((schema.clone(), table.clone()))
             .or_default()
@@ -257,6 +264,9 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
         }
         return Ok(());
     }
+
+    // Validate the config target (rejecting symlinks/non-regular files) before writing migrations.
+    let _ = read_existing_config_doc(&config.file_path)?;
 
     match migrations::write(&migration_opts).exit_code(Exit::Io)? {
         WriteOutcome::UpToDate { existing } => {
@@ -336,6 +346,57 @@ fn ensure_table<'a>(doc: &'a mut DocumentMut, key: &str) -> &'a mut Table {
         .expect("table item was just inserted")
 }
 
+fn read_existing_config_doc(path: &Path) -> anyhow::Result<DocumentMut> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(anyhow!(
+            "refusing to follow symlink at config path {}",
+            path.display()
+        ))
+        .exit_code(Exit::Io),
+        Ok(meta) if !meta.file_type().is_file() => Err(anyhow!(
+            "config path {} is not a regular file",
+            path.display()
+        ))
+        .exit_code(Exit::Io),
+        Ok(_) => {
+            let mut read_opts = OpenOptions::new();
+            read_opts.read(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::custom_flags(
+                &mut read_opts,
+                libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            );
+            let mut existing = read_opts
+                .open(path)
+                .map_err(|err| anyhow!("failed to read {}: {err}", path.display()))
+                .exit_code(Exit::Io)?;
+            if !existing
+                .metadata()
+                .map_err(|err| anyhow!("failed to inspect {}: {err}", path.display()))
+                .exit_code(Exit::Io)?
+                .file_type()
+                .is_file()
+            {
+                return Err(anyhow!(
+                    "config path {} is not a regular file",
+                    path.display()
+                ))
+                .exit_code(Exit::Io);
+            }
+            let mut raw = String::new();
+            existing
+                .read_to_string(&mut raw)
+                .map_err(|err| anyhow!("failed to read {}: {err}", path.display()))
+                .exit_code(Exit::Io)?;
+            raw.parse::<DocumentMut>()
+                .map_err(|err| anyhow!("failed to parse {}: {}", path.display(), err.message()))
+                .exit_code(Exit::Usage)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(DocumentMut::new()),
+        Err(err) => Err(anyhow!("failed to inspect {}: {err}", path.display())).exit_code(Exit::Io),
+    }
+}
+
 fn update_config_file(
     path: &Path,
     tables: &[String],
@@ -343,16 +404,7 @@ fn update_config_file(
     format: MigrationFormat,
     dir: &Path,
 ) -> anyhow::Result<()> {
-    let mut doc = if path.exists() {
-        let raw = fs::read_to_string(path)
-            .map_err(|err| anyhow!("failed to read {}: {err}", path.display()))
-            .exit_code(Exit::Io)?;
-        raw.parse::<DocumentMut>()
-            .map_err(|err| anyhow!("failed to parse {}: {err}", path.display()))
-            .exit_code(Exit::Usage)?
-    } else {
-        DocumentMut::new()
-    };
+    let mut doc = read_existing_config_doc(path)?;
 
     let capture = ensure_table(&mut doc, "capture");
     capture["tables"] = value(string_array(tables));
@@ -372,20 +424,57 @@ fn update_config_file(
     }
 
     let rendered = doc.to_string();
-    let tmp_name = format!(
-        ".{}.tmp.{}",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("auditstream.toml"),
-        std::process::id()
-    );
-    let tmp_path = path.with_file_name(tmp_name);
-    fs::write(&tmp_path, rendered.as_bytes())
-        .map_err(|err| anyhow!("failed to write {}: {err}", tmp_path.display()))
-        .exit_code(Exit::Io)?;
-    fs::rename(&tmp_path, path)
-        .map_err(|err| anyhow!("failed to replace {}: {err}", path.display()))
-        .exit_code(Exit::Io)?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("auditstream.toml");
+
+    // Exclusive creation with random entropy and mode 0600 on Unix prevents symlink TOCTOU and
+    // predictable-path collisions while keeping `database_url` secrets private.
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+
+    let mut attempt = 0_u32;
+    let (tmp_path, mut file) = loop {
+        let candidate =
+            path.with_file_name(format!(".{file_name}.tmp.{}", Uuid::new_v4().simple()));
+        match options.open(&candidate) {
+            Ok(file) => break (candidate, file),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists && attempt < 64 => {
+                attempt += 1;
+            }
+            Err(err) => {
+                return Err(anyhow!("failed to create {}: {err}", candidate.display()))
+                    .exit_code(Exit::Io);
+            }
+        }
+    };
+
+    if let Err(err) = file
+        .write_all(rendered.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        drop(file);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(anyhow!("failed to write {}: {err}", tmp_path.display())).exit_code(Exit::Io);
+    }
+    drop(file);
+
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(anyhow!("failed to replace {}: {err}", path.display())).exit_code(Exit::Io);
+    }
+
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let _ = fs::File::open(parent).and_then(|dir_file| dir_file.sync_all());
+    }
 
     Ok(())
 }
@@ -485,5 +574,146 @@ mod tests {
         let err = detect_migration_format(empty.path()).unwrap_err();
         assert_eq!(exit_code_for(&err), Exit::Usage);
         assert!(err.to_string().contains("missing migration format"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_config_file_preserves_0600_and_resists_symlink_at_temp_path() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::path::Path;
+
+        use super::update_config_file;
+
+        let dir = tempdir().unwrap();
+        let cfg_path = dir.path().join("auditstream.toml");
+        fs::write(
+            &cfg_path,
+            "database_url = \"postgres://u:p@localhost/db\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&cfg_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Pre-plant symlinks at both the legacy PID path and attempt-0 path pointing to a victim file.
+        let victim = dir.path().join("victim.txt");
+        fs::write(&victim, "DO_NOT_OVERWRITE").unwrap();
+        let pid = std::process::id();
+        symlink(
+            &victim,
+            dir.path().join(format!(".auditstream.toml.tmp.{pid}")),
+        )
+        .unwrap();
+        symlink(
+            &victim,
+            dir.path().join(format!(".auditstream.toml.tmp.{pid}.0")),
+        )
+        .unwrap();
+
+        update_config_file(
+            &cfg_path,
+            &["public.invoice".to_owned()],
+            &[],
+            MigrationFormat::Sql,
+            Path::new("migrations"),
+        )
+        .expect("update_config_file succeeds");
+
+        let mode = fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "auditstream.toml must retain mode 0600, got {mode:o}"
+        );
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "DO_NOT_OVERWRITE",
+            "symlink target must never be overwritten"
+        );
+        let updated = fs::read_to_string(&cfg_path).unwrap();
+        assert!(
+            updated.contains("database_url = \"postgres://u:p@localhost/db\""),
+            "database_url must be preserved: {updated}"
+        );
+        assert!(updated.contains("public.invoice"), "{updated}");
+        assert!(updated.contains("migrations"), "{updated}");
+
+        // Fresh config file creation also uses mode 0600.
+        let fresh_path = dir.path().join("fresh.toml");
+        update_config_file(
+            &fresh_path,
+            &["public.invoice".to_owned()],
+            &[],
+            MigrationFormat::Sql,
+            Path::new("migrations"),
+        )
+        .expect("create fresh config");
+        let fresh_mode = fs::metadata(&fresh_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            fresh_mode, 0o600,
+            "new auditstream.toml must be created with mode 0600, got {fresh_mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_config_file_refuses_target_symlinks_and_never_leaks_toml_secrets() {
+        use std::os::unix::fs::symlink;
+        use std::path::Path;
+
+        use super::update_config_file;
+
+        let dir = tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        fs::write(&victim, "DO_NOT_OVERWRITE").unwrap();
+
+        let sym_live = dir.path().join("live_sym.toml");
+        symlink(&victim, &sym_live).unwrap();
+        let err = update_config_file(
+            &sym_live,
+            &["public.invoice".to_owned()],
+            &[],
+            MigrationFormat::Sql,
+            Path::new("migrations"),
+        )
+        .expect_err("live symlink config target must be rejected");
+        assert!(err.to_string().contains("symlink"), "{err}");
+
+        let sym_dangling = dir.path().join("dangling_sym.toml");
+        symlink(dir.path().join("does-not-exist.toml"), &sym_dangling).unwrap();
+        let err = update_config_file(
+            &sym_dangling,
+            &["public.invoice".to_owned()],
+            &[],
+            MigrationFormat::Sql,
+            Path::new("migrations"),
+        )
+        .expect_err("dangling symlink config target must be rejected");
+        assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    #[test]
+    fn update_config_file_never_leaks_toml_edit_secrets() {
+        use std::path::Path;
+
+        use super::update_config_file;
+
+        let dir = tempdir().unwrap();
+        let secret = "TOML_EDIT_SECRET_PW_777";
+        let broken_path = dir.path().join("broken.toml");
+        fs::write(
+            &broken_path,
+            format!("database_url = \"postgresql://app:{secret}@db.example.com/prod\n"),
+        )
+        .unwrap();
+        let err = update_config_file(
+            &broken_path,
+            &["public.invoice".to_owned()],
+            &[],
+            MigrationFormat::Sql,
+            Path::new("migrations"),
+        )
+        .expect_err("broken TOML must fail");
+        assert!(
+            !err.to_string().contains(secret),
+            "toml_edit parse error leaked secret: {err}"
+        );
     }
 }

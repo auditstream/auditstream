@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use sqlx::{AssertSqlSafe, FromRow, PgPool, Postgres, Transaction};
 use thiserror::Error;
 
-use crate::ddl::{DEFAULT_SCHEMA, quote_ident};
+use crate::ddl::{self, DEFAULT_SCHEMA, DdlOptions, OWNER_ROLE, quote_ident};
 use crate::triggers::{self, TableTriggerSpec, TriggerOptions};
 
 const TRIGGER_TYPE_ROW: i16 = 1 << 0;
@@ -49,6 +49,7 @@ pub enum Severity {
 
 /// Machine-readable category of a verification [`Finding`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum FindingKind {
     /// An expected history table, function, audited table, or trigger does not exist.
     Missing,
@@ -61,6 +62,16 @@ pub enum FindingKind {
     PartitionedTable,
     /// The `changes_default` partition holds rows, blocking monthly partition creation.
     DefaultPartitionRows,
+    /// A primary key column is listed in excluded columns (either in configuration or on an
+    /// installed trigger), which causes `capture()` to record `NULL` values inside `record_id`.
+    InvalidExclusion,
+    /// An Auditstream schema, table, child partition, identity sequence, or function grants
+    /// unsafe privileges (such as `PUBLIC` access, writes/grants on child partitions,
+    /// `EXECUTE` on `capture()`/`resolve_actor()`, sequence access, or `WITH GRANT OPTION`).
+    UnsafePrivileges,
+    /// An Auditstream schema, table, child partition, identity sequence, or function is not
+    /// owned by `auditstream_owner`.
+    InvalidOwnership,
 }
 
 /// Single drift finding returned by [`check`] and [`check_with_options`].
@@ -296,20 +307,44 @@ pub async fn check_with_options(
     let mut findings = Vec::new();
     let expected_bodies = ExpectedFunctionBodies::from_generator(&options.audit_schema);
 
+    check_schema_security(&mut tx, &options.audit_schema, &mut findings).await?;
     let history_exists = check_history_table(&mut tx, &options.audit_schema, &mut findings).await?;
+    if history_exists {
+        check_history_security(&mut tx, &options.audit_schema, &mut findings).await?;
+    }
     check_function(
         &mut tx,
         &options.audit_schema,
-        "resolve_actor",
-        &expected_bodies.resolve_actor,
+        FunctionCheckSpec {
+            name: "resolve_actor",
+            pronargs: 0,
+            expected_body: &expected_bodies.resolve_actor,
+            allow_non_owner_execute: false,
+        },
         &mut findings,
     )
     .await?;
     check_function(
         &mut tx,
         &options.audit_schema,
-        "capture",
-        &expected_bodies.capture,
+        FunctionCheckSpec {
+            name: "capture",
+            pronargs: 0,
+            expected_body: &expected_bodies.capture,
+            allow_non_owner_execute: false,
+        },
+        &mut findings,
+    )
+    .await?;
+    check_function(
+        &mut tx,
+        &options.audit_schema,
+        FunctionCheckSpec {
+            name: "log_event",
+            pronargs: 3,
+            expected_body: &expected_bodies.log_event,
+            allow_non_owner_execute: true,
+        },
         &mut findings,
     )
     .await?;
@@ -348,39 +383,49 @@ pub async fn check_with_options(
 struct ExpectedFunctionBodies {
     resolve_actor: String,
     capture: String,
+    log_event: String,
 }
 
 impl ExpectedFunctionBodies {
     fn from_generator(audit_schema: &str) -> Self {
-        let stmts = triggers::generate(&TriggerOptions::new(audit_schema, Vec::new()));
+        let trigger_stmts = triggers::generate(&TriggerOptions::new(audit_schema, Vec::new()));
+        let ddl_stmts = ddl::generate(&DdlOptions::new(audit_schema, Vec::new()));
+        let prefix = format!("CREATE OR REPLACE FUNCTION {}.", quote_ident(audit_schema));
         let mut resolve_actor = None;
         let mut capture = None;
+        let mut log_event = None;
 
-        for stmt in &stmts {
-            let Some(first_line) = stmt.lines().next() else {
+        for stmt in trigger_stmts.iter().chain(ddl_stmts.iter()) {
+            let Some(rest) = stmt.strip_prefix(&prefix) else {
                 continue;
             };
-            if first_line.starts_with("CREATE OR REPLACE FUNCTION ") {
-                if first_line.contains(".resolve_actor(") {
-                    resolve_actor = extract_dollar_quoted_body(stmt, "$fn$");
-                } else if first_line.contains(".capture(") {
-                    capture = extract_dollar_quoted_body(stmt, "$fn$");
-                }
+            if rest.starts_with("resolve_actor(") {
+                resolve_actor = extract_function_body(rest);
+            } else if rest.starts_with("capture(") {
+                capture = extract_function_body(rest);
+            } else if rest.starts_with("log_event(") {
+                log_event = extract_function_body(rest);
             }
         }
 
         Self {
             resolve_actor: resolve_actor
-                .expect("triggers::generate must emit resolve_actor() with $fn$ body"),
-            capture: capture.expect("triggers::generate must emit capture() with $fn$ body"),
+                .expect("triggers::generate must emit resolve_actor() with dollar-quoted body"),
+            capture: capture
+                .expect("triggers::generate must emit capture() with dollar-quoted body"),
+            log_event: log_event
+                .expect("ddl::generate must emit log_event() with dollar-quoted body"),
         }
     }
 }
 
-fn extract_dollar_quoted_body(sql: &str, tag: &str) -> Option<String> {
-    let start = sql.find(tag)? + tag.len();
+fn extract_function_body(sql: &str) -> Option<String> {
+    let (_, after_as) = sql.split_once("\nAS $")?;
+    let tag_end = after_as.find('$')?;
+    let tag = format!("${}$", &after_as[..tag_end]);
+    let start = sql.find(&tag)? + tag.len();
     let rest = &sql[start..];
-    let end = rest.rfind(tag)?;
+    let end = rest.rfind(&tag)?;
     Some(rest[..end].to_owned())
 }
 
@@ -417,36 +462,417 @@ async fn check_history_table(
 }
 
 #[derive(Debug, FromRow)]
+struct AclGrantRow {
+    grantee: String,
+    privilege_type: String,
+    is_grantable: bool,
+}
+
+#[derive(Debug, FromRow)]
+struct OwnedObjectRow {
+    oid: i64,
+    schema_name: String,
+    object_name: String,
+    owner_name: String,
+}
+
+#[derive(Debug, FromRow)]
 struct ProcRow {
+    oid: i64,
     prosrc: String,
     prosecdef: bool,
     langname: String,
     proconfig: Option<Vec<String>>,
+    owner_name: String,
+}
+
+struct FunctionCheckSpec<'a> {
+    name: &'a str,
+    pronargs: i16,
+    expected_body: &'a str,
+    allow_non_owner_execute: bool,
+}
+
+async fn check_schema_security(
+    tx: &mut Transaction<'_, Postgres>,
+    audit_schema: &str,
+    findings: &mut Vec<Finding>,
+) -> Result<(), sqlx::Error> {
+    let owner: Option<String> = sqlx::query_scalar(
+        "SELECT pg_catalog.pg_get_userbyid(nspowner)::text \
+           FROM pg_catalog.pg_namespace \
+          WHERE nspname = $1",
+    )
+    .bind(audit_schema)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    let Some(owner_name) = owner else {
+        return Ok(());
+    };
+
+    if owner_name != OWNER_ROLE {
+        findings.push(Finding {
+            kind: FindingKind::InvalidOwnership,
+            severity: Severity::Error,
+            table: None,
+            object: audit_schema.to_owned(),
+            detail: format!(
+                "audit schema `{audit_schema}` is owned by `{owner_name}`, expected `{OWNER_ROLE}`"
+            ),
+        });
+    }
+
+    let unsafe_grants: Vec<AclGrantRow> = sqlx::query_as(
+        "SELECT \
+           CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END AS grantee, \
+           a.privilege_type::text AS privilege_type, \
+           a.is_grantable \
+         FROM pg_catalog.pg_namespace n \
+         CROSS JOIN LATERAL pg_catalog.aclexplode( \
+           COALESCE(n.nspacl, pg_catalog.acldefault('n', n.nspowner)) \
+         ) AS a \
+        WHERE n.nspname = $1 \
+          AND a.grantee <> n.nspowner \
+          AND (a.grantee = 0 OR a.privilege_type <> 'USAGE' OR a.is_grantable) \
+        ORDER BY 1, 2",
+    )
+    .bind(audit_schema)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    push_unsafe_acl_finding(findings, None, audit_schema, "audit schema", &unsafe_grants);
+    Ok(())
+}
+
+async fn check_history_security(
+    tx: &mut Transaction<'_, Postgres>,
+    audit_schema: &str,
+    findings: &mut Vec<Finding>,
+) -> Result<(), sqlx::Error> {
+    check_parent_changes_security(tx, audit_schema, findings).await?;
+    check_child_partitions_security(tx, audit_schema, findings).await?;
+    check_identity_sequences_security(tx, audit_schema, findings).await?;
+    Ok(())
+}
+
+async fn check_parent_changes_security(
+    tx: &mut Transaction<'_, Postgres>,
+    audit_schema: &str,
+    findings: &mut Vec<Finding>,
+) -> Result<(), sqlx::Error> {
+    let row: Option<OwnedObjectRow> = sqlx::query_as(
+        "SELECT \
+           c.oid::bigint AS oid, \
+           n.nspname AS schema_name, \
+           c.relname AS object_name, \
+           pg_catalog.pg_get_userbyid(c.relowner)::text AS owner_name \
+         FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+        WHERE n.nspname = $1 \
+          AND c.relname = 'changes' \
+          AND c.relkind IN ('r', 'p')",
+    )
+    .bind(audit_schema)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    let Some(parent) = row else {
+        return Ok(());
+    };
+    let object = format!("{}.{}", parent.schema_name, parent.object_name);
+    if parent.owner_name != OWNER_ROLE {
+        findings.push(Finding {
+            kind: FindingKind::InvalidOwnership,
+            severity: Severity::Error,
+            table: Some(object.clone()),
+            object: object.clone(),
+            detail: format!(
+                "history table `{object}` is owned by `{}`, expected `{OWNER_ROLE}`",
+                parent.owner_name
+            ),
+        });
+    }
+
+    let unsafe_grants: Vec<AclGrantRow> = sqlx::query_as(
+        "SELECT grantee, privilege_type, is_grantable FROM ( \
+           SELECT \
+             CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END AS grantee, \
+             a.privilege_type::text AS privilege_type, \
+             a.is_grantable \
+           FROM pg_catalog.pg_class c \
+           CROSS JOIN LATERAL pg_catalog.aclexplode( \
+             COALESCE(c.relacl, pg_catalog.acldefault('r', c.relowner)) \
+           ) AS a \
+          WHERE c.oid = $1::oid \
+            AND a.grantee <> c.relowner \
+            AND (a.grantee = 0 OR a.privilege_type <> 'SELECT' OR a.is_grantable) \
+           UNION ALL \
+           SELECT \
+             CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END AS grantee, \
+             a.privilege_type::text || ' (' || att.attname || ')' AS privilege_type, \
+             a.is_grantable \
+           FROM pg_catalog.pg_class c \
+           JOIN pg_catalog.pg_attribute att \
+             ON att.attrelid = c.oid \
+            AND att.attnum > 0 \
+            AND NOT att.attisdropped \
+            AND att.attacl IS NOT NULL \
+           CROSS JOIN LATERAL pg_catalog.aclexplode(att.attacl) AS a \
+          WHERE c.oid = $1::oid \
+            AND a.grantee <> c.relowner \
+            AND (a.grantee = 0 OR a.privilege_type <> 'SELECT' OR a.is_grantable) \
+         ) AS all_unsafe \
+         ORDER BY 1, 2",
+    )
+    .bind(parent.oid)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    push_unsafe_acl_finding(
+        findings,
+        Some(object.clone()),
+        &object,
+        "history table",
+        &unsafe_grants,
+    );
+    Ok(())
+}
+
+async fn check_child_partitions_security(
+    tx: &mut Transaction<'_, Postgres>,
+    audit_schema: &str,
+    findings: &mut Vec<Finding>,
+) -> Result<(), sqlx::Error> {
+    let children: Vec<OwnedObjectRow> = sqlx::query_as(
+        "WITH RECURSIVE tree(relid) AS ( \
+           SELECT i.inhrelid \
+             FROM pg_catalog.pg_inherits i \
+             JOIN pg_catalog.pg_class parent ON parent.oid = i.inhparent \
+             JOIN pg_catalog.pg_namespace pn ON pn.oid = parent.relnamespace \
+            WHERE pn.nspname = $1 \
+              AND parent.relname = 'changes' \
+           UNION ALL \
+           SELECT i.inhrelid \
+             FROM tree \
+             JOIN pg_catalog.pg_inherits i ON i.inhparent = tree.relid \
+         ) \
+         SELECT \
+           c.oid::bigint AS oid, \
+           cn.nspname AS schema_name, \
+           c.relname AS object_name, \
+           pg_catalog.pg_get_userbyid(c.relowner)::text AS owner_name \
+         FROM tree \
+         JOIN pg_catalog.pg_class c ON c.oid = tree.relid \
+         JOIN pg_catalog.pg_namespace cn ON cn.oid = c.relnamespace \
+        ORDER BY cn.nspname, c.relname",
+    )
+    .bind(audit_schema)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    for child in children {
+        let object = format!("{}.{}", child.schema_name, child.object_name);
+        if child.owner_name != OWNER_ROLE {
+            findings.push(Finding {
+                kind: FindingKind::InvalidOwnership,
+                severity: Severity::Error,
+                table: Some(object.clone()),
+                object: object.clone(),
+                detail: format!(
+                    "history partition `{object}` is owned by `{}`, expected `{OWNER_ROLE}`",
+                    child.owner_name
+                ),
+            });
+        }
+
+        let unsafe_grants: Vec<AclGrantRow> = sqlx::query_as(
+            "SELECT grantee, privilege_type, is_grantable FROM ( \
+               SELECT \
+                 CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END AS grantee, \
+                 a.privilege_type::text AS privilege_type, \
+                 a.is_grantable \
+               FROM pg_catalog.pg_class c \
+               CROSS JOIN LATERAL pg_catalog.aclexplode( \
+                 COALESCE(c.relacl, pg_catalog.acldefault('r', c.relowner)) \
+               ) AS a \
+              WHERE c.oid = $1::oid \
+                AND a.grantee <> c.relowner \
+               UNION ALL \
+               SELECT \
+                 CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END AS grantee, \
+                 a.privilege_type::text || ' (' || att.attname || ')' AS privilege_type, \
+                 a.is_grantable \
+               FROM pg_catalog.pg_class c \
+               JOIN pg_catalog.pg_attribute att \
+                 ON att.attrelid = c.oid \
+                AND att.attnum > 0 \
+                AND NOT att.attisdropped \
+                AND att.attacl IS NOT NULL \
+               CROSS JOIN LATERAL pg_catalog.aclexplode(att.attacl) AS a \
+              WHERE c.oid = $1::oid \
+                AND a.grantee <> c.relowner \
+             ) AS all_unsafe \
+             ORDER BY 1, 2",
+        )
+        .bind(child.oid)
+        .fetch_all(&mut **tx)
+        .await?;
+
+        push_unsafe_acl_finding(
+            findings,
+            Some(object.clone()),
+            &object,
+            "history partition",
+            &unsafe_grants,
+        );
+    }
+
+    Ok(())
+}
+
+async fn check_identity_sequences_security(
+    tx: &mut Transaction<'_, Postgres>,
+    audit_schema: &str,
+    findings: &mut Vec<Finding>,
+) -> Result<(), sqlx::Error> {
+    let sequences: Vec<OwnedObjectRow> = sqlx::query_as(
+        "SELECT \
+           s.oid::bigint AS oid, \
+           sn.nspname AS schema_name, \
+           s.relname AS object_name, \
+           pg_catalog.pg_get_userbyid(s.relowner)::text AS owner_name \
+         FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         JOIN pg_catalog.pg_depend d \
+           ON d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass \
+          AND d.refobjid = c.oid \
+          AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass \
+          AND d.deptype IN ('a', 'i') \
+         JOIN pg_catalog.pg_class s ON s.oid = d.objid AND s.relkind = 'S' \
+         JOIN pg_catalog.pg_namespace sn ON sn.oid = s.relnamespace \
+        WHERE n.nspname = $1 \
+          AND c.relname = 'changes' \
+        ORDER BY sn.nspname, s.relname",
+    )
+    .bind(audit_schema)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    for seq in sequences {
+        let object = format!("{}.{}", seq.schema_name, seq.object_name);
+        if seq.owner_name != OWNER_ROLE {
+            findings.push(Finding {
+                kind: FindingKind::InvalidOwnership,
+                severity: Severity::Error,
+                table: None,
+                object: object.clone(),
+                detail: format!(
+                    "history identity sequence `{object}` is owned by `{}`, expected `{OWNER_ROLE}`",
+                    seq.owner_name
+                ),
+            });
+        }
+
+        let unsafe_grants: Vec<AclGrantRow> = sqlx::query_as(
+            "SELECT \
+               CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END AS grantee, \
+               a.privilege_type::text AS privilege_type, \
+               a.is_grantable \
+             FROM pg_catalog.pg_class s \
+             CROSS JOIN LATERAL pg_catalog.aclexplode( \
+               COALESCE(s.relacl, pg_catalog.acldefault('s', s.relowner)) \
+             ) AS a \
+            WHERE s.oid = $1::oid \
+              AND a.grantee <> s.relowner \
+            ORDER BY 1, 2",
+        )
+        .bind(seq.oid)
+        .fetch_all(&mut **tx)
+        .await?;
+
+        push_unsafe_acl_finding(
+            findings,
+            None,
+            &object,
+            "history identity sequence",
+            &unsafe_grants,
+        );
+    }
+
+    Ok(())
+}
+
+fn push_unsafe_acl_finding(
+    findings: &mut Vec<Finding>,
+    table: Option<String>,
+    object: &str,
+    label: &str,
+    grants: &[AclGrantRow],
+) {
+    if grants.is_empty() {
+        return;
+    }
+    let summary: Vec<String> = grants
+        .iter()
+        .map(|g| {
+            if g.is_grantable {
+                format!("{} ({} WITH GRANT OPTION)", g.grantee, g.privilege_type)
+            } else {
+                format!("{} ({})", g.grantee, g.privilege_type)
+            }
+        })
+        .collect();
+    findings.push(Finding {
+        kind: FindingKind::UnsafePrivileges,
+        severity: Severity::Error,
+        table,
+        object: object.to_owned(),
+        detail: format!(
+            "{label} `{object}` has unsafe non-owner privilege(s): {}",
+            summary.join(", ")
+        ),
+    });
 }
 
 async fn check_function(
     tx: &mut Transaction<'_, Postgres>,
     audit_schema: &str,
-    func_name: &str,
-    expected_body: &str,
+    spec: FunctionCheckSpec<'_>,
     findings: &mut Vec<Finding>,
 ) -> Result<(), sqlx::Error> {
-    let object = format!("{audit_schema}.{func_name}()");
+    let object = if spec.pronargs == 0 {
+        format!("{audit_schema}.{}()", spec.name)
+    } else {
+        format!("{audit_schema}.{}(text, jsonb, jsonb)", spec.name)
+    };
     let row: Option<ProcRow> = sqlx::query_as(
         "SELECT \
+           p.oid::bigint AS oid, \
            p.prosrc, \
            p.prosecdef, \
            l.lanname AS langname, \
-           p.proconfig \
+           p.proconfig, \
+           pg_catalog.pg_get_userbyid(p.proowner)::text AS owner_name \
          FROM pg_catalog.pg_proc p \
          JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
          JOIN pg_catalog.pg_language l ON l.oid = p.prolang \
         WHERE n.nspname = $1 \
           AND p.proname = $2 \
-          AND p.pronargs = 0",
+          AND p.prokind = 'f' \
+          AND p.pronargs = $3 \
+          AND ( \
+            $3 = 0 \
+            OR p.proargtypes = (ARRAY[ \
+              'pg_catalog.text'::pg_catalog.regtype::pg_catalog.oid, \
+              'pg_catalog.jsonb'::pg_catalog.regtype::pg_catalog.oid, \
+              'pg_catalog.jsonb'::pg_catalog.regtype::pg_catalog.oid \
+            ])::pg_catalog.oidvector \
+          )",
     )
     .bind(audit_schema)
-    .bind(func_name)
+    .bind(spec.name)
+    .bind(spec.pronargs)
     .fetch_optional(&mut **tx)
     .await?;
 
@@ -462,7 +888,7 @@ async fn check_function(
     };
 
     let mut diffs = Vec::new();
-    if proc_row.prosrc.trim() != expected_body.trim() {
+    if proc_row.prosrc.trim() != spec.expected_body.trim() {
         diffs.push("function body differs from generated SQL");
     }
     if !proc_row.prosecdef {
@@ -489,6 +915,71 @@ async fn check_function(
         });
     }
 
+    if proc_row.owner_name != OWNER_ROLE {
+        findings.push(Finding {
+            kind: FindingKind::InvalidOwnership,
+            severity: Severity::Error,
+            table: None,
+            object: object.clone(),
+            detail: format!(
+                "function `{object}` is owned by `{}`, expected `{OWNER_ROLE}`",
+                proc_row.owner_name
+            ),
+        });
+    }
+
+    check_function_acls(
+        tx,
+        proc_row.oid,
+        &object,
+        spec.allow_non_owner_execute,
+        findings,
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn check_function_acls(
+    tx: &mut Transaction<'_, Postgres>,
+    proc_oid: i64,
+    object: &str,
+    allow_non_owner_execute: bool,
+    findings: &mut Vec<Finding>,
+) -> Result<(), sqlx::Error> {
+    let query = if allow_non_owner_execute {
+        "SELECT \
+           CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END AS grantee, \
+           a.privilege_type::text AS privilege_type, \
+           a.is_grantable \
+         FROM pg_catalog.pg_proc p \
+         CROSS JOIN LATERAL pg_catalog.aclexplode( \
+           COALESCE(p.proacl, pg_catalog.acldefault('f', p.proowner)) \
+         ) AS a \
+        WHERE p.oid = $1::oid \
+          AND a.grantee <> p.proowner \
+          AND (a.grantee = 0 OR a.is_grantable) \
+        ORDER BY 1, 2"
+    } else {
+        "SELECT \
+           CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END AS grantee, \
+           a.privilege_type::text AS privilege_type, \
+           a.is_grantable \
+         FROM pg_catalog.pg_proc p \
+         CROSS JOIN LATERAL pg_catalog.aclexplode( \
+           COALESCE(p.proacl, pg_catalog.acldefault('f', p.proowner)) \
+         ) AS a \
+        WHERE p.oid = $1::oid \
+          AND a.grantee <> p.proowner \
+        ORDER BY 1, 2"
+    };
+
+    let unsafe_grants: Vec<AclGrantRow> = sqlx::query_as(query)
+        .bind(proc_oid)
+        .fetch_all(&mut **tx)
+        .await?;
+
+    push_unsafe_acl_finding(findings, None, object, "function", &unsafe_grants);
     Ok(())
 }
 
@@ -516,18 +1007,22 @@ async fn check_default_partition(
     .fetch_optional(&mut **tx)
     .await?;
 
-    if default_exists.is_none() {
+    let Some(default_oid) = default_exists else {
         return Ok(None);
-    }
+    };
 
     let schema_q = quote_ident(audit_schema);
-    // Query ONLY the DEFAULT partition so monthly partitions are never scanned.
+    // Query through parent `{schema}.changes` filtered by the literal `changes_default` OID:
+    // PostgreSQL checks SELECT only on the parent table (so non-superusers with parent SELECT
+    // succeed while child partitions stay zero-grant) and constant-folds `tableoid = <oid>` so
+    // monthly partitions are never scanned.
     let sql = format!(
         "SELECT \
            count(*)::bigint AS row_count, \
            to_char(min(occurred_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS oldest, \
            to_char(max(occurred_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS newest \
-         FROM ONLY {schema_q}.changes_default"
+         FROM {schema_q}.changes \
+        WHERE tableoid = {default_oid}::pg_catalog.oid"
     );
 
     let row: DefaultPartitionRow = sqlx::query_as(AssertSqlSafe(sql))
@@ -651,7 +1146,8 @@ async fn check_tables(
         .map(|r| r.oid)
         .collect();
 
-    let partition_clones = fetch_partition_update_clones(tx, &partitioned_oids).await?;
+    let partition_clones =
+        fetch_partition_update_clones(tx, &partitioned_oids, audit_schema).await?;
 
     for spec in tables {
         check_single_table(
@@ -700,6 +1196,20 @@ fn check_single_table(
         });
     }
 
+    let config_pk_excluded = spec.excluded_primary_key_columns();
+    if !config_pk_excluded.is_empty() {
+        findings.push(Finding {
+            kind: FindingKind::InvalidExclusion,
+            severity: Severity::Error,
+            table: Some(fq_table.clone()),
+            object: fq_table.clone(),
+            detail: format!(
+                "primary key column(s) {} cannot be excluded on `{fq_table}` because `record_id` requires them",
+                config_pk_excluded.join(", ")
+            ),
+        });
+    }
+
     let rel_triggers = triggers_by_rel.get(&cat.oid);
     let expected_args = expected_trigger_args(spec, is_partitioned_live);
 
@@ -734,6 +1244,15 @@ fn check_single_table(
             });
         }
 
+        check_live_trigger_pk_exclusions(
+            trig,
+            expected.name,
+            &fq_table,
+            &object,
+            &spec.primary_key,
+            findings,
+        );
+
         let diffs = diff_trigger(trig, expected, audit_schema, &expected_args);
         if !diffs.is_empty() {
             findings.push(Finding {
@@ -751,21 +1270,68 @@ fn check_single_table(
     }
 
     if is_partitioned_live && let Some(clones) = partition_clones.get(&cat.oid) {
-        for clone in clones {
-            if let Some(state_label) = disabled_state_label(&clone.tgenabled) {
-                let child_fq = format!("{}.{}", clone.child_schema, clone.child_table);
-                findings.push(Finding {
-                    kind: FindingKind::Disabled,
-                    severity: Severity::Error,
-                    table: Some(fq_table.clone()),
-                    object: format!("{child_fq}.{}", clone.tgname),
-                    detail: format!(
-                        "cloned trigger `{}` on child partition `{child_fq}` (of `{fq_table}`) is {state_label} (`tgenabled = '{}'`)",
-                        clone.tgname, clone.tgenabled
-                    ),
-                });
-            }
+        check_partition_update_clones(&fq_table, clones, findings);
+    }
+}
+
+fn check_partition_update_clones(
+    fq_table: &str,
+    clones: &[PartitionCloneRow],
+    findings: &mut Vec<Finding>,
+) {
+    for clone in clones {
+        if let Some(state_label) = disabled_state_label(&clone.tgenabled) {
+            let child_fq = format!("{}.{}", clone.child_schema, clone.child_table);
+            findings.push(Finding {
+                kind: FindingKind::Disabled,
+                severity: Severity::Error,
+                table: Some(fq_table.to_owned()),
+                object: format!("{child_fq}.{}", clone.tgname),
+                detail: format!(
+                    "cloned trigger `{}` on child partition `{child_fq}` (of `{fq_table}`) is {state_label} (`tgenabled = '{}'`)",
+                    clone.tgname, clone.tgenabled
+                ),
+            });
         }
+    }
+}
+
+fn check_live_trigger_pk_exclusions(
+    trig: &TriggerCatalogRow,
+    trigger_name: &str,
+    fq_table: &str,
+    object: &str,
+    primary_key: &[String],
+    findings: &mut Vec<Finding>,
+) {
+    if primary_key.is_empty() {
+        return;
+    }
+    let live_args = decode_tgargs(&trig.tgargs, trig.tgnargs);
+    let Some(live_excluded) = live_args
+        .get(1)
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+    else {
+        return;
+    };
+    let mut bad_live: Vec<&str> = live_excluded
+        .iter()
+        .filter(|col| primary_key.iter().any(|pk| pk == *col))
+        .map(String::as_str)
+        .collect();
+    bad_live.sort_unstable();
+    bad_live.dedup();
+    if !bad_live.is_empty() {
+        findings.push(Finding {
+            kind: FindingKind::InvalidExclusion,
+            severity: Severity::Error,
+            table: Some(fq_table.to_owned()),
+            object: object.to_owned(),
+            detail: format!(
+                "installed trigger `{trigger_name}` on `{fq_table}` excludes primary key column(s) {}",
+                bad_live.join(", ")
+            ),
+        });
     }
 }
 
@@ -813,6 +1379,7 @@ async fn fetch_table_triggers(
 async fn fetch_partition_update_clones(
     tx: &mut Transaction<'_, Postgres>,
     partitioned_oids: &[i64],
+    audit_schema: &str,
 ) -> Result<HashMap<i64, Vec<PartitionCloneRow>>, sqlx::Error> {
     if partitioned_oids.is_empty() {
         return Ok(HashMap::new());
@@ -838,10 +1405,18 @@ async fn fetch_partition_update_clones(
          JOIN pg_catalog.pg_class c ON c.oid = tree.child_oid \
          JOIN pg_catalog.pg_namespace cn ON cn.oid = c.relnamespace \
          JOIN pg_catalog.pg_trigger t ON t.tgrelid = tree.child_oid \
+         LEFT JOIN pg_catalog.pg_trigger pt ON pt.oid = t.tgparentid \
+         JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid \
+         JOIN pg_catalog.pg_namespace pn ON pn.oid = p.pronamespace \
         WHERE NOT t.tgisinternal \
-          AND (t.tgparentid <> 0 OR t.tgname = 'auditstream_update')",
+          AND ( \
+            t.tgname = 'auditstream_update' \
+            OR pt.tgname = 'auditstream_update' \
+            OR (pn.nspname = $2 AND p.proname = 'capture') \
+          )",
     )
     .bind(partitioned_oids)
+    .bind(audit_schema)
     .fetch_all(&mut **tx)
     .await?;
 
@@ -906,10 +1481,11 @@ fn disabled_state_label(tgenabled: &str) -> Option<&'static str> {
 }
 
 fn expected_trigger_args(spec: &TableTriggerSpec, is_partitioned: bool) -> Vec<String> {
-    let pk_json = serde_json::to_string(&spec.primary_key)
-        .expect("primary_key JSON serialization cannot fail");
-    let ex_json = serde_json::to_string(&spec.excluded_columns)
-        .expect("excluded_columns JSON serialization cannot fail");
+    let pk_json = triggers::encode_json_string_array(&spec.primary_key);
+    let mut excluded = spec.excluded_columns.clone();
+    excluded.sort();
+    excluded.dedup();
+    let ex_json = triggers::encode_json_string_array(&excluded);
     if spec.is_partitioned || is_partitioned {
         vec![pk_json, ex_json, spec.schema.clone(), spec.table.clone()]
     } else {
@@ -1049,8 +1625,24 @@ mod tests {
 
     #[test]
     fn expected_function_bodies_extract_cleanly_from_generator() {
-        let bodies = ExpectedFunctionBodies::from_generator(DEFAULT_SCHEMA);
-        assert!(bodies.resolve_actor.contains("auditstream.actor"));
-        assert!(bodies.capture.contains("TG_OP = 'TRUNCATE'"));
+        for schema in [
+            DEFAULT_SCHEMA,
+            "x.capture(",
+            "x.resolve_actor(",
+            "x.log_event(",
+            "audit\nstream",
+            "x\nAS $fn$",
+        ] {
+            let bodies = ExpectedFunctionBodies::from_generator(schema);
+            assert!(
+                bodies.resolve_actor.contains("auditstream.actor"),
+                "schema {schema:?}"
+            );
+            assert!(
+                bodies.capture.contains("TG_OP = 'TRUNCATE'"),
+                "schema {schema:?}"
+            );
+            assert!(bodies.log_event.contains("v_event_id"), "schema {schema:?}");
+        }
     }
 }

@@ -265,17 +265,19 @@ impl TestDb {
         Ok(())
     }
 
-    /// Executes an ordered sequence of single SQL statements sequentially on one connection
-    /// (preserving session-local settings such as `auditstream._granted_self` across statements).
+    /// Executes an ordered sequence of single SQL statements inside one transaction
+    /// (preserving transaction-local settings such as `auditstream._migration_tx` and
+    /// `auditstream._granted_self` across statements).
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Sqlx`] if acquiring a connection or executing any statement fails.
+    /// Returns [`Error::Sqlx`] if starting a transaction, executing any statement, or committing fails.
     pub async fn execute_statements(&self, stmts: &[String]) -> Result<(), Error> {
-        let mut conn = self.pool.acquire().await?;
+        let mut tx = self.pool.begin().await?;
         for stmt in stmts {
-            conn.execute(AssertSqlSafe(stmt.as_str())).await?;
+            tx.execute(AssertSqlSafe(stmt.as_str())).await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 

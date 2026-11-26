@@ -22,6 +22,7 @@ auditstream init --migrations sql \
 ```
 
 Plain SQL migrations are wrapped in `BEGIN; ... COMMIT;`.
+Keep this transaction wrapper intact: stripping `BEGIN; ... COMMIT;` or executing statements in autocommit mode causes the migration's transaction guard to abort before DDL so lock bounds, ownership reconciliation, and temporary role grants remain atomic.
 
 ## 2. Apply and verify
 
@@ -45,4 +46,4 @@ auditstream init --migrations sql \
 
 `init` leaves previous migrations untouched and writes one new migration.
 Removed tables receive `DROP TRIGGER IF EXISTS` while keeping all existing rows in `auditstream.changes`.
-Re-running with the same selection and generated function and trigger definitions prints `up to date` to stderr and exits `0`.
+Re-running with the same selection and generated DDL, ACL, function, and trigger definitions prints `up to date` to stderr and exits `0`.

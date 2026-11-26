@@ -353,6 +353,93 @@
         },
         "actor_source": "comment"
       }
+    },
+    {
+      "name": "reject-nul-escape-in-comment-payload",
+      "description": "JSON \\u0000 escape inside actor.id yields actor_source='invalid' (matching PostgreSQL jsonb SQLSTATE 22P05).",
+      "input": {
+        "sql": "UPDATE invoice SET status = 'ok' /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidVx1MDAwMDEifQ'*/"
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": "invalid"
+      }
+    },
+    {
+      "name": "reject-raw-nul-byte-in-comment-payload",
+      "description": "Raw 0x00 byte inside decoded comment JSON yields actor_source='invalid'.",
+      "input": {
+        "sql": "UPDATE invoice SET status = 'ok' /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidQAxIn0'*/"
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": "invalid"
+      }
+    },
+    {
+      "name": "reject-nul-in-unknown-key-value",
+      "description": "JSON \\u0000 escape inside an unknown additive key yields actor_source='invalid' (matching PostgreSQL jsonb).",
+      "input": {
+        "sql": "UPDATE invoice SET status = 'ok' /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidTEiLCJleHRyYSI6ImFcdTAwMDBiIn0'*/"
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": "invalid"
+      }
+    },
+    {
+      "name": "reject-nul-in-object-key",
+      "description": "JSON \\u0000 escape inside an object key yields actor_source='invalid'.",
+      "input": {
+        "sql": "UPDATE invoice SET status = 'ok' /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidTEiLCJiYWRcdTAwMDBrIjoxfQ'*/"
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": "invalid"
+      }
+    },
+    {
+      "name": "reject-nul-in-shadowed-duplicate-key",
+      "description": "JSON \\u0000 escape in an overwritten duplicate key yields actor_source='invalid' (PostgreSQL jsonb rejects before deduplication).",
+      "input": {
+        "sql": "UPDATE invoice SET status = 'ok' /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidVx1MDAwMDEiLCJpZCI6InUxIn0'*/"
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": "invalid"
+      }
+    },
+    {
+      "name": "accept-escaped-backslash-before-u0000",
+      "description": "Escaped backslash followed by literal u0000 (\\\\u0000 in JSON) is NOT a NUL character and MUST succeed.",
+      "input": {
+        "sql": "UPDATE invoice SET status = 'ok' /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidVxcdTAwMDAxIn0'*/"
+      },
+      "expected": {
+        "actor": {
+          "type": "user",
+          "id": "u\\u00001"
+        },
+        "context": null,
+        "actor_source": "comment"
+      }
+    },
+    {
+      "name": "reject-escaped-backslash-plus-nul",
+      "description": "Escaped backslash immediately followed by a real \\u0000 escape (\\\\\\u0000 in JSON) yields actor_source='invalid'.",
+      "input": {
+        "sql": "UPDATE invoice SET status = 'ok' /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidVxcXHUwMDAwMSJ9'*/"
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": "invalid"
+      }
     }
   ]
 }
