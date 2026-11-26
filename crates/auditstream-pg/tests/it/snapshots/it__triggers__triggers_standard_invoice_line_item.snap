@@ -10,26 +10,62 @@ $$;
 
 DO $$
 DECLARE
-  granted_self boolean := false;
-  needs_grant boolean := false;
+  grant_mode text := 'none';
+  need_inherit boolean := false;
+  need_set boolean := false;
 BEGIN
   IF pg_catalog.current_setting('auditstream._migration_tx', true) IS DISTINCT FROM 'on' THEN
     RAISE EXCEPTION 'Auditstream trigger statements must run inside a single transaction'
       USING HINT = 'Wrap the generated statements in BEGIN; ... COMMIT; or use a transactional migrator.';
   END IF;
-  needs_grant := NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'USAGE');
-  IF NOT needs_grant AND pg_catalog.current_setting('server_version_num')::int >= 160000 THEN
-    needs_grant := NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'SET');
+  IF NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'MEMBER') THEN
+    IF pg_catalog.current_setting('server_version_num')::int >= 160000 THEN
+      EXECUTE pg_catalog.format('GRANT "auditstream_owner" TO %I WITH INHERIT TRUE, SET TRUE', current_user);
+    ELSE
+      EXECUTE pg_catalog.format('GRANT "auditstream_owner" TO %I', current_user);
+    END IF;
+    grant_mode := 'member';
+  ELSIF pg_catalog.current_setting('server_version_num')::int >= 160000 THEN
+    need_inherit := NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'USAGE');
+    need_set := NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'SET');
+    IF need_inherit AND need_set THEN
+      EXECUTE pg_catalog.format('GRANT "auditstream_owner" TO %I WITH INHERIT TRUE, SET TRUE', current_user);
+      grant_mode := 'both';
+    ELSIF need_inherit THEN
+      EXECUTE pg_catalog.format('GRANT "auditstream_owner" TO %I WITH INHERIT TRUE', current_user);
+      grant_mode := 'inherit';
+    ELSIF need_set THEN
+      EXECUTE pg_catalog.format('GRANT "auditstream_owner" TO %I WITH SET TRUE', current_user);
+      grant_mode := 'set';
+    END IF;
   END IF;
-  IF needs_grant THEN
-    EXECUTE pg_catalog.format('GRANT "auditstream_owner" TO %I', current_user);
-    granted_self := true;
-  END IF;
-  PERFORM pg_catalog.set_config(
-    'auditstream._triggers_granted_self',
-    CASE WHEN granted_self THEN '1' ELSE '0' END,
-    true
-  );
+  PERFORM pg_catalog.set_config('auditstream._triggers_granted_self', grant_mode, true);
+END
+$$;
+
+DO $$
+DECLARE
+  fn_name name;
+BEGIN
+  FOREACH fn_name IN ARRAY ARRAY['resolve_actor', 'capture']::name[] LOOP
+    IF EXISTS (
+      SELECT 1 FROM pg_catalog.pg_proc p
+      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+       WHERE n.nspname = 'auditstream'
+         AND p.proname = fn_name
+         AND p.pronargs = 0
+         AND p.proowner <> 'auditstream_owner'::pg_catalog.regrole
+    ) THEN
+      EXECUTE pg_catalog.format('ALTER FUNCTION %I.%I() OWNER TO %I', 'auditstream', fn_name, 'auditstream_owner');
+    END IF;
+  END LOOP;
+END
+$$;
+
+DO $$
+BEGIN
+  PERFORM pg_catalog.set_config('auditstream._prev_role', current_user, true);
+  EXECUTE pg_catalog.format('SET LOCAL ROLE %I', 'auditstream_owner');
 END
 $$;
 
@@ -228,18 +264,6 @@ BEGIN
 END
 $fn$;
 
-DO $$
-BEGIN
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_proc
-             WHERE oid = '"auditstream".resolve_actor()'::pg_catalog.regprocedure
-               AND proowner <> 'auditstream_owner'::pg_catalog.regrole) THEN
-    ALTER FUNCTION "auditstream".resolve_actor() OWNER TO "auditstream_owner";
-  END IF;
-END
-$$;
-
-REVOKE ALL ON FUNCTION "auditstream".resolve_actor() FROM PUBLIC;
-
 CREATE OR REPLACE FUNCTION "auditstream".capture()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -268,6 +292,18 @@ BEGIN
     v_schema := TG_ARGV[2];
     v_table := TG_ARGV[3];
     v_relid := pg_catalog.to_regclass(pg_catalog.format('%I.%I', v_schema, v_table));
+    IF v_relid IS NULL OR (
+      v_relid <> TG_RELID
+      AND NOT EXISTS (
+        SELECT 1
+          FROM pg_catalog.pg_partition_ancestors(TG_RELID) AS a(relid)
+         WHERE a.relid = v_relid
+      )
+    ) THEN
+      RAISE EXCEPTION 'auditstream.capture: trigger relation % is not a partition of %.%',
+        TG_RELID::pg_catalog.regclass, v_schema, v_table
+        USING ERRCODE = '42501';
+    END IF;
   ELSE
     v_schema := TG_TABLE_SCHEMA;
     v_table := TG_TABLE_NAME;
@@ -490,16 +526,87 @@ END
 $fn$;
 
 DO $$
+DECLARE
+  fn_name name;
+  grantee_oid oid;
 BEGIN
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_proc
-             WHERE oid = '"auditstream".capture()'::pg_catalog.regprocedure
-               AND proowner <> 'auditstream_owner'::pg_catalog.regrole) THEN
-    ALTER FUNCTION "auditstream".capture() OWNER TO "auditstream_owner";
-  END IF;
+  FOR fn_name, grantee_oid IN
+    SELECT DISTINCT p.proname, a.grantee
+      FROM pg_catalog.pg_proc p
+      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(p.proacl, pg_catalog.acldefault('f', p.proowner))
+      ) AS a
+     WHERE n.nspname = 'auditstream'
+       AND p.proname IN ('resolve_actor', 'capture')
+       AND p.pronargs = 0
+       AND a.grantee <> p.proowner
+     ORDER BY p.proname, a.grantee
+  LOOP
+    IF grantee_oid = 0 THEN
+      EXECUTE pg_catalog.format('REVOKE ALL ON FUNCTION %I.%I() FROM PUBLIC CASCADE', 'auditstream', fn_name);
+    ELSE
+      EXECUTE pg_catalog.format(
+        'REVOKE ALL ON FUNCTION %I.%I() FROM %I CASCADE',
+        'auditstream',
+        fn_name,
+        pg_catalog.pg_get_userbyid(grantee_oid)
+      );
+    END IF;
+  END LOOP;
 END
 $$;
 
-REVOKE ALL ON FUNCTION "auditstream".capture() FROM PUBLIC;
+DO $$
+DECLARE
+  prev_role text := pg_catalog.current_setting('auditstream._prev_role', true);
+BEGIN
+  SET LOCAL ROLE NONE;
+  IF prev_role IS NOT NULL AND prev_role <> '' AND prev_role <> current_user THEN
+    EXECUTE pg_catalog.format('SET LOCAL ROLE %I', prev_role);
+  END IF;
+  PERFORM pg_catalog.set_config('auditstream._prev_role', '', true);
+END
+$$;
+
+DO $$
+DECLARE
+  caller name := current_user;
+  granted_usage boolean := false;
+  granted_exec boolean := false;
+BEGIN
+  IF NOT pg_catalog.pg_has_role(caller, 'auditstream_owner', 'USAGE') THEN
+    EXECUTE pg_catalog.format('SET LOCAL ROLE %I', 'auditstream_owner');
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_catalog.pg_namespace n
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(n.nspacl, pg_catalog.acldefault('n', n.nspowner))
+      ) AS a
+       WHERE n.nspname = 'auditstream'
+         AND a.grantee = caller::pg_catalog.regrole
+         AND a.privilege_type = 'USAGE'
+    ) THEN
+      EXECUTE pg_catalog.format('GRANT USAGE ON SCHEMA %I TO %I', 'auditstream', caller);
+      granted_usage := true;
+    END IF;
+    EXECUTE pg_catalog.format('GRANT EXECUTE ON FUNCTION %I.capture() TO %I', 'auditstream', caller);
+    granted_exec := true;
+    SET LOCAL ROLE NONE;
+    IF caller <> current_user THEN
+      EXECUTE pg_catalog.format('SET LOCAL ROLE %I', caller);
+    END IF;
+  END IF;
+  PERFORM pg_catalog.set_config(
+    'auditstream._temp_trigger_privs',
+    CASE
+      WHEN granted_usage AND granted_exec THEN 'both'
+      WHEN granted_exec THEN 'exec'
+      ELSE 'none'
+    END,
+    true
+  );
+END
+$$;
 
 CREATE OR REPLACE TRIGGER auditstream_insert
   AFTER INSERT ON "public"."invoice"
@@ -546,9 +653,40 @@ CREATE OR REPLACE TRIGGER auditstream_truncate
   EXECUTE FUNCTION "auditstream".capture('["id"]', '[]');
 
 DO $$
+DECLARE
+  caller name := current_user;
+  priv_mode text := pg_catalog.current_setting('auditstream._temp_trigger_privs', true);
 BEGIN
-  IF pg_catalog.current_setting('auditstream._triggers_granted_self', true) = '1' THEN
+  IF priv_mode IN ('both', 'exec') THEN
+    EXECUTE pg_catalog.format('SET LOCAL ROLE %I', 'auditstream_owner');
+    EXECUTE pg_catalog.format('REVOKE EXECUTE ON FUNCTION %I.capture() FROM %I CASCADE', 'auditstream', caller);
+    IF priv_mode = 'both' THEN
+      EXECUTE pg_catalog.format('REVOKE USAGE ON SCHEMA %I FROM %I CASCADE', 'auditstream', caller);
+    END IF;
+    SET LOCAL ROLE NONE;
+    IF caller <> current_user THEN
+      EXECUTE pg_catalog.format('SET LOCAL ROLE %I', caller);
+    END IF;
+    PERFORM pg_catalog.set_config('auditstream._temp_trigger_privs', '', true);
+  END IF;
+END
+$$;
+
+DO $$
+DECLARE
+  grant_mode text := pg_catalog.current_setting('auditstream._triggers_granted_self', true);
+BEGIN
+  IF grant_mode = 'member' THEN
     EXECUTE pg_catalog.format('REVOKE "auditstream_owner" FROM %I', current_user);
+  ELSIF grant_mode = 'both' THEN
+    EXECUTE pg_catalog.format('REVOKE INHERIT OPTION FOR "auditstream_owner" FROM %I', current_user);
+    EXECUTE pg_catalog.format('REVOKE SET OPTION FOR "auditstream_owner" FROM %I', current_user);
+  ELSIF grant_mode = 'inherit' THEN
+    EXECUTE pg_catalog.format('REVOKE INHERIT OPTION FOR "auditstream_owner" FROM %I', current_user);
+  ELSIF grant_mode = 'set' THEN
+    EXECUTE pg_catalog.format('REVOKE SET OPTION FOR "auditstream_owner" FROM %I', current_user);
+  END IF;
+  IF grant_mode IS NOT NULL AND grant_mode <> '' THEN
     PERFORM pg_catalog.set_config('auditstream._triggers_granted_self', '', true);
   END IF;
 END

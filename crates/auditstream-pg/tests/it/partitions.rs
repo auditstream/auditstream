@@ -349,6 +349,7 @@ async fn history_stats_reports_missing_clean_contiguous_gap_and_default_rows() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn ensure_ahead_under_alter_default_privileges_keeps_child_partitions_append_only() {
     let _lock = TestDb::cluster_lock().await.expect("acquire cluster lock");
     let db = TestDb::non_superuser()
@@ -424,6 +425,7 @@ async fn ensure_ahead_under_alter_default_privileges_keeps_child_partitions_appe
         let target = format!("auditstream.{}", ym.partition_name());
         let (start_utc, _) = ym.utc_bounds();
         for sql in [
+            format!("SELECT count(*) FROM {target}"),
             format!(
                 "INSERT INTO {target} (occurred_at, op) VALUES ('{start_utc}'::timestamptz, 'FAKE')"
             ),
@@ -441,6 +443,18 @@ async fn ensure_ahead_under_alter_default_privileges_keeps_child_partitions_appe
             );
         }
     }
+
+    // No-op ensure_ahead (when all target months already exist) must succeed without requiring
+    // auditstream_owner elevation (even as app_role, which holds zero membership in auditstream_owner).
+    let app_pool = auditstream_pg::connect(&app_url)
+        .await
+        .expect("connect app_pool");
+    let noop = partitions::ensure_ahead(&app_pool, DEFAULT_SCHEMA, 5)
+        .await
+        .expect("no-op ensure_ahead must not require auditstream_owner membership");
+    assert_eq!(noop.created, Vec::new());
+    assert_eq!(noop.skipped.len(), 6);
+    app_pool.close().await;
 
     app_conn.close().await.expect("close app_conn");
     drop(db);

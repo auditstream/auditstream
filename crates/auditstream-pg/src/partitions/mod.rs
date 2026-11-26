@@ -299,6 +299,26 @@ pub async fn ensure_ahead_with_options(
     let current_month = fetch_db_utc_month(&mut tx).await?;
     let existing = fetch_existing_monthly_partitions(&mut tx, &options.schema).await?;
     let existing_set: HashSet<String> = existing.into_iter().collect();
+    let targets = target_months_from(current_month, options.months_ahead);
+
+    if targets
+        .iter()
+        .all(|ym| existing_set.contains(&ym.partition_name()))
+    {
+        tx.commit().await?;
+        let skipped = targets
+            .into_iter()
+            .map(|month| SkippedMonth {
+                month,
+                reason: SkipReason::AlreadyExists,
+            })
+            .collect();
+        return Ok(EnsureReport {
+            current_month,
+            created: Vec::new(),
+            skipped,
+        });
+    }
 
     let lock_timeout_sql = format!(
         "SET LOCAL lock_timeout = {}",
@@ -308,7 +328,7 @@ pub async fn ensure_ahead_with_options(
         .execute(&mut *tx)
         .await?;
 
-    let granted_self = ensure_owner_membership(&mut tx).await?;
+    let grant_mode = ensure_owner_membership(&mut tx).await?;
     let saved_role = enter_owner_role(&mut tx).await?;
 
     let schema_q = quote_ident(&options.schema);
@@ -316,7 +336,7 @@ pub async fn ensure_ahead_with_options(
     let mut created = Vec::new();
     let mut skipped = Vec::new();
 
-    for ym in target_months_from(current_month, options.months_ahead) {
+    for ym in targets {
         let part_name = ym.partition_name();
         if existing_set.contains(&part_name) {
             skipped.push(SkippedMonth {
@@ -326,47 +346,14 @@ pub async fn ensure_ahead_with_options(
             continue;
         }
 
-        let (start_utc, end_utc) = ym.utc_bounds();
-        let part_q = quote_ident(&part_name);
-        let create_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {schema_q}.{part_q} \
-             PARTITION OF {schema_q}.changes \
-             FOR VALUES FROM ({}) TO ({})",
-            quote_literal(&start_utc),
-            quote_literal(&end_utc),
-        );
-
-        sqlx::query("SAVEPOINT auditstream_create_part")
-            .execute(&mut *tx)
-            .await?;
-
-        match sqlx::query(AssertSqlSafe(create_sql))
-            .execute(&mut *tx)
+        match create_partition_with_savepoint(&mut tx, &options.schema, &schema_q, ym, &part_name)
             .await
         {
-            Ok(_) => {
-                sanitize_child_partition_acl(&mut tx, &options.schema, &part_name).await?;
-                sqlx::query("RELEASE SAVEPOINT auditstream_create_part")
-                    .execute(&mut *tx)
-                    .await?;
-                created.push(ym);
-            }
-            Err(err) if is_sqlstate(&err, SQLSTATE_CHECK_VIOLATION) => {
-                sqlx::query("ROLLBACK TO SAVEPOINT auditstream_create_part")
-                    .execute(&mut *tx)
-                    .await?;
-                sqlx::query("RELEASE SAVEPOINT auditstream_create_part")
-                    .execute(&mut *tx)
-                    .await?;
-
-                let row_count =
-                    count_default_rows_in_range(&mut tx, &options.schema, &start_utc, &end_utc)
-                        .await?;
-                skipped.push(SkippedMonth {
-                    month: ym,
-                    reason: SkipReason::DefaultPartitionConflict { row_count },
-                });
-            }
+            Ok(Some(row_count)) => skipped.push(SkippedMonth {
+                month: ym,
+                reason: SkipReason::DefaultPartitionConflict { row_count },
+            }),
+            Ok(None) => created.push(ym),
             Err(err) if is_sqlstate(&err, SQLSTATE_LOCK_NOT_AVAILABLE) => {
                 tx.rollback().await?;
                 return Err(PartitionError::LockTimeout {
@@ -381,10 +368,7 @@ pub async fn ensure_ahead_with_options(
     }
 
     restore_role(&mut tx, &saved_role).await?;
-
-    if granted_self {
-        revoke_owner_membership(&mut tx).await?;
-    }
+    revoke_owner_membership(&mut tx, grant_mode).await?;
 
     tx.commit().await?;
 
@@ -393,6 +377,52 @@ pub async fn ensure_ahead_with_options(
         created,
         skipped,
     })
+}
+
+async fn create_partition_with_savepoint(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    schema: &str,
+    schema_q: &str,
+    ym: YearMonth,
+    part_name: &str,
+) -> Result<Option<i64>, sqlx::Error> {
+    let (start_utc, end_utc) = ym.utc_bounds();
+    let part_q = quote_ident(part_name);
+    let create_sql = format!(
+        "CREATE TABLE IF NOT EXISTS {schema_q}.{part_q} \
+         PARTITION OF {schema_q}.changes \
+         FOR VALUES FROM ({}) TO ({})",
+        quote_literal(&start_utc),
+        quote_literal(&end_utc),
+    );
+
+    sqlx::query("SAVEPOINT auditstream_create_part")
+        .execute(&mut **tx)
+        .await?;
+
+    match sqlx::query(AssertSqlSafe(create_sql))
+        .execute(&mut **tx)
+        .await
+    {
+        Ok(_) => {
+            sanitize_child_partition_acl(tx, schema, part_name).await?;
+            sqlx::query("RELEASE SAVEPOINT auditstream_create_part")
+                .execute(&mut **tx)
+                .await?;
+            Ok(None)
+        }
+        Err(err) if is_sqlstate(&err, SQLSTATE_CHECK_VIOLATION) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT auditstream_create_part")
+                .execute(&mut **tx)
+                .await?;
+            sqlx::query("RELEASE SAVEPOINT auditstream_create_part")
+                .execute(&mut **tx)
+                .await?;
+            let row_count = count_default_rows_in_range(tx, schema, &start_utc, &end_utc).await?;
+            Ok(Some(row_count))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Inspects attached monthly partitions and `{schema}.changes_default` row count using the
@@ -698,12 +728,12 @@ async fn sanitize_child_partition_acl(
                 CASE WHEN a.grantee = 0 THEN NULL ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END \
            FROM pg_catalog.pg_class c \
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-           CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) AS a \
+           CROSS JOIN LATERAL pg_catalog.aclexplode( \
+             COALESCE(c.relacl, pg_catalog.acldefault('r', c.relowner)) \
+           ) AS a \
           WHERE n.nspname = $1 \
             AND c.relname = $2 \
-            AND c.relacl IS NOT NULL \
             AND a.grantee <> c.relowner \
-            AND (a.grantee = 0 OR a.privilege_type <> 'SELECT') \
           ORDER BY 1",
     )
     .bind(schema)
@@ -715,10 +745,10 @@ async fn sanitize_child_partition_acl(
     let part_q = quote_ident(part_name);
     for (grantee_oid, grantee_name) in grantees {
         let revoke_sql = if grantee_oid == 0 {
-            format!("REVOKE ALL ON TABLE {schema_q}.{part_q} FROM PUBLIC")
+            format!("REVOKE ALL ON TABLE {schema_q}.{part_q} FROM PUBLIC CASCADE")
         } else if let Some(role) = grantee_name {
             format!(
-                "REVOKE ALL ON TABLE {schema_q}.{part_q} FROM {}",
+                "REVOKE ALL ON TABLE {schema_q}.{part_q} FROM {} CASCADE",
                 quote_ident(&role)
             )
         } else {
@@ -731,50 +761,73 @@ async fn sanitize_child_partition_acl(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerGrantMode {
+    None,
+    Member,
+    SetOption,
+}
+
 async fn ensure_owner_membership(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-) -> Result<bool, sqlx::Error> {
-    let has_usage: bool =
-        sqlx::query_scalar("SELECT pg_catalog.pg_has_role(current_user, $1, 'USAGE')")
+) -> Result<OwnerGrantMode, sqlx::Error> {
+    let server_version_num: i32 =
+        sqlx::query_scalar("SELECT pg_catalog.current_setting('server_version_num')::int")
+            .fetch_one(&mut **tx)
+            .await?;
+    let has_member: bool =
+        sqlx::query_scalar("SELECT pg_catalog.pg_has_role(current_user, $1, 'MEMBER')")
             .bind(OWNER_ROLE)
             .fetch_one(&mut **tx)
             .await?;
 
-    let mut needs_grant = !has_usage;
-    if !needs_grant {
-        let server_version_num: i32 =
-            sqlx::query_scalar("SELECT pg_catalog.current_setting('server_version_num')::int")
+    let owner_q = quote_ident(OWNER_ROLE);
+    if !has_member {
+        let sql = if server_version_num >= 160_000 {
+            format!(
+                "DO $$ BEGIN EXECUTE pg_catalog.format('GRANT {owner_q} TO %I WITH SET TRUE', current_user); END $$"
+            )
+        } else {
+            format!(
+                "DO $$ BEGIN EXECUTE pg_catalog.format('GRANT {owner_q} TO %I', current_user); END $$"
+            )
+        };
+        sqlx::query(AssertSqlSafe(sql)).execute(&mut **tx).await?;
+        return Ok(OwnerGrantMode::Member);
+    }
+
+    if server_version_num >= 160_000 {
+        let has_set: bool =
+            sqlx::query_scalar("SELECT pg_catalog.pg_has_role(current_user, $1, 'SET')")
+                .bind(OWNER_ROLE)
                 .fetch_one(&mut **tx)
                 .await?;
-        if server_version_num >= 160_000 {
-            let has_set: bool =
-                sqlx::query_scalar("SELECT pg_catalog.pg_has_role(current_user, $1, 'SET')")
-                    .bind(OWNER_ROLE)
-                    .fetch_one(&mut **tx)
-                    .await?;
-            needs_grant = !has_set;
+        if !has_set {
+            let sql = format!(
+                "DO $$ BEGIN EXECUTE pg_catalog.format('GRANT {owner_q} TO %I WITH SET TRUE', current_user); END $$"
+            );
+            sqlx::query(AssertSqlSafe(sql)).execute(&mut **tx).await?;
+            return Ok(OwnerGrantMode::SetOption);
         }
     }
 
-    if !needs_grant {
-        return Ok(false);
-    }
-
-    let owner_q = quote_ident(OWNER_ROLE);
-    let sql = format!(
-        "DO $$ BEGIN EXECUTE pg_catalog.format('GRANT {owner_q} TO %I', current_user); END $$"
-    );
-    sqlx::query(AssertSqlSafe(sql)).execute(&mut **tx).await?;
-    Ok(true)
+    Ok(OwnerGrantMode::None)
 }
 
 async fn revoke_owner_membership(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    mode: OwnerGrantMode,
 ) -> Result<(), sqlx::Error> {
     let owner_q = quote_ident(OWNER_ROLE);
-    let sql = format!(
-        "DO $$ BEGIN EXECUTE pg_catalog.format('REVOKE {owner_q} FROM %I', current_user); END $$"
-    );
+    let sql = match mode {
+        OwnerGrantMode::None => return Ok(()),
+        OwnerGrantMode::Member => format!(
+            "DO $$ BEGIN EXECUTE pg_catalog.format('REVOKE {owner_q} FROM %I', current_user); END $$"
+        ),
+        OwnerGrantMode::SetOption => format!(
+            "DO $$ BEGIN EXECUTE pg_catalog.format('REVOKE SET OPTION FOR {owner_q} FROM %I', current_user); END $$"
+        ),
+    };
     sqlx::query(AssertSqlSafe(sql)).execute(&mut **tx).await?;
     Ok(())
 }

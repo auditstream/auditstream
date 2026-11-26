@@ -471,3 +471,71 @@ async fn reports_error_when_primary_key_column_is_excluded() {
         live_report.findings
     );
 }
+
+#[tokio::test]
+async fn reports_unsafe_privileges_and_invalid_ownership_across_history_objects() {
+    let db = TestDb::new().await.expect("create TestDb");
+    create_invoice_table(&db).await;
+    let specs = vec![invoice_spec(vec!["password_hash"])];
+    install_fixture(&db, &specs).await;
+
+    // Inject unsafe ACLs across schema, parent changes, child partition, identity sequence, and functions,
+    // plus wrong owner on changes_default.
+    for sql in [
+        "GRANT CREATE ON SCHEMA auditstream TO PUBLIC",
+        "GRANT INSERT ON TABLE auditstream.changes TO PUBLIC",
+        "GRANT DELETE ON TABLE auditstream.changes_default TO PUBLIC",
+        "GRANT USAGE ON SEQUENCE auditstream.changes_id_seq TO PUBLIC",
+        "GRANT EXECUTE ON FUNCTION auditstream.capture() TO PUBLIC",
+        "GRANT EXECUTE ON FUNCTION auditstream.resolve_actor() TO PUBLIC",
+        "GRANT EXECUTE ON FUNCTION auditstream.log_event(text, jsonb, jsonb) TO PUBLIC",
+        "ALTER TABLE auditstream.changes_default OWNER TO CURRENT_USER",
+    ] {
+        db.execute(sql).await.expect(sql);
+    }
+
+    let report = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify unsafe privileges");
+    assert!(report.has_errors());
+
+    for expected_obj in [
+        "auditstream",
+        "auditstream.changes",
+        "auditstream.changes_default",
+        "auditstream.changes_id_seq",
+        "auditstream.capture()",
+        "auditstream.resolve_actor()",
+        "auditstream.log_event(text, jsonb, jsonb)",
+    ] {
+        assert!(
+            report.findings.iter().any(|f| {
+                f.kind == FindingKind::UnsafePrivileges
+                    && f.severity == Severity::Error
+                    && f.object == expected_obj
+            }),
+            "expected UnsafePrivileges finding for {expected_obj}, got: {:?}",
+            report.findings
+        );
+    }
+    assert!(
+        report.findings.iter().any(|f| {
+            f.kind == FindingKind::InvalidOwnership
+                && f.severity == Severity::Error
+                && f.object == "auditstream.changes_default"
+        }),
+        "expected InvalidOwnership finding for changes_default, got: {:?}",
+        report.findings
+    );
+
+    // Re-applying DDL + triggers heals every ownership and ACL finding.
+    install_fixture(&db, &specs).await;
+    let healed = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify healed install");
+    assert!(
+        healed.is_clean(),
+        "expected clean verify after re-applying DDL + triggers, got: {:?}",
+        healed.findings
+    );
+}

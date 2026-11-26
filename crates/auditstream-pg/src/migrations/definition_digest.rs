@@ -1,17 +1,15 @@
 use sha2::{Digest, Sha256};
 
-/// Hashes the generated function (`resolve_actor`, `capture`, `log_event`) and trigger
-/// definitions so changing any of them produces a refresh migration. Other statements are skipped:
-/// they are idempotent DDL wrappers or depend on the previous selection (`DROP TRIGGER` for
-/// removed tables).
+/// Hashes all deterministic generated DDL, ACL, function, and trigger statements so any engine
+/// security or capture change produces a refresh migration on the next `init` run. Only
+/// selection-history-dependent `DROP TRIGGER IF EXISTS` statements are skipped so removing a
+/// table once does not invalidate subsequent no-op checks.
 pub(super) fn from_statements(statements: &[String]) -> String {
     let mut digest = Sha256::new();
     for sql in statements {
-        if sql.starts_with("CREATE OR REPLACE FUNCTION ")
-            || sql.starts_with("CREATE OR REPLACE TRIGGER ")
-        {
+        if !sql.starts_with("DROP TRIGGER IF EXISTS ") {
             digest.update(sql.as_bytes());
-            // NUL separates definitions and cannot occur in a PostgreSQL statement.
+            // NUL separates statements and cannot occur in a PostgreSQL statement.
             digest.update([0]);
         }
     }

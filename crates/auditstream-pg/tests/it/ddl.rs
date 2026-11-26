@@ -546,25 +546,62 @@ async fn alter_default_privileges_cannot_grant_writes_on_changes_or_child_partit
             .await
             .expect("migrator connect");
         // Simulate a common managed-Postgres setup where the migration role automatically
-        // grants ALL ON TABLES to the application role and PUBLIC.
-        conn.execute(AssertSqlSafe(format!(
-            "ALTER DEFAULT PRIVILEGES FOR ROLE {} GRANT ALL ON TABLES TO {}",
-            quote_ident(&migrator_role),
-            quote_ident(&app_role),
-        )))
-        .await
-        .expect("set default privileges for app_role");
-        conn.execute(AssertSqlSafe(format!(
-            "ALTER DEFAULT PRIVILEGES FOR ROLE {} GRANT ALL ON TABLES TO PUBLIC",
-            quote_ident(&migrator_role),
-        )))
-        .await
-        .expect("set default privileges for PUBLIC");
+        // grants ALL ON TABLES, SEQUENCES, and FUNCTIONS to the application role and PUBLIC.
+        for grant_sql in [
+            format!(
+                "ALTER DEFAULT PRIVILEGES FOR ROLE {} GRANT ALL ON TABLES TO {}",
+                quote_ident(&migrator_role),
+                quote_ident(&app_role),
+            ),
+            format!(
+                "ALTER DEFAULT PRIVILEGES FOR ROLE {} GRANT ALL ON TABLES TO PUBLIC",
+                quote_ident(&migrator_role),
+            ),
+            format!(
+                "ALTER DEFAULT PRIVILEGES FOR ROLE {} GRANT ALL ON SEQUENCES TO {}",
+                quote_ident(&migrator_role),
+                quote_ident(&app_role),
+            ),
+            format!(
+                "ALTER DEFAULT PRIVILEGES FOR ROLE {} GRANT ALL ON SEQUENCES TO PUBLIC",
+                quote_ident(&migrator_role),
+            ),
+            format!(
+                "ALTER DEFAULT PRIVILEGES FOR ROLE {} GRANT ALL ON FUNCTIONS TO {}",
+                quote_ident(&migrator_role),
+                quote_ident(&app_role),
+            ),
+            format!(
+                "ALTER DEFAULT PRIVILEGES FOR ROLE {} GRANT ALL ON FUNCTIONS TO PUBLIC",
+                quote_ident(&migrator_role),
+            ),
+        ] {
+            conn.execute(AssertSqlSafe(grant_sql))
+                .await
+                .expect("set default privileges");
+        }
+
+        conn.execute("CREATE TABLE public.invoice (id int PRIMARY KEY, status text)")
+            .await
+            .expect("create public.invoice");
 
         let mut tx = conn.begin().await.expect("begin setup tx");
         run_statements(&mut tx, &stmts)
             .await
             .expect("apply DDL under ALTER DEFAULT PRIVILEGES");
+        let trig_stmts =
+            auditstream_pg::triggers::generate(&auditstream_pg::triggers::TriggerOptions::new(
+                DEFAULT_SCHEMA,
+                vec![auditstream_pg::triggers::TableTriggerSpec::new(
+                    "public",
+                    "invoice",
+                    vec!["id".to_owned()],
+                    vec![],
+                )],
+            ));
+        run_statements(&mut tx, &trig_stmts)
+            .await
+            .expect("apply triggers under ALTER DEFAULT PRIVILEGES");
         tx.commit().await.expect("commit setup tx");
         conn.close().await.expect("close migrator");
     }
@@ -603,8 +640,45 @@ async fn alter_default_privileges_cannot_grant_writes_on_changes_or_child_partit
         }
     }
 
-    // Also verify re-applying DDL heals leaked write grants on pre-existing partitions and changes
-    // (simulating an upgrade from a v0.1.0 database installed under ALTER DEFAULT PRIVILEGES).
+    // app_role must NOT hold sequence privileges (prevents setval DoS / cursor corruption).
+    let seq_err = app_conn
+        .execute("SELECT pg_catalog.setval('auditstream.changes_id_seq', 1)")
+        .await
+        .expect_err("app_role must be denied setval on changes_id_seq");
+    assert!(
+        seq_err.to_string().contains("permission denied"),
+        "expected permission denied on sequence, got: {seq_err}"
+    );
+
+    // app_role must NOT hold EXECUTE on SECURITY DEFINER capture() or resolve_actor(),
+    // blocking forged audit rows via temp-table triggers.
+    let resolve_err = app_conn
+        .execute("SELECT * FROM auditstream.resolve_actor()")
+        .await
+        .expect_err("app_role must be denied EXECUTE on resolve_actor()");
+    assert!(
+        resolve_err.to_string().contains("permission denied"),
+        "expected permission denied on resolve_actor(), got: {resolve_err}"
+    );
+    app_conn
+        .execute("CREATE TEMP TABLE evil (id int, status text)")
+        .await
+        .expect("create temp table");
+    let spoof_trig_err = app_conn
+        .execute(
+            "CREATE TRIGGER spoof AFTER INSERT ON evil \
+             REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT \
+             EXECUTE FUNCTION auditstream.capture('[\"id\"]', '[]', 'public', 'invoice')",
+        )
+        .await
+        .expect_err("app_role must be denied CREATE TRIGGER calling auditstream.capture()");
+    assert!(
+        spoof_trig_err.to_string().contains("permission denied"),
+        "expected permission denied on capture() trigger creation, got: {spoof_trig_err}"
+    );
+
+    // Defense in depth: even if a superuser attaches capture() with spoofed TG_ARGV[2..3]
+    // pointing to an unrelated table, capture() rejects the write with SQLSTATE 42501.
     {
         let (base, _) = admin_url.rsplit_once('/').expect("admin url slash");
         let admin_db_url = format!("{base}/{}", db.database_name());
@@ -612,8 +686,40 @@ async fn alter_default_privileges_cannot_grant_writes_on_changes_or_child_partit
             .await
             .expect("admin connect target db");
         db_admin
+            .execute(
+                "CREATE TABLE public.unrelated_evil (id int PRIMARY KEY, status text); \
+                 CREATE TRIGGER spoof_insert AFTER INSERT ON public.unrelated_evil \
+                 REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT \
+                 EXECUTE FUNCTION auditstream.capture('[\"id\"]', '[]', 'public', 'invoice');",
+            )
+            .await
+            .expect("create unrelated table with spoofed trigger");
+        let spoof_insert_err = db_admin
+            .execute("INSERT INTO public.unrelated_evil (id, status) VALUES (999, 'forged')")
+            .await
+            .expect_err("capture() must reject TG_RELID not belonging to named parent");
+        assert_eq!(
+            spoof_insert_err
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("42501"),
+            "expected SQLSTATE 42501 on parent spoof, got: {spoof_insert_err}"
+        );
+
+        // Also inject leaked grants on a historical partition, SELECT WITH GRANT OPTION on changes,
+        // sequence grants, and function grants to verify re-running DDL heals all of them.
+        db_admin
             .execute(AssertSqlSafe(format!(
-                "GRANT ALL ON TABLE auditstream.changes, auditstream.changes_default, {current_part} TO {}",
+                "CREATE TABLE auditstream.changes_2025_01 PARTITION OF auditstream.changes \
+                   FOR VALUES FROM ('2025-01-01 00:00:00+00') TO ('2025-02-01 00:00:00+00'); \
+                 ALTER TABLE auditstream.changes_2025_01 OWNER TO auditstream_owner; \
+                 GRANT ALL ON TABLE auditstream.changes, auditstream.changes_default, \
+                   auditstream.changes_2025_01, {current_part} TO {} WITH GRANT OPTION; \
+                 GRANT ALL ON SEQUENCE auditstream.changes_id_seq TO {}; \
+                 GRANT EXECUTE ON FUNCTION auditstream.capture() TO {};",
+                quote_ident(&app_role),
+                quote_ident(&app_role),
                 quote_ident(&app_role),
             )))
             .await
@@ -623,15 +729,24 @@ async fn alter_default_privileges_cannot_grant_writes_on_changes_or_child_partit
         let mut migrator = PgConnection::connect(db.url())
             .await
             .expect("migrator reconnect");
-        run_statements_tx(&mut migrator, &stmts)
+        let trig_stmts = auditstream_pg::triggers::generate(
+            &auditstream_pg::triggers::TriggerOptions::new(DEFAULT_SCHEMA, vec![]),
+        );
+        let mut tx = migrator.begin().await.expect("begin healing tx");
+        run_statements(&mut tx, &stmts)
             .await
             .expect("re-apply DDL to heal leaked grants");
+        run_statements(&mut tx, &trig_stmts)
+            .await
+            .expect("re-apply triggers to heal function grants");
+        tx.commit().await.expect("commit healing tx");
         migrator.close().await.expect("close migrator");
     }
 
     for target in [
         "auditstream.changes",
         "auditstream.changes_default",
+        "auditstream.changes_2025_01",
         current_part.as_str(),
     ] {
         let err = app_conn
@@ -643,6 +758,40 @@ async fn alter_default_privileges_cannot_grant_writes_on_changes_or_child_partit
             "expected permission denied after healing {target}, got {err}"
         );
     }
+    // Historical child partition must deny even SELECT directly (parent SELECT suffices).
+    let child_select_err = app_conn
+        .execute("SELECT count(*) FROM auditstream.changes_2025_01")
+        .await
+        .expect_err("healed child partition must deny direct SELECT");
+    assert!(
+        child_select_err.to_string().contains("permission denied"),
+        "expected permission denied for direct child SELECT, got {child_select_err}"
+    );
+    // GRANT OPTION on changes must be stripped (app_role cannot re-grant SELECT to PUBLIC).
+    let has_grant_option: bool = sqlx::query_scalar(
+        "SELECT pg_catalog.has_table_privilege($1, 'auditstream.changes', 'SELECT WITH GRANT OPTION')",
+    )
+    .bind(&app_role)
+    .fetch_one(&mut app_conn)
+    .await
+    .expect("check SELECT WITH GRANT OPTION");
+    assert!(
+        !has_grant_option,
+        "app_role must not retain WITH GRANT OPTION on auditstream.changes"
+    );
+    let _ = app_conn
+        .execute("GRANT SELECT ON TABLE auditstream.changes TO PUBLIC")
+        .await;
+    let public_has_select: bool = sqlx::query_scalar(
+        "SELECT pg_catalog.has_table_privilege('public', 'auditstream.changes', 'SELECT')",
+    )
+    .fetch_one(&mut app_conn)
+    .await
+    .expect("check PUBLIC SELECT after regrant attempt");
+    assert!(
+        !public_has_select,
+        "app_role must not be able to re-grant SELECT on auditstream.changes to PUBLIC"
+    );
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM auditstream.changes")
         .fetch_one(&mut app_conn)
         .await
@@ -670,6 +819,7 @@ async fn alter_default_privileges_cannot_grant_writes_on_changes_or_child_partit
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn autocommit_and_failed_tx_never_leave_migrator_holding_auditstream_owner() {
     let _lock = TestDb::cluster_lock().await.expect("cluster lock");
 
@@ -698,23 +848,31 @@ async fn autocommit_and_failed_tx_never_leave_migrator_holding_auditstream_owner
         .await
         .expect("migrator connect");
 
-    // 1. Autocommit execution with a mid-setup failure must fail BEFORE granting auditstream_owner.
-    let mut autocommit_stmts = stmts.clone();
-    autocommit_stmts.insert(2, "SELECT 1 / 0".to_owned());
-    let _ = run_statements(&mut conn, &autocommit_stmts)
+    // 1. Autocommit execution must fail at the transaction guard BEFORE creating or granting auditstream_owner.
+    let autocommit_err = run_statements(&mut conn, &stmts)
         .await
         .expect_err("autocommit execution must fail");
-
-    let has_usage_after_autocommit: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $2) AND pg_catalog.pg_has_role($1, $2, 'USAGE')")
-            .bind(&migrator_role)
-            .bind(OWNER_ROLE)
-            .fetch_one(&mut conn)
-            .await
-            .unwrap_or(false);
     assert!(
-        !has_usage_after_autocommit,
-        "autocommit failure must never leave migrator holding USAGE on {OWNER_ROLE}"
+        autocommit_err.to_string().contains("single transaction"),
+        "expected transaction-guard error, got: {autocommit_err}"
+    );
+
+    let has_member_after_autocommit: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+           SELECT 1 FROM pg_catalog.pg_auth_members m \
+           JOIN pg_catalog.pg_roles r ON r.oid = m.roleid \
+           JOIN pg_catalog.pg_roles u ON u.oid = m.member \
+          WHERE r.rolname = $2 AND u.rolname = $1 \
+         )",
+    )
+    .bind(&migrator_role)
+    .bind(OWNER_ROLE)
+    .fetch_one(&mut conn)
+    .await
+    .expect("check membership after autocommit");
+    assert!(
+        !has_member_after_autocommit,
+        "autocommit failure must never leave migrator as a member of {OWNER_ROLE}"
     );
 
     // 2. A mid-transaction failure inside BEGIN/ROLLBACK must also leave zero elevated membership.
@@ -728,17 +886,101 @@ async fn autocommit_and_failed_tx_never_leave_migrator_holding_auditstream_owner
         tx.rollback().await.expect("rollback failed tx");
     }
 
-    let has_usage_after_rollback: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $2) AND pg_catalog.pg_has_role($1, $2, 'USAGE')")
+    let has_member_after_rollback: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+           SELECT 1 FROM pg_catalog.pg_auth_members m \
+           JOIN pg_catalog.pg_roles r ON r.oid = m.roleid \
+           JOIN pg_catalog.pg_roles u ON u.oid = m.member \
+          WHERE r.rolname = $2 AND u.rolname = $1 \
+         )",
+    )
+    .bind(&migrator_role)
+    .bind(OWNER_ROLE)
+    .fetch_one(&mut conn)
+    .await
+    .expect("check membership after rollback");
+    assert!(
+        !has_member_after_rollback,
+        "rolled-back transaction must never leave migrator as a member of {OWNER_ROLE}"
+    );
+
+    // 3. A NOINHERIT migrator role must also succeed cleanly on DDL + triggers and revoke all grants.
+    conn.execute("CREATE TABLE public.noinherit_item (id int PRIMARY KEY, note text)")
+        .await
+        .expect("create table owned by migrator");
+    {
+        let mut admin = PgConnection::connect(&admin_url)
+            .await
+            .expect("admin alter noinherit");
+        admin
+            .execute(AssertSqlSafe(format!(
+                "ALTER ROLE {} NOINHERIT",
+                quote_ident(&migrator_role)
+            )))
+            .await
+            .expect("set NOINHERIT");
+        admin.close().await.expect("close admin");
+    }
+    {
+        let mut tx = conn.begin().await.expect("begin noinherit tx");
+        run_statements(&mut tx, &stmts)
+            .await
+            .expect("DDL must succeed as NOINHERIT migrator");
+        let trig_stmts =
+            auditstream_pg::triggers::generate(&auditstream_pg::triggers::TriggerOptions::new(
+                DEFAULT_SCHEMA,
+                vec![auditstream_pg::triggers::TableTriggerSpec::new(
+                    "public",
+                    "noinherit_item",
+                    vec!["id".to_owned()],
+                    vec![],
+                )],
+            ));
+        run_statements(&mut tx, &trig_stmts)
+            .await
+            .expect("triggers must succeed as NOINHERIT migrator");
+        tx.commit().await.expect("commit noinherit tx");
+    }
+    let pg_version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+        .fetch_one(&mut conn)
+        .await
+        .expect("read server_version_num");
+    let has_usage_after_noinherit: bool =
+        sqlx::query_scalar("SELECT pg_catalog.pg_has_role($1, $2, 'USAGE')")
             .bind(&migrator_role)
             .bind(OWNER_ROLE)
             .fetch_one(&mut conn)
             .await
-            .unwrap_or(false);
+            .expect("check USAGE after noinherit");
     assert!(
-        !has_usage_after_rollback,
-        "rolled-back transaction must never leave migrator holding USAGE on {OWNER_ROLE}"
+        !has_usage_after_noinherit,
+        "NOINHERIT migrator must not retain USAGE on {OWNER_ROLE} after commit"
     );
+    if pg_version >= 160_000 {
+        let has_set_after_noinherit: bool =
+            sqlx::query_scalar("SELECT pg_catalog.pg_has_role($1, $2, 'SET')")
+                .bind(&migrator_role)
+                .bind(OWNER_ROLE)
+                .fetch_one(&mut conn)
+                .await
+                .expect("check SET after noinherit");
+        assert!(
+            !has_set_after_noinherit,
+            "NOINHERIT migrator must not retain SET on {OWNER_ROLE} after commit"
+        );
+    } else {
+        let has_member_after_noinherit: bool =
+            sqlx::query_scalar("SELECT pg_catalog.pg_has_role($1, $2, 'MEMBER')")
+                .bind(&migrator_role)
+                .bind(OWNER_ROLE)
+                .fetch_one(&mut conn)
+                .await
+                .expect("check MEMBER after noinherit");
+        assert!(
+            !has_member_after_noinherit,
+            "PG 15 NOINHERIT migrator must not retain MEMBER on {OWNER_ROLE} after commit"
+        );
+    }
 
     conn.close().await.expect("close conn");
     drop(db);
