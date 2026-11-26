@@ -158,7 +158,7 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
 
     // Build expected specs for D7 drift detection so status knows whether to print a verify hint.
     let verify_specs = if configured_set.is_empty() {
-        build_installed_verify_specs(&installed, &introspected_map)
+        build_installed_verify_specs(&installed, &configured_excludes_by_table, &introspected_map)
     } else {
         build_configured_verify_specs(
             &configured_set,

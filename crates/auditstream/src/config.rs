@@ -248,7 +248,7 @@ fn redact_uri_password(raw: &str, scheme_end: usize, sep_len: usize) -> String {
         })
         .map(|(pos, _)| pos);
     let has_later_authority_at =
-        authority.contains(':') && last_non_query_at.is_some_and(|pos| pos > authority_end);
+        last_non_query_at.is_some_and(|pos| pos > authority_end && rest[..pos].contains(':'));
     let malformed_authority = !authority.contains('@') && !is_host_port_authority(authority);
     if malformed_authority || has_later_authority_at {
         if let Some(later_at) = last_non_query_at.filter(|&pos| pos > authority_end) {
@@ -372,15 +372,16 @@ fn redact_libpq_kv_password(raw: &str) -> String {
                 }
             }
             let val = &raw[val_start..i];
-            if is_secret_pg_param(key) {
-                out.push_str("***");
-            } else if had_ws_after_eq
+            if had_ws_after_eq
                 && (token_starts_secret_kv(val)
                     || (is_secret_pg_param(val) && raw[i..].trim_start().starts_with('=')))
             {
-                // Previous non-secret key had an empty unquoted value (e.g. `sslrootcert= password=SECRET`
-                // or `sslrootcert= password = SECRET`); rewind so the secret pair is masked next.
+                // Previous key had an empty unquoted value (e.g. `sslrootcert= password=SECRET`,
+                // `sslrootcert= password = SECRET`, or `password= sslpassword = SECRET`); rewind
+                // so the following secret pair is parsed and masked on the next iteration.
                 i = val_start;
+            } else if is_secret_pg_param(key) {
+                out.push_str("***");
             } else {
                 out.push_str(val);
             }
@@ -987,6 +988,9 @@ batch_size = 250
             format!("postgresql:?%7\t0assword={pw1}"),
             format!("postgres:prod?oauth_client_secret={pw1}"),
             format!("postgresql:app:{pw1}@db.example.com:5432/prod"),
+            format!("postgresql:/app:{pw1}@db.example.com:5432/prod"),
+            format!("postgresql:///app:{pw1}@db.example.com:5432/prod"),
+            format!("{scheme}org/app:{pw1}@db.example.com:5432/prod"),
             format!("postgresql:app:1234/{pw1}@db.example.com:5432/prod?sslpassword={pw2}"),
             format!("postgresql:app:1234#{pw1}@db.example.com:5432/prod"),
             format!("postgresql:app:1234?{pw1}@db.example.com:5432/prod"),
@@ -1029,6 +1033,12 @@ batch_size = 250
             RedactedUrl::new(safe_query_at.clone()).redacted(),
             safe_query_at
         );
+        let safe_uds_at =
+            "postgresql:///prod?host=/var/run/postgresql&application_name=ops@corp.com";
+        assert_eq!(
+            RedactedUrl::new(safe_uds_at.to_owned()).redacted(),
+            safe_uds_at
+        );
 
         // 10. Libpq KV empty value (with or without spaces around `=`), malformed quotes, and
         // unclosed quotes before `password=` never leak.
@@ -1042,11 +1052,17 @@ batch_size = 250
             format!("password=foo://{pw1}"),
             format!("host=db.example.com sslrootcert= password={pw1} dbname=prod"),
             format!("host=db.example.com sslrootcert= password = {pw1} dbname=prod"),
+            format!("host=db.example.com password= sslpassword = {pw2} dbname=prod"),
+            format!("host=db.example.com sslpassword= password = {pw1} dbname=prod"),
+            format!("host=db.example.com password= sslpassword='first {pw2}' dbname=prod"),
             format!("host=db.example.com password='pa'{pw1}' dbname=prod"),
             format!("application_name='broken password={pw1} dbname=prod"),
         ] {
             let red = RedactedUrl::new(kv_case).redacted();
-            assert!(!red.contains(pw1), "leaked in libpq KV: {red}");
+            assert!(
+                !red.contains(pw1) && !red.contains(pw2),
+                "leaked in libpq KV: {red}"
+            );
         }
 
         // 11. Non-secret libpq parameters and URIs remain untouched.

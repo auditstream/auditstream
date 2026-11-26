@@ -145,18 +145,7 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
             .map(|t| ((t.schema.clone(), t.name.clone()), t))
             .collect();
 
-        let mut specs = build_installed_verify_specs(&installed, &introspected_map);
-        for spec in &mut specs {
-            if let Some(configured_excludes) =
-                excludes_by_table.get(&(spec.schema.clone(), spec.table.clone()))
-            {
-                let mut cols: Vec<String> = configured_excludes.iter().cloned().collect();
-                cols.sort();
-                cols.dedup();
-                spec.excluded_columns = cols;
-            }
-        }
-        specs
+        build_installed_verify_specs(&installed, &excludes_by_table, &introspected_map)
     } else {
         let configured_set: BTreeSet<(String, String)> = configured_tables.into_iter().collect();
 

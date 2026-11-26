@@ -143,6 +143,27 @@ async fn clean_install_status_text_and_json_match_snapshots() {
     assert_eq!(parsed["history"]["months_covered_ahead"], 3);
     assert_eq!(parsed["history"]["default_has_rows"], false);
     insta::assert_snapshot!("status_clean_json", scrub_volatile(&json_stdout));
+
+    // When `capture.tables` is omitted, configured `capture.exclude` must still be checked by
+    // `status` (matching `verify`), surfacing a PK exclusion as a problem and hinting `verify`.
+    fs::write(
+        dir.path().join("auditstream.toml"),
+        "[capture]\nexclude = [\"public.invoice.id\"]\n",
+    )
+    .expect("write PK exclude config without capture.tables");
+    let bad_status = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["status", "--format", "json"])
+        .output()
+        .expect("run status json with PK exclude");
+    assert!(bad_status.status.success());
+    let bad_parsed: serde_json::Value =
+        serde_json::from_slice(&bad_status.stdout).expect("parse bad status json");
+    assert!(
+        bad_parsed["problems_found"].as_u64().unwrap_or(0) >= 1,
+        "status must report problems_found >= 1 when capture.exclude excludes a PK without capture.tables, got: {bad_parsed}"
+    );
 }
 
 #[tokio::test]

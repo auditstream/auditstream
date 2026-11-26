@@ -260,8 +260,13 @@ pub(crate) fn table_trigger_spec(
 
 /// Builds expected [`TableTriggerSpec`]s for installed captures using live catalog metadata
 /// when available and falling back to the installed trigger arguments otherwise.
+///
+/// When `configured_excludes` contains entries for an installed table, those sorted/deduplicated
+/// column names replace the live trigger exclusions so `verify` and `status` detect exclusion
+/// drift and primary-key exclusions even when `capture.tables` is omitted.
 pub(crate) fn build_installed_verify_specs(
     installed: &[InstalledTableCapture],
+    configured_excludes: &BTreeMap<(String, String), BTreeSet<String>>,
     introspected_map: &BTreeMap<(String, String), &TableInfo>,
 ) -> Vec<TableTriggerSpec> {
     installed
@@ -277,13 +282,11 @@ pub(crate) fn build_installed_verify_specs(
                     )
                 },
             );
-            table_trigger_spec(
-                cap.schema.clone(),
-                cap.table.clone(),
-                pk,
-                cap.excluded_columns.clone(),
-                is_part,
-            )
+            let excluded = configured_excludes.get(&key).map_or_else(
+                || cap.excluded_columns.clone(),
+                |cols| cols.iter().cloned().collect(),
+            );
+            table_trigger_spec(cap.schema.clone(), cap.table.clone(), pk, excluded, is_part)
         })
         .collect()
 }
