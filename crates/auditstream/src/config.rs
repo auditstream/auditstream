@@ -151,14 +151,10 @@ fn redact_url_password(raw: &str) -> String {
         return redact_uri_password(&normalized, scheme_end, 3);
     }
 
-    // Run libpq KV redaction against the raw whitespace-preserving input first whenever whitespace
-    // is present so tab/newline-separated tokens (for example `foo:bar\tpassword=...` or
-    // `postgresql: host=localhost\tpassword=...`) are never glued together before KV parsing.
-    let kv_redacted = if trimmed.chars().any(char::is_whitespace) {
-        std::borrow::Cow::Owned(redact_libpq_kv_password(raw))
-    } else {
-        std::borrow::Cow::Borrowed(raw)
-    };
+    // Run libpq KV redaction against the raw whitespace-preserving input first so single-token
+    // (`password=...`) and tab/newline-separated tokens (`foo:bar\tpassword=...`,
+    // `postgresql: host=localhost\tpassword=...`) are always masked before URI normalization.
+    let kv_redacted = redact_libpq_kv_password(raw);
     let kv_trimmed = kv_redacted.trim_matches(|c: char| c <= ' ');
     let kv_normalized = strip_whatwg_ascii_tabs_newlines(kv_trimmed);
     if let Some(scheme_end) = kv_normalized.find(':') {
@@ -169,7 +165,7 @@ fn redact_url_password(raw: &str) -> String {
             return redact_uri_password(&kv_normalized, scheme_end, 1);
         }
     }
-    kv_redacted.into_owned()
+    kv_redacted
 }
 
 fn is_host_port_authority(authority: &str) -> bool {
@@ -1037,6 +1033,13 @@ batch_size = 250
         // 10. Libpq KV empty value (with or without spaces around `=`), malformed quotes, and
         // unclosed quotes before `password=` never leak.
         for kv_case in [
+            format!("password={pw1}"),
+            format!(" password={pw1} "),
+            format!("sslpassword={pw1}"),
+            format!("ssl-password={pw1}"),
+            format!("oauth_client_secret={pw1}"),
+            format!("password='{pw1}'"),
+            format!("password=foo://{pw1}"),
             format!("host=db.example.com sslrootcert= password={pw1} dbname=prod"),
             format!("host=db.example.com sslrootcert= password = {pw1} dbname=prod"),
             format!("host=db.example.com password='pa'{pw1}' dbname=prod"),
