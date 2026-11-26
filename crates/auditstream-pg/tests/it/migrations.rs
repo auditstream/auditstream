@@ -360,7 +360,11 @@ async fn assert_v0_1_0_verify_drift(pool: &sqlx::PgPool) {
     let report = verify::check(pool, &fixture_tables())
         .await
         .expect("verify before refresh");
-    for object in ["auditstream.capture()", "public.invoice.auditstream_update"] {
+    for object in [
+        "auditstream.resolve_actor()",
+        "auditstream.capture()",
+        "public.invoice.auditstream_update",
+    ] {
         assert!(
             report
                 .findings

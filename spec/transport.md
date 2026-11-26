@@ -12,19 +12,23 @@ The trailing SQL comment is the default transport. It requires no explicit trans
 
 ### Comment placement and grammar
 
-An encoder MUST append the comment at the very end of the SQL statement, preceded by a single ASCII space (`0x20`). Only ASCII whitespace or semicolons (`;`) MAY follow the closing `*/`.
+An encoder MUST append the comment at the very end of the SQL statement, preceded by a single ASCII space (`0x20`), or by a single ASCII line feed (`LF`, `0x0A`) when the SQL statement ends inside an unterminated `--` single-line comment so PostgreSQL does not treat the block comment as part of the line comment. Only ASCII SQL whitespace (`SP`, `HTAB`, `CR`, `LF`, `FF` `0x0C`, `VT` `0x0B`) or semicolons (`;`) MAY follow the closing `*/`.
 
 The comment follows sqlcommenter syntax and MAY share the comment block with other sqlcommenter key-value pairs (such as `traceparent`), separated by `,` with no spaces around the comma. The comment body MUST NOT contain `/`. Encoders MUST emit at most one `auditstream` key in the trailing comment.
 
+When an encoder checks whether a statement is already tagged, it MUST inspect trailing block comments lexically (ignoring comment delimiters inside string literals, `E'...'` escape strings, dollar-quoted strings, quoted identifiers, nested block comments, and `--` single-line comments) and parse sqlcommenter `key='value'` pairs respecting single-quoted value boundaries so `,auditstream='...'` embedded in another value, a malformed/free-form comment, or a `--` line comment does not suppress tagging. When an encoder merges `auditstream` into an existing sqlcommenter block comment, it MUST ensure the entire merged comment plus trailing whitespace/semicolons fits within the 4,096-character tail window scanned by database readers (`right(current_query(), 4096)`) and does not collide with an earlier key's value; otherwise it MUST append a standalone trailing `/*auditstream='...'*/` comment instead of merging.
+
 ```abnf
-trailing-comment   = SP "/*" comment-body "*/" *( SP / HTAB / CR / LF / ";" )
+trailing-comment   = ( SP / LF ) "/*" comment-body "*/" *( SP / HTAB / CR / LF / FF / VT / ";" )
+FF                 = %x0C
+VT                 = %x0B
 comment-body       = pair *( "," pair )
 pair               = auditstream-pair / other-pair
 auditstream-pair   = "auditstream='" base64url-unpadded "'"
 base64url-unpadded = 1*( ALPHA / DIGIT / "-" / "_" )
 other-pair         = other-key "='" other-value "'"
-other-key          = 1*( ALPHA / DIGIT / "_" / "-" ) ; MUST NOT equal "auditstream"
-other-value        = *( %x20-26 / %x28-2E / %x30-7E ) ; MUST NOT contain "'" or "/"
+other-key          = 1*( ALPHA / DIGIT / "_" / "-" / "." / "%" / "!" / "~" / "*" / "(" / ")" ) ; MUST NOT equal "auditstream"
+other-value        = *( %x20-26 / %x28-2E / %x30-7E / %x80-FF ) ; valid UTF-8 bytes, MUST NOT contain "'" or "/"
 ```
 
 Because `base64url-unpadded` contains only ASCII letters, digits, `-`, and `_`, it can never contain `'`, `/`, or `*/` and therefore cannot break out of the single-quoted value or close the block comment.
@@ -103,21 +107,17 @@ In all cases — including when `actor` is `NULL` — the trigger MUST still wri
 
 To avoid scanning arbitrarily large SQL statements and to work within PostgreSQL's regex quantifier limit (maximum repetition count of 255):
 
-1. Slice the tail of the query with `right(current_query(), 4096)`.
-2. Extract the body of the final comment whose body contains no `/`:
-   ```sql
-   regexp_match(right(current_query(), 4096), '/\*([^/]*)\*/[\s;]*$')
-   ```
-3. If a trailing comment exists, locate the `auditstream` key value:
-   ```sql
-   regexp_match(body[1], '(?:^|,)auditstream=''([^'']*)''')
-   ```
-   - If the `auditstream` key is absent (for example `/*traceparent='00-...'*/`), fall through to priority 3 (`jwt`).
-   - If the `auditstream` key is present, validate outside the regex that `length(raw) BETWEEN 1 AND 683`, `length(raw) % 4 <> 1`, and `raw ~ '^[A-Za-z0-9_-]+$'`.
+1. Slice the tail of the query with `right(current_query(), 4096)` and strip trailing ASCII SQL whitespace (`E' \t\n\r\f\x0b'`) and semicolons (`;`).
+2. Extract the body of the final trailing `/*...*/` block comment whose body contains no `/` (the opening `/*` MUST lie inside the 4,096-character tail window and MUST NOT immediately follow `*`, rejecting nested-comment `*/` + `*` false boundaries).
+3. Parse the trailing comment body lexically as comma-separated sqlcommenter `key='value'` pairs respecting single-quoted value boundaries. Readers MUST first attempt strict unescaped ABNF parsing; when strict parsing finds no `auditstream` key and the comment body contains `\'`, readers MUST fall back to Drizzle/Google sqlcommenter escape mode (allowing `\'` in non-`auditstream` keys and `\'` / `\\` in non-`auditstream` values):
+   - If the body is not a valid sqlcommenter pair list (for example a free-form comment containing `,auditstream='...'` or trailing garbage), treat the `auditstream` key as absent and fall through to priority 3 (`jwt`).
+   - If the `auditstream` key is absent (for example `/*traceparent='00-...'*/` or `/*route='foo,auditstream=',other='bar'*/`), fall through to priority 3 (`jwt`).
+   - If the `auditstream` key appears more than once in a valid sqlcommenter comment, yield `actor = NULL`, `actor_source = 'invalid'`, and MUST NOT fall through to `jwt`.
+   - If a single `auditstream` key is present, validate outside any regex that `length(raw) BETWEEN 1 AND 683`, `length(raw) % 4 <> 1`, and `raw` contains only `[A-Za-z0-9_-]`.
    - Convert unpadded base64url to standard padded base64, decode to UTF-8, verify decoded octet length `<= 512`, and parse as JSON.
    - Any failure in validation or decoding yields `actor = NULL`, `actor_source = 'invalid'`, and MUST NOT fall through to `jwt`.
 
-*(Informative)* Because step 3 captures any characters inside `auditstream='...'` before validating the base64url alphabet, a malformed value such as `/*auditstream='!!!notbase64'*/` produces `actor_source = 'invalid'` rather than silently being skipped as `NULL`.
+*(Informative)* Because step 3 captures any characters inside `auditstream='...'` before validating the base64url alphabet, a malformed value such as `/*auditstream='!!!notbase64'*/` produces `actor_source = 'invalid'` rather than silently being skipped as `NULL`. Because database trigger readers scan only `right(current_query(), 4096)` rather than lexing arbitrarily large statements from byte 0, untagged SQL ending inside a `--` line comment that contains `/*auditstream='...'*/` is outside the database reader's lexical scope; encoders lexically detect trailing `--` line comments and append `\n/*auditstream='...'*/` so the real tag always supersedes earlier comment text.
 
 ## Size limits
 
@@ -141,6 +141,7 @@ A malformed actor payload MUST NEVER abort the application's SQL write. Any of t
 - Present `onBehalfOf` that is not a JSON object, lacks a valid `type` (same 5-value enum) or non-empty string `id`, has a non-string or empty `tenant`, or contains a nested `onBehalfOf` key (even `null`; max nesting depth is 1).
 - Present `context` that is not a JSON object, or contains any known context key (`requestId`, `source`, `ip`, `userAgent`) whose value is not a non-empty string. (Non-object `context` MUST yield `actor_source = 'invalid'` rather than being silently dropped.)
 - Present non-null `sub` in `request.jwt.claims` that is not a non-empty string.
+- Duplicate `auditstream` keys inside a valid trailing sqlcommenter comment (for example `/*auditstream='...',auditstream='...'*/`).
 - `auditstream` comment value that is empty (`auditstream=''`), contains characters outside `[A-Za-z0-9_-]` (for example `auditstream='!!!notbase64'`), has invalid base64url length (`length % 4 = 1`), or decodes to invalid UTF-8.
 - Payload exceeding 512 UTF-8 bytes or encoded comment value exceeding 683 characters.
 

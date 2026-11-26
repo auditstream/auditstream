@@ -63,10 +63,15 @@ pub fn encode_with_context(actor: &Actor, context: Option<&Context>) -> Result<S
 
 /// Appends or merges a trailing `/*auditstream='<base64url>'*/` comment onto `sql`.
 ///
-/// - Never tags a statement that already ends with an `auditstream` key (returns `sql` unchanged).
-/// - If `sql` ends with a valid sqlcommenter comment (such as `/*traceparent='00-...'*/`),
-///   merges `auditstream='...'` into that comment with keys sorted lexicographically and
-///   preserves trailing whitespace/semicolons.
+/// - Never tags a statement that already ends with a valid, lexically parsed `auditstream`
+///   tag inside PostgreSQL's 4,096-character tail window (returns `sql` unchanged).
+/// - If `sql` ends with a strict sqlcommenter block comment (such as `/*traceparent='00-...'*/`)
+///   outside strings, identifiers, and `--` line comments, merges `auditstream='...'` into that
+///   comment with keys sorted lexicographically and preserves trailing ASCII whitespace/semicolons,
+///   provided the merged comment + suffix fits within the 4,096-character tail window and introduces
+///   no `,auditstream='` collision with an earlier pair.
+/// - When `sql` ends inside an unterminated `--` single-line comment, appends
+///   `\n/*auditstream='...'*/` so PostgreSQL does not treat the tag as part of the line comment.
 /// - Otherwise appends ` /*auditstream='...'*/` to the end of `sql`.
 ///
 /// # Errors
@@ -88,62 +93,49 @@ pub fn tag_with_context(
 ) -> Result<String, CoreError> {
     let encoded = encode_with_context(actor, context)?;
 
-    if let Some((comment_start, body, suffix)) = find_trailing_comment(sql) {
-        if extract_auditstream_value(body).is_some() {
+    if !ends_with_block_comment_close(sql) && !has_line_comment_candidate(sql) {
+        return Ok(format!("{sql} /*auditstream='{encoded}'*/"));
+    }
+
+    let tail = scan_sql_tail(sql);
+    if let Some(comment) = tail.trailing_block_comment {
+        if matches!(
+            decode_comment_body(comment.body),
+            DecodedActor::Valid { .. }
+        ) {
             return Ok(sql.to_owned());
         }
-        if let Some(mut pairs) = parse_sqlcommenter_pairs(body) {
-            pairs.push(("auditstream", encoded.as_str()));
-            pairs.sort_unstable_by(|a, b| a.0.cmp(b.0));
-
-            let mut out = String::with_capacity(sql.len() + encoded.len() + 20);
-            out.push_str(&sql[..comment_start]);
-            out.push_str("/*");
-            for (idx, (k, v)) in pairs.iter().enumerate() {
-                if idx > 0 {
-                    out.push(',');
-                }
-                out.push_str(k);
-                out.push_str("='");
-                out.push_str(v);
-                out.push('\'');
-            }
-            out.push_str("*/");
-            out.push_str(suffix);
-            return Ok(out);
+        if let Some(merged) = try_merge_trailing_comment(sql, &comment, &encoded) {
+            return Ok(merged);
         }
     }
 
-    Ok(format!("{sql} /*auditstream='{encoded}'*/"))
+    if tail.ends_in_line_comment {
+        Ok(format!("{sql}\n/*auditstream='{encoded}'*/"))
+    } else {
+        Ok(format!("{sql} /*auditstream='{encoded}'*/"))
+    }
 }
 
 /// Decodes a trailing `/*auditstream='...'*/` comment from `sql` following `spec/transport.md`.
 ///
 /// Scans at most the last 4,096 Unicode scalar values (`right(current_query(), 4096)`),
-/// never panics on multi-byte UTF-8 boundaries, and returns [`DecodedActor::Absent`] or
-/// [`DecodedActor::Invalid`] rather than failing on malformed payloads.
+/// lexically ignores comments inside strings, identifiers, nested block comments, and `--`
+/// line comments, enforces strict sqlcommenter key-value pair boundaries (with Drizzle/Google
+/// sqlcommenter `\'` escape fallback), never panics on multi-byte UTF-8 boundaries, and returns
+/// [`DecodedActor::Absent`] or [`DecodedActor::Invalid`] rather than failing on malformed payloads.
 pub fn decode(sql: &str) -> DecodedActor {
-    let tail = tail_chars(sql, TAIL_WINDOW_CHARS);
-    let Some((_, body, _)) = find_trailing_comment(tail) else {
+    if !ends_with_block_comment_close(sql)
+        || !tail_chars(sql, TAIL_WINDOW_CHARS).contains("auditstream='")
+    {
         return DecodedActor::Absent;
-    };
-
-    let Some(raw_value) = extract_auditstream_value(body) else {
-        return DecodedActor::Absent;
-    };
-
-    let Some(bytes) = decode_base64url_unpadded(raw_value) else {
-        return DecodedActor::Invalid;
-    };
-    if bytes.len() > MAX_PAYLOAD_BYTES {
-        return DecodedActor::Invalid;
     }
 
-    let Ok(text) = std::str::from_utf8(&bytes) else {
-        return DecodedActor::Invalid;
+    let Some(comment) = scan_sql_tail(sql).trailing_block_comment else {
+        return DecodedActor::Absent;
     };
 
-    parse_trigger_actor_json(text)
+    decode_comment_body(comment.body)
 }
 
 const ALLOWED_ACTOR_TYPES: &[&str] = &["user", "api_key", "ai_agent", "service", "system"];
@@ -199,7 +191,6 @@ pub(crate) fn raw_json_contains_nul(raw: &str) -> bool {
 
     while i < len {
         match bytes[i] {
-            0 => return true,
             b'"' => {
                 in_string = !in_string;
                 i += 1;
@@ -253,6 +244,23 @@ pub(crate) fn parse_trigger_actor_json(raw_json: &str) -> DecodedActor {
     }
 }
 
+struct TrailingBlockComment<'a> {
+    start: usize,
+    body: &'a str,
+    suffix: &'a str,
+}
+
+struct SqlTailInfo<'a> {
+    ends_in_line_comment: bool,
+    trailing_block_comment: Option<TrailingBlockComment<'a>>,
+}
+
+enum ParsedCommentTag<'a> {
+    Absent,
+    Invalid,
+    Found(&'a str),
+}
+
 fn tail_chars(s: &str, max_chars: usize) -> &str {
     match s.char_indices().rev().nth(max_chars.saturating_sub(1)) {
         Some((idx, _)) => &s[idx..],
@@ -260,69 +268,438 @@ fn tail_chars(s: &str, max_chars: usize) -> &str {
     }
 }
 
-/// Matches `/\*([^/]*)\*/[\s;]*$` at the end of `s`, returning `(comment_start_byte, body, suffix)`.
-fn find_trailing_comment(s: &str) -> Option<(usize, &str, &str)> {
-    let trimmed = s.trim_end_matches(|c: char| c.is_whitespace() || c == ';');
-    let suffix = &s[trimmed.len()..];
-    let before_close = trimmed.strip_suffix("*/")?;
-
-    // Find the last `/*` before `*/` whose body contains no `/`.
-    let open_idx = before_close.rfind("/*")?;
-    let body = &before_close[open_idx + 2..];
-    if body.contains('/') {
-        return None;
-    }
-
-    Some((open_idx, body, suffix))
+/// Matches PostgreSQL `scan.l` `space` (`[ \t\n\r\f\v]`) and `resolve_actor()`'s
+/// `rtrim(..., E' \t\n\r\f\x0b;')`. Non-ASCII whitespace (such as `\u{00A0}`) is lexed as an
+/// identifier byte by PostgreSQL, not whitespace.
+const fn is_sql_whitespace(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0C | 0x0B)
 }
 
-/// Matches `(?:^|,)auditstream='([^']*)'` inside a comment body.
-fn extract_auditstream_value(body: &str) -> Option<&str> {
-    let prefix = "auditstream='";
-    let mut rest = body;
-    let mut at_boundary = true;
+const fn is_newline(b: u8) -> bool {
+    matches!(b, b'\n' | b'\r')
+}
 
-    while !rest.is_empty() {
-        if at_boundary && let Some(after_prefix) = rest.strip_prefix(prefix) {
-            let end = after_prefix.find('\'')?;
-            return Some(&after_prefix[..end]);
+const fn is_ident_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_' || b >= 0x80
+}
+
+const fn is_ident_cont(b: u8) -> bool {
+    is_ident_start(b) || b.is_ascii_digit() || b == b'$'
+}
+
+const fn is_dollar_tag_cont(b: u8) -> bool {
+    is_ident_start(b) || b.is_ascii_digit()
+}
+
+/// Matches `spec/transport.md` sqlcommenter keys plus unescaped `encodeURIComponent` characters
+/// emitted by Drizzle 1.x and Prisma 7 (`A-Za-z0-9-_.!~*()%`).
+const fn is_sqlcommenter_key_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'_' | b'-' | b'.' | b'%' | b'!' | b'~' | b'*' | b'(' | b')'
+        )
+}
+
+fn ends_with_block_comment_close(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && (bytes[end - 1] == b';' || is_sql_whitespace(bytes[end - 1])) {
+        end -= 1;
+    }
+    end >= 4 && bytes[end - 2] == b'*' && bytes[end - 1] == b'/'
+}
+
+fn has_line_comment_candidate(sql: &str) -> bool {
+    let last_break = sql.rfind(['\n', '\r']).map_or(0, |idx| idx + 1);
+    sql[last_break..].contains("--")
+}
+
+/// Matches PostgreSQL `pg_catalog.right(current_query(), 4096)` (Unicode scalar values).
+fn is_within_tail_window(sql: &str, start_byte: usize) -> bool {
+    let byte_len = sql.len() - start_byte;
+    if byte_len <= TAIL_WINDOW_CHARS {
+        return true;
+    }
+    if byte_len > TAIL_WINDOW_CHARS * 4 {
+        return false;
+    }
+    sql[start_byte..].chars().nth(TAIL_WINDOW_CHARS).is_none()
+}
+
+fn skip_line_comment(bytes: &[u8], start: usize) -> (usize, bool) {
+    let mut i = start + 2;
+    while i < bytes.len() {
+        let b = bytes[i];
+        i += 1;
+        if is_newline(b) {
+            return (i, true);
         }
-        if let Some(comma_idx) = rest.find(',') {
-            rest = &rest[comma_idx + 1..];
-            at_boundary = true;
+    }
+    (bytes.len(), false)
+}
+
+fn skip_quoted_token(bytes: &[u8], start: usize, quote: u8) -> usize {
+    let len = bytes.len();
+    let mut i = start + 1;
+    while i < len {
+        if bytes[i] != quote {
+            i += 1;
+            continue;
+        }
+        if bytes.get(i + 1) == Some(&quote) {
+            i += 2;
+        } else {
+            return i + 1;
+        }
+    }
+    len
+}
+
+/// Matches PostgreSQL `scan.l` `<xe>{quotecontinue}` (`{whitespace_with_newline}'`) so
+/// multi-line `E'...'` continuations keep backslash escaping active across chunks.
+fn match_quote_continue(bytes: &[u8], after_quote: usize) -> Option<usize> {
+    let len = bytes.len();
+    let mut j = after_quote;
+    let mut seen_newline = false;
+
+    while j < len {
+        let b = bytes[j];
+        if is_sql_whitespace(b) {
+            seen_newline |= is_newline(b);
+            j += 1;
+        } else if b == b'-' && bytes.get(j + 1) == Some(&b'-') {
+            let (next_idx, terminated) = skip_line_comment(bytes, j);
+            if !terminated {
+                return None;
+            }
+            seen_newline = true;
+            j = next_idx;
+        } else {
+            return (b == b'\'' && seen_newline).then_some(j + 1);
+        }
+    }
+    None
+}
+
+fn skip_escape_string(bytes: &[u8], start: usize) -> usize {
+    let len = bytes.len();
+    let mut i = start + 2;
+    while i < len {
+        match bytes[i] {
+            b'\\' => i = (i + 2).min(len),
+            b'\'' if bytes.get(i + 1) == Some(&b'\'') => i += 2,
+            b'\'' => match match_quote_continue(bytes, i + 1) {
+                Some(cont) => i = cont,
+                None => return i + 1,
+            },
+            _ => i += 1,
+        }
+    }
+    len
+}
+
+fn is_escape_string_start(bytes: &[u8], index: usize) -> bool {
+    matches!(bytes[index], b'E' | b'e')
+        && bytes.get(index + 1) == Some(&b'\'')
+        && (index == 0 || !is_ident_cont(bytes[index - 1]))
+}
+
+fn match_dollar_quote_tag(sql: &str, start: usize) -> Option<&str> {
+    let bytes = sql.as_bytes();
+    if start > 0 && is_ident_cont(bytes[start - 1]) {
+        return None;
+    }
+    let next = *bytes.get(start + 1)?;
+    if next == b'$' {
+        return Some(&sql[start..start + 2]);
+    }
+    if !is_ident_start(next) {
+        return None;
+    }
+    let mut j = start + 2;
+    while j < bytes.len() && is_dollar_tag_cont(bytes[j]) {
+        j += 1;
+    }
+    (bytes.get(j) == Some(&b'$')).then_some(&sql[start..=j])
+}
+
+fn scan_block_comment(bytes: &[u8], start: usize) -> (usize, bool, bool) {
+    let len = bytes.len();
+    let mut i = start + 2;
+    let mut depth: usize = 1;
+    let mut has_slash_in_body = false;
+
+    while i < len && depth > 0 {
+        let b = bytes[i];
+        let next = bytes.get(i + 1).copied();
+        if b == b'/' && next == Some(b'*') {
+            depth += 1;
+            has_slash_in_body = true;
+            i += 2;
+        } else if b == b'*' && next == Some(b'/') {
+            depth -= 1;
+            has_slash_in_body |= depth > 0;
+            i += 2;
+        } else {
+            has_slash_in_body |= b == b'/';
+            i += 1;
+        }
+    }
+
+    (i, depth == 0, has_slash_in_body)
+}
+
+fn skip_non_comment_token(sql: &str, index: usize) -> usize {
+    let bytes = sql.as_bytes();
+    let b = bytes[index];
+    if is_escape_string_start(bytes, index) {
+        return skip_escape_string(bytes, index);
+    }
+    if b == b'\'' || b == b'"' {
+        return skip_quoted_token(bytes, index, b);
+    }
+    if b == b'$'
+        && let Some(tag) = match_dollar_quote_tag(sql, index)
+    {
+        let after_open = index + tag.len();
+        return sql[after_open..]
+            .find(tag)
+            .map_or(sql.len(), |rel| after_open + rel + tag.len());
+    }
+    index + 1
+}
+
+const fn is_valid_trailing_block_comment(
+    bytes: &[u8],
+    start: usize,
+    closed: bool,
+    has_slash_in_body: bool,
+) -> bool {
+    closed && !has_slash_in_body && (start == 0 || bytes[start - 1] != b'*')
+}
+
+/// Single-pass PostgreSQL lexical scanner determining whether `sql` ends inside an unterminated
+/// `--` line comment and extracting the final trailing `/*...*/` block comment (if closed,
+/// containing no `/`, not immediately following `*`, outside strings/identifiers/`--` comments,
+/// and within the 4,096-char tail).
+fn scan_sql_tail(sql: &str) -> SqlTailInfo<'_> {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut last_comment: Option<(usize, usize)> = None;
+    let mut i = 0;
+
+    while i < len {
+        let b = bytes[i];
+        if b == b';' || is_sql_whitespace(b) {
+            i += 1;
+        } else if b == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            last_comment = None;
+            let (next_idx, terminated) = skip_line_comment(bytes, i);
+            if !terminated {
+                return SqlTailInfo {
+                    ends_in_line_comment: true,
+                    trailing_block_comment: None,
+                };
+            }
+            i = next_idx;
+        } else if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            let (next_idx, closed, has_slash_in_body) = scan_block_comment(bytes, i);
+            last_comment = is_valid_trailing_block_comment(bytes, i, closed, has_slash_in_body)
+                .then_some((i, next_idx));
+            i = next_idx;
+        } else {
+            last_comment = None;
+            i = skip_non_comment_token(sql, i);
+        }
+    }
+
+    let trailing_block_comment = last_comment
+        .filter(|&(start, _)| is_within_tail_window(sql, start))
+        .map(|(start, end)| TrailingBlockComment {
+            start,
+            body: &sql[start + 2..end - 2],
+            suffix: &sql[end..],
+        });
+    SqlTailInfo {
+        ends_in_line_comment: false,
+        trailing_block_comment,
+    }
+}
+
+fn read_sqlcommenter_key_end(bytes: &[u8], start: usize, allow_escapes: bool) -> usize {
+    let mut i = start;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if is_sqlcommenter_key_byte(b) {
+            i += 1;
+        } else if allow_escapes && b == b'\\' && bytes.get(i + 1) == Some(&b'\'') {
+            i += 2;
         } else {
             break;
         }
     }
+    i
+}
 
+fn read_sqlcommenter_value(body: &str, start: usize, allow_escapes: bool) -> Option<(&str, usize)> {
+    let bytes = body.as_bytes();
+    let mut i = start;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if allow_escapes && b == b'\\' && matches!(bytes.get(i + 1), Some(b'\'' | b'\\')) {
+            i += 2;
+            continue;
+        }
+        if b == b'\'' {
+            return Some((&body[start..i], i + 1));
+        }
+        i += 1;
+    }
     None
 }
 
-/// Parses a strict sqlcommenter body `k1='v1',k2='v2'` where keys are `[A-Za-z0-9_-]+`
-/// and values contain no `'` or `/`.
-fn parse_sqlcommenter_pairs(body: &str) -> Option<Vec<(&str, &str)>> {
+/// Parses a sqlcommenter body `k1='v1',k2='v2'` respecting single-quoted value boundaries.
+///
+/// Callers pass bodies already validated by [`scan_sql_tail`] to contain no `/`.
+/// When `allow_escapes` is `false`, enforces strict `spec/transport.md` ABNF (no `'` inside
+/// values). When `allow_escapes` is `true`, additionally permits Drizzle/Google sqlcommenter
+/// `\'` in non-`auditstream` keys and `\'` / `\\` in non-`auditstream` values.
+fn parse_sqlcommenter_pairs_with_mode(
+    body: &str,
+    allow_escapes: bool,
+) -> Option<Vec<(&str, &str)>> {
     if body.is_empty() {
         return None;
     }
+    let bytes = body.as_bytes();
     let mut pairs = Vec::new();
-    for part in body.split(',') {
-        let eq = part.find('=')?;
-        let key = &part[..eq];
-        let val_quoted = &part[eq + 1..];
-        if key.is_empty()
-            || !key
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-        {
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let key_end = read_sqlcommenter_key_end(bytes, i, allow_escapes);
+        if key_end == i || bytes.get(key_end..key_end + 2) != Some(b"='") {
             return None;
         }
-        let val = val_quoted.strip_prefix('\'')?.strip_suffix('\'')?;
-        if val.contains('\'') || val.contains('/') {
-            return None;
-        }
+        let key = &body[i..key_end];
+        let (val, next) =
+            read_sqlcommenter_value(body, key_end + 2, allow_escapes && key != "auditstream")?;
         pairs.push((key, val));
+
+        if next == bytes.len() {
+            break;
+        }
+        if bytes[next] != b',' || next + 1 >= bytes.len() {
+            return None;
+        }
+        i = next + 1;
     }
+
     Some(pairs)
+}
+
+fn extract_tag_from_pairs<'a>(pairs: &[(&'a str, &'a str)]) -> ParsedCommentTag<'a> {
+    let mut found: Option<&'a str> = None;
+    for &(key, val) in pairs {
+        if key == "auditstream" {
+            if found.is_some() {
+                return ParsedCommentTag::Invalid;
+            }
+            found = Some(val);
+        }
+    }
+    found.map_or(ParsedCommentTag::Absent, ParsedCommentTag::Found)
+}
+
+fn parse_auditstream_from_body(body: &str) -> ParsedCommentTag<'_> {
+    if body.is_empty() {
+        return ParsedCommentTag::Absent;
+    }
+    // Prefer strict unescaped ABNF (matching spec/transport.md and PG resolve_actor()),
+    // falling back to Drizzle/Google sqlcommenter `\'` escaping only when strict parsing yields
+    // no tag and `\'` is present.
+    if let Some(pairs) = parse_sqlcommenter_pairs_with_mode(body, false) {
+        let tag = extract_tag_from_pairs(&pairs);
+        if !matches!(tag, ParsedCommentTag::Absent) || !body.contains("\\'") {
+            return tag;
+        }
+    } else if !body.contains("\\'") {
+        return ParsedCommentTag::Absent;
+    }
+    parse_sqlcommenter_pairs_with_mode(body, true).map_or(ParsedCommentTag::Absent, |pairs| {
+        extract_tag_from_pairs(&pairs)
+    })
+}
+
+fn decode_comment_body(body: &str) -> DecodedActor {
+    let raw_value = match parse_auditstream_from_body(body) {
+        ParsedCommentTag::Absent => return DecodedActor::Absent,
+        ParsedCommentTag::Invalid => return DecodedActor::Invalid,
+        ParsedCommentTag::Found(val) => val,
+    };
+
+    let Some(bytes) = decode_base64url_unpadded(raw_value) else {
+        return DecodedActor::Invalid;
+    };
+    if bytes.len() > MAX_PAYLOAD_BYTES {
+        return DecodedActor::Invalid;
+    }
+
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return DecodedActor::Invalid;
+    };
+
+    parse_trigger_actor_json(text)
+}
+
+fn try_merge_trailing_comment(
+    sql: &str,
+    comment: &TrailingBlockComment<'_>,
+    encoded: &str,
+) -> Option<String> {
+    let mut pairs = parse_sqlcommenter_pairs_with_mode(comment.body, false)?;
+    if pairs.iter().any(|(k, _)| *k == "auditstream") {
+        return None;
+    }
+    pairs.push(("auditstream", encoded));
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut merged_body = String::with_capacity(comment.body.len() + encoded.len() + 16);
+    let mut auditstream_start = 0;
+    for (idx, (k, v)) in pairs.iter().enumerate() {
+        if idx > 0 {
+            merged_body.push(',');
+        }
+        if *k == "auditstream" {
+            auditstream_start = merged_body.len();
+        }
+        merged_body.push_str(k);
+        merged_body.push_str("='");
+        merged_body.push_str(v);
+        merged_body.push('\'');
+    }
+
+    // Avoid emitting `,auditstream='` inside an earlier key's value before our key so even
+    // legacy substring-based `resolve_actor()` installations and older adapters decode cleanly.
+    if auditstream_start > 0 && merged_body.find(",auditstream='") != Some(auditstream_start - 1) {
+        return None;
+    }
+
+    // Ensure the entire merged `/*...*/` plus trailing whitespace/semicolons stays inside
+    // PostgreSQL's 4,096-character `right(current_query(), 4096)` window.
+    let merged_tail_chars = 4 + merged_body.chars().count() + comment.suffix.chars().count();
+    if merged_tail_chars > TAIL_WINDOW_CHARS {
+        return None;
+    }
+
+    let mut out =
+        String::with_capacity(comment.start + 4 + merged_body.len() + comment.suffix.len());
+    out.push_str(&sql[..comment.start]);
+    out.push_str("/*");
+    out.push_str(&merged_body);
+    out.push_str("*/");
+    out.push_str(comment.suffix);
+    Some(out)
 }
 
 fn encode_base64url_unpadded(bytes: &[u8]) -> String {
