@@ -219,59 +219,186 @@ fn is_host_port_authority(authority: &str) -> bool {
     })
 }
 
-fn looks_like_uri_host_after_at(after_at: &str) -> bool {
-    let host_end = after_at.find(['/', '?', '#']).unwrap_or(after_at.len());
-    let host = &after_at[..host_end];
-    if host.is_empty() || !is_host_port_authority(host) {
-        return false;
-    }
-    after_at[host_end..].starts_with(['/', '?']) || host.contains(':')
+fn is_strong_uri_host(host: &str, after_delim: Option<u8>) -> bool {
+    after_delim == Some(b'/')
+        || host.contains([':', '.', ','])
+        || host.eq_ignore_ascii_case("localhost")
 }
 
-fn tail_at_is_query_value(tail: &str, at_in_tail: usize) -> bool {
-    let prefix = &tail[..at_in_tail];
-    if prefix.contains('#') {
-        return false;
-    }
-    let Some(q_pos) = prefix.find('?') else {
-        return false;
-    };
-    let current_pair = prefix[q_pos + 1..].rsplit('&').next().unwrap_or("");
-    current_pair.contains('=') && !looks_like_uri_host_after_at(&tail[at_in_tail + 1..])
+#[derive(Clone, Copy)]
+enum AuthorityShape {
+    Malformed,
+    HasPassword,
+    BareHostPort,
+    Clean,
 }
 
-fn append_redacted_uri_tail(out: &mut String, tail: &str) {
-    let hash_pos = tail.find('#');
-    let q_limit = hash_pos.unwrap_or(tail.len());
-    let Some(q_pos) = tail[..q_limit].find('?') else {
-        out.push_str(tail);
-        return;
-    };
+#[derive(Clone, Copy)]
+enum TailRegion {
+    Path { seen_at: bool },
+    Query { pair_has_eq: bool },
+    Fragment,
+}
 
-    out.push_str(&tail[..=q_pos]);
-    let after_q = &tail[q_pos + 1..];
-    let (query, fragment) = match after_q.find('#') {
-        Some(h) => (&after_q[..h], &after_q[h..]),
-        None => (after_q, ""),
-    };
+struct TailAtScan {
+    best_authority_at: Option<usize>,
+    fallback_non_query_at: Option<usize>,
+}
 
-    for (idx, pair) in query.split('&').enumerate() {
-        if idx > 0 {
-            out.push('&');
+struct TailAtScanner {
+    authority_shape: AuthorityShape,
+    has_nonempty_path: bool,
+    path_has_colon: bool,
+    region: TailRegion,
+    best_authority_at: Option<usize>,
+    fallback_non_query_at: Option<usize>,
+}
+
+impl TailAtScanner {
+    fn new(authority: &str, tail: &str, malformed_authority: bool) -> Self {
+        let authority_at = authority.rfind('@');
+        let authority_shape = if malformed_authority {
+            AuthorityShape::Malformed
+        } else if authority_at.is_some_and(|at| authority[..at].contains(':')) {
+            AuthorityShape::HasPassword
+        } else if authority_at.is_none() && authority.contains(':') {
+            AuthorityShape::BareHostPort
+        } else {
+            AuthorityShape::Clean
+        };
+        Self {
+            authority_shape,
+            has_nonempty_path: tail.starts_with('/'),
+            path_has_colon: false,
+            region: TailRegion::Path { seen_at: false },
+            best_authority_at: None,
+            fallback_non_query_at: None,
         }
-        if let Some(eq_pos) = pair.find('=') {
+    }
+
+    fn qualifies(&self, host: &str, after_delim: Option<u8>) -> bool {
+        let malformed_or_path_colon =
+            matches!(self.authority_shape, AuthorityShape::Malformed) || self.path_has_colon;
+        if !malformed_or_path_colon && matches!(self.authority_shape, AuthorityShape::Clean) {
+            return false;
+        }
+        let has_path_or_colon = after_delim == Some(b'/') || host.contains(':');
+        let allow_query_or_frag = malformed_or_path_colon || !self.has_nonempty_path;
+        match self.region {
+            TailRegion::Path { .. } => {
+                malformed_or_path_colon
+                    || matches!(self.authority_shape, AuthorityShape::HasPassword)
+                    || is_strong_uri_host(host, after_delim)
+            }
+            TailRegion::Query { pair_has_eq: false } => {
+                allow_query_or_frag || is_strong_uri_host(host, after_delim)
+            }
+            TailRegion::Query { pair_has_eq: true } => allow_query_or_frag && has_path_or_colon,
+            TailRegion::Fragment => {
+                allow_query_or_frag && (has_path_or_colon || self.best_authority_at.is_none())
+            }
+        }
+    }
+
+    fn inspect_at(&mut self, tail: &str, authority_end: usize, idx: usize) {
+        if !matches!(self.region, TailRegion::Query { pair_has_eq: true }) {
+            self.fallback_non_query_at = Some(authority_end + idx);
+        }
+        let bytes = tail.as_bytes();
+        let after = &tail[idx + 1..];
+        // Stopping at `@` keeps all scanned host slices pairwise disjoint (strictly O(n)).
+        let rel_end = after
+            .bytes()
+            .position(|c| matches!(c, b'/' | b'?' | b'#' | b'@'))
+            .unwrap_or(after.len());
+        let host_end = idx + 1 + rel_end;
+        let has_following_at = host_end < bytes.len() && bytes[host_end] == b'@';
+        let host = &after[..rel_end];
+        let after_delim = bytes.get(host_end).copied();
+        let valid_host = !has_following_at && !host.is_empty() && is_host_port_authority(host);
+
+        if valid_host && self.qualifies(host, after_delim) {
+            self.best_authority_at = Some(authority_end + idx);
+        }
+        if let TailRegion::Path { seen_at } = &mut self.region {
+            *seen_at = true;
+        }
+    }
+}
+
+fn scan_tail_at_candidates(
+    authority: &str,
+    authority_end: usize,
+    tail: &str,
+    malformed_authority: bool,
+) -> TailAtScan {
+    let mut scanner = TailAtScanner::new(authority, tail, malformed_authority);
+    for (idx, &byte) in tail.as_bytes().iter().enumerate() {
+        match byte {
+            b'#' => scanner.region = TailRegion::Fragment,
+            b'?' if matches!(scanner.region, TailRegion::Path { .. }) => {
+                scanner.region = TailRegion::Query { pair_has_eq: false };
+            }
+            b'&' if matches!(scanner.region, TailRegion::Query { .. }) => {
+                scanner.region = TailRegion::Query { pair_has_eq: false };
+            }
+            b'=' if matches!(scanner.region, TailRegion::Query { .. }) => {
+                scanner.region = TailRegion::Query { pair_has_eq: true };
+            }
+            b':' if matches!(scanner.region, TailRegion::Path { seen_at: false }) => {
+                scanner.path_has_colon = true;
+            }
+            b'@' => scanner.inspect_at(tail, authority_end, idx),
+            _ => {}
+        }
+    }
+    TailAtScan {
+        best_authority_at: scanner.best_authority_at,
+        fallback_non_query_at: scanner.fallback_non_query_at,
+    }
+}
+
+fn append_redacted_query_pair(out: &mut String, mut pair: &str) {
+    loop {
+        let hash_pos = pair.find('#');
+        let key_limit = hash_pos.unwrap_or(pair.len());
+        if let Some(eq_pos) = pair[..key_limit].find('=') {
             let key = &pair[..eq_pos];
             let decoded_key = percent_decode_form_key(key);
             if is_secret_pg_param(&decoded_key) {
                 out.push_str(key);
                 out.push_str("=***");
-                continue;
+                return;
             }
         }
+        if let Some(h) = hash_pos
+            && let Some(rel_q) = pair[h + 1..].find('?')
+        {
+            let split = h + 1 + rel_q + 1;
+            out.push_str(&pair[..split]);
+            pair = &pair[split..];
+            continue;
+        }
         out.push_str(pair);
+        return;
     }
+}
 
-    out.push_str(fragment);
+fn append_redacted_uri_tail(out: &mut String, tail: &str) {
+    // Do not stop at `#` before `?` or inside a query value: PostgreSQL URLs do not use
+    // fragments, so an unencoded `#` in a password or earlier value must never disable masking.
+    let Some(q_pos) = tail.find('?') else {
+        out.push_str(tail);
+        return;
+    };
+
+    out.push_str(&tail[..=q_pos]);
+    for (idx, pair) in tail[q_pos + 1..].split('&').enumerate() {
+        if idx > 0 {
+            out.push('&');
+        }
+        append_redacted_query_pair(out, pair);
+    }
 }
 
 fn redact_uri_password(raw: &str, scheme_end: usize, sep_len: usize) -> String {
@@ -281,31 +408,18 @@ fn redact_uri_password(raw: &str, scheme_end: usize, sep_len: usize) -> String {
     let mut tail = &rest[authority_end..];
 
     // If an unencoded `/`, `?`, or `#` appeared inside an authority password (for example
-    // `postgresql://app:abc/def@host/db`, `postgresql://app:1234/secret@host/db`, or
+    // `postgresql://app:abc/def@host/db`, `postgresql://app:1234/secret@host`, or
     // `postgresql://app:p1@p2/secret@host/db?application_name=ops@corp.com`), re-slice at the
-    // rightmost authority `@` outside query values (or fail closed) so raw credentials are never
-    // echoed, while preserving legitimate `@` inside query values, paths, or fragments.
-    let later_authority_at = rest
-        .match_indices('@')
-        .rev()
-        .find(|&(pos, _)| {
-            pos > authority_end
-                && rest[..pos].contains(':')
-                && !tail_at_is_query_value(tail, pos - authority_end)
-                && looks_like_uri_host_after_at(&rest[pos + 1..])
-        })
-        .map(|(pos, _)| pos);
-    let malformed_authority = !authority.contains('@') && !is_host_port_authority(authority);
-    if malformed_authority || later_authority_at.is_some() {
-        let reslice_at = later_authority_at.or_else(|| {
-            rest.match_indices('@')
-                .rev()
-                .find(|&(pos, _)| {
-                    pos > authority_end && !tail_at_is_query_value(tail, pos - authority_end)
-                })
-                .map(|(pos, _)| pos)
-        });
-        if let Some(later_at) = reslice_at {
+    // rightmost authority `@` outside query values (or fail closed) in O(n) time so raw
+    // credentials are never echoed while legitimate `@` in paths, queries, or fragments remain
+    // intact.
+    let authority_host = authority
+        .rfind('@')
+        .map_or(authority, |at| &authority[at + 1..]);
+    let malformed_authority = !is_host_port_authority(authority_host);
+    let scan = scan_tail_at_candidates(authority, authority_end, tail, malformed_authority);
+    if malformed_authority || scan.best_authority_at.is_some() {
+        if let Some(later_at) = scan.best_authority_at.or(scan.fallback_non_query_at) {
             let after_at = &rest[later_at + 1..];
             let host_end = after_at.find(['/', '?', '#']).unwrap_or(after_at.len());
             let new_end = later_at + 1 + host_end;
@@ -344,24 +458,38 @@ fn advance_escaped(raw: &str, backslash_idx: usize) -> usize {
         .map_or(raw.len(), |ch| after_slash + ch.len_utf8())
 }
 
-fn token_starts_secret_kv(token: &str) -> bool {
-    token
-        .split_once('=')
-        .is_some_and(|(k, _)| is_secret_pg_param(k))
+fn starts_with_secret_kv(rest: &str) -> bool {
+    // Longest secret parameter name (`oauth_client_secret`) is 19 ASCII bytes.
+    let Some(sep_pos) = rest
+        .bytes()
+        .take(20)
+        .position(|b| is_libpq_whitespace(b) || b == b'=')
+    else {
+        return false;
+    };
+    let key = &rest[..sep_pos];
+    if !is_secret_pg_param(key) {
+        return false;
+    }
+    rest.as_bytes()[sep_pos] == b'='
+        || rest[sep_pos..]
+            .trim_start_matches(is_libpq_ws_char)
+            .starts_with('=')
 }
 
-fn starts_with_secret_kv(rest: &str) -> bool {
-    let token_end = rest
-        .bytes()
-        .position(is_libpq_whitespace)
-        .unwrap_or(rest.len());
-    let token = &rest[..token_end];
-    !token.is_empty()
-        && (token_starts_secret_kv(token)
-            || (is_secret_pg_param(token)
-                && rest[token_end..]
-                    .trim_start_matches(is_libpq_ws_char)
-                    .starts_with('=')))
+fn skip_secret_quoted_trailing(raw: &str, mut i: usize) -> usize {
+    let bytes = raw.as_bytes();
+    if starts_with_secret_kv(&raw[i..]) {
+        return i;
+    }
+    while i < bytes.len() && !is_libpq_whitespace(bytes[i]) {
+        let is_quote = bytes[i] == b'\'';
+        i += 1;
+        if is_quote && starts_with_secret_kv(&raw[i..]) {
+            break;
+        }
+    }
+    i
 }
 
 fn redact_libpq_kv_password(raw: &str) -> String {
@@ -425,12 +553,10 @@ fn redact_libpq_kv_password(raw: &str) -> String {
             }
             if is_secret_pg_param(key) {
                 // Consume any malformed trailing non-whitespace suffix (e.g. `password='pa'ss'`),
-                // unless an adjacent secret parameter immediately follows the closing quote
-                // (e.g. `password='s3cr3t'sslpassword = s3cr3t2`).
-                if !(closed && starts_with_secret_kv(&raw[i..])) {
-                    while i < len && !is_libpq_whitespace(bytes[i]) {
-                        i += 1;
-                    }
+                // stopping before an adjacent secret parameter immediately after `'` (e.g.
+                // `password='a'sslpassword = b` or `password='a'dbname='prod'sslpassword = b`).
+                if closed {
+                    i = skip_secret_quoted_trailing(raw, i);
                 }
                 out.push_str("***");
             } else if closed && (i >= len || is_libpq_whitespace(bytes[i])) {
@@ -942,7 +1068,9 @@ batch_size = 250
         let pw2 = "s3cr3t_beta";
         let pw3 = "s3cr3t_gamma";
 
-        // 1. URI with authority password + query password + sslpassword + fragment.
+        // 1. URI with authority password + query password + sslpassword + trailing `#...`
+        // (fails closed on `#...` inside a secret query value so unencoded `#` in passwords
+        // never leaks, while preserving `#...` after non-secret query parameters).
         let uri_all = format!(
             "postgresql://app:{pw1}@db.example.com:5432/prod?sslmode=verify-full&password={pw2}&sslpassword={pw3}#frag"
         );
@@ -952,7 +1080,14 @@ batch_size = 250
         }
         assert_eq!(
             red_uri,
-            "postgresql://app:***@db.example.com:5432/prod?sslmode=verify-full&password=***&sslpassword=***#frag"
+            "postgresql://app:***@db.example.com:5432/prod?sslmode=verify-full&password=***&sslpassword=***"
+        );
+        assert_eq!(
+            RedactedUrl::new(format!(
+                "postgresql://app:{pw1}@db.example.com:5432/prod?password={pw2}&sslmode=verify-full#frag"
+            ))
+            .redacted(),
+            "postgresql://app:***@db.example.com:5432/prod?password=***&sslmode=verify-full#frag"
         );
 
         // 2. URI without authority password but with uppercase/mixed-case query secrets.
@@ -1093,6 +1228,19 @@ batch_size = 250
             format!("{scheme}app:1234/x{pw1}@db.example.com:5432/prod#ops@corp.com"),
             format!("{scheme}app:1234?k={pw1}@db.example.com:5432/prod#ops@corp.com"),
             format!("{scheme}app:1234?k={pw1}@[::1]"),
+            format!("{scheme}app:1234/{pw1}@db.example.com"),
+            format!("{scheme}app:1234/{pw1}@localhost"),
+            format!("{scheme}app:1234/{pw1}@host1,host2"),
+            format!("{scheme}app:p1@p2/{pw1}@db.example.com"),
+            format!("{scheme}app:1234?{pw1}@db.example.com"),
+            format!("{scheme}app:1234#{pw1}@db.example.com"),
+            format!("{scheme}app:1234/{pw1}@db.example.com#frag"),
+            format!("postgresql:///app:{pw1}@db.example.com"),
+            format!("{scheme}org/app:{pw1}@db.example.com"),
+            format!("{scheme}app@db.example.com:5432/prod?password=p1#{pw1}"),
+            format!("{scheme}app@db.example.com:5432/prod?application_name=svc#1&password={pw1}"),
+            format!("{scheme}app@db.example.com:5432/my#db?password={pw1}"),
+            format!("{scheme}app@db.example.com:5432/prod?a=1#frag?password={pw1}"),
             format!("{scheme} host=localhost password={pw1}"),
             format!("{scheme}db.example.com password={pw1}"),
             format!("{scheme}db.example.com/prod password={pw1}"),
@@ -1130,15 +1278,47 @@ batch_size = 250
         );
         for safe_uri in [
             format!("{scheme}db.example.com:5432/prod?application_name=ops@corp.com"),
+            format!("{scheme}db.example.com:5432?application_name=ops@corp.com"),
             format!("{scheme}db.example.com:5432/prod?sslmode=verify-full#ops@corp.com"),
             format!("{scheme}app@db.example.com:5432/prod#ops@corp.com"),
             format!("{scheme}db.example.com/prod?application_name=svc:1#ops@corp.com"),
             format!("{scheme}db.example.com:5432/prod@v2"),
+            format!("{scheme}db.example.com:5432/prod@v2?sslmode=verify-full"),
+            format!("{scheme}app@db.example.com:5432/prod@v2?sslmode=verify-full"),
+            format!("{scheme}db.example.com:5432/prod?application_name=worker@node1:8080"),
+            format!("{scheme}db.example.com:5432/prod?application_name=ops@corp.com/team"),
+            format!("{scheme}db.example.com:5432/prod#ops@corp.com/team"),
             format!("{scheme}[::1]:5432/prod?sslmode=verify-full"),
             format!("{scheme}:5432/prod"),
             "postgresql:///prod?host=/var/run/postgresql&application_name=ops@corp.com".to_owned(),
+            "postgresql:///prod?host=/var/run/postgresql&application_name=svc:1&options=-c%20app.email=ops@corp.com/team".to_owned(),
         ] {
             assert_eq!(RedactedUrl::new(safe_uri.clone()).redacted(), safe_uri);
+        }
+        assert_eq!(
+            RedactedUrl::new(format!(
+                "{scheme}app:{pw1}@db.example.com:5432/prod#ops@corp.com"
+            ))
+            .redacted(),
+            "postgresql://app:***@db.example.com:5432/prod#ops@corp.com"
+        );
+        assert_eq!(
+            RedactedUrl::new(format!(
+                "{scheme}app:{pw1}@db.example.com:5432/prod?application_name=worker@node1:8080"
+            ))
+            .redacted(),
+            "postgresql://app:***@db.example.com:5432/prod?application_name=worker@node1:8080"
+        );
+
+        // Linear-time behavior on adversarial repeated-delimiter inputs.
+        for huge in [
+            format!("{scheme}host:5432/db?k={}", "@".repeat(50_000)),
+            format!("{scheme}host/db/{}", "@".repeat(50_000)),
+            format!("{scheme}a:b/{}", "@".repeat(50_000)),
+            format!("{scheme}host/db?{}", "#?".repeat(25_000)),
+        ] {
+            let red = RedactedUrl::new(huge).redacted();
+            assert_ne!(red, "");
         }
 
         // 10. Libpq KV empty values, vertical tabs (`\x0b`), adjacent quoted secrets, malformed
@@ -1161,6 +1341,8 @@ batch_size = 250
             format!("host=db.example.com password= sslpassword='first {pw2}' dbname=prod"),
             format!("host=db.example.com password='{pw1}'sslpassword = {pw2} dbname=prod"),
             format!("host=db.example.com password='{pw1}'sslpassword='first {pw2}' dbname=prod"),
+            format!("host=db.example.com password='{pw1}'dbname='prod'sslpassword = {pw2}"),
+            format!("host=db.example.com password='{pw1}'dbname='prod'sslpassword='first {pw2}'"),
             format!("host=db.example.com password='{pw1}'dbname='my db'sslpassword={pw2}"),
             format!("host=db.example.com password='pa'{pw1}' dbname=prod"),
             format!("host='localhost'password={pw1} dbname=prod"),
