@@ -129,9 +129,8 @@ fn percent_decode_form_key(raw: &str) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
-fn redact_url_password(raw: &str) -> String {
-    let trimmed = raw.trim_matches(|c: char| c <= ' ');
-    let normalized: std::borrow::Cow<'_, str> = if trimmed.contains(['\t', '\n', '\r']) {
+fn strip_whatwg_ascii_tabs_newlines(trimmed: &str) -> std::borrow::Cow<'_, str> {
+    if trimmed.contains(['\t', '\n', '\r']) {
         std::borrow::Cow::Owned(
             trimmed
                 .chars()
@@ -140,44 +139,37 @@ fn redact_url_password(raw: &str) -> String {
         )
     } else {
         std::borrow::Cow::Borrowed(trimmed)
-    };
+    }
+}
+
+fn redact_url_password(raw: &str) -> String {
+    let trimmed = raw.trim_matches(|c: char| c <= ' ');
+    let normalized = strip_whatwg_ascii_tabs_newlines(trimmed);
     if let Some(scheme_end) = normalized.find("://")
         && is_valid_uri_scheme(&normalized[..scheme_end])
     {
-        return redact_uri_password(&normalized, scheme_end);
+        return redact_uri_password(&normalized, scheme_end, 3);
     }
-    if let Some(scheme_end) = normalized.find(':')
-        && is_valid_uri_scheme(&normalized[..scheme_end])
-    {
-        let uri_redacted = redact_authorityless_uri(&normalized, scheme_end);
-        if uri_redacted.chars().any(char::is_whitespace) {
-            return redact_libpq_kv_password(&uri_redacted);
-        }
-        return uri_redacted;
-    }
-    redact_libpq_kv_password(raw)
-}
 
-fn redact_authorityless_uri(raw: &str, scheme_end: usize) -> String {
-    let after_scheme = &raw[scheme_end + 1..];
-    let q_or_hash = after_scheme.find(['?', '#']).unwrap_or(after_scheme.len());
-    let head = &after_scheme[..q_or_hash];
-    let tail = &after_scheme[q_or_hash..];
-
-    let mut out = String::with_capacity(raw.len());
-    out.push_str(&raw[..=scheme_end]);
-    if !head.chars().any(char::is_whitespace)
-        && let Some(at_pos) = head.rfind('@')
-        && let Some(colon_pos) = head[..at_pos].find(':')
-    {
-        out.push_str(&head[..=colon_pos]);
-        out.push_str("***");
-        out.push_str(&head[at_pos..]);
+    // Run libpq KV redaction against the raw whitespace-preserving input first whenever whitespace
+    // is present so tab/newline-separated tokens (for example `foo:bar\tpassword=...` or
+    // `postgresql: host=localhost\tpassword=...`) are never glued together before KV parsing.
+    let kv_redacted = if trimmed.chars().any(char::is_whitespace) {
+        std::borrow::Cow::Owned(redact_libpq_kv_password(raw))
     } else {
-        out.push_str(head);
+        std::borrow::Cow::Borrowed(raw)
+    };
+    let kv_trimmed = kv_redacted.trim_matches(|c: char| c <= ' ');
+    let kv_normalized = strip_whatwg_ascii_tabs_newlines(kv_trimmed);
+    if let Some(scheme_end) = kv_normalized.find(':') {
+        let scheme = &kv_normalized[..scheme_end];
+        if (scheme.eq_ignore_ascii_case("postgres") || scheme.eq_ignore_ascii_case("postgresql"))
+            && kv_normalized[scheme_end + 1..].contains(['?', '@', ':'])
+        {
+            return redact_uri_password(&kv_normalized, scheme_end, 1);
+        }
     }
-    append_redacted_uri_tail(&mut out, tail);
-    out
+    kv_redacted.into_owned()
 }
 
 fn is_host_port_authority(authority: &str) -> bool {
@@ -241,8 +233,8 @@ fn append_redacted_uri_tail(out: &mut String, tail: &str) {
     out.push_str(fragment);
 }
 
-fn redact_uri_password(raw: &str, scheme_end: usize) -> String {
-    let rest = &raw[scheme_end + 3..];
+fn redact_uri_password(raw: &str, scheme_end: usize, sep_len: usize) -> String {
+    let rest = &raw[scheme_end + sep_len..];
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let mut authority = &rest[..authority_end];
     let mut tail = &rest[authority_end..];
@@ -272,13 +264,13 @@ fn redact_uri_password(raw: &str, scheme_end: usize) -> String {
         } else {
             return format!(
                 "{}<redacted malformed database URL>",
-                &raw[..scheme_end + 3]
+                &raw[..scheme_end + sep_len]
             );
         }
     }
 
     let mut out = String::with_capacity(raw.len());
-    out.push_str(&raw[..scheme_end + 3]);
+    out.push_str(&raw[..scheme_end + sep_len]);
 
     if let Some(at_pos) = authority.rfind('@')
         && let Some(colon_pos) = authority[..at_pos].find(':')
@@ -996,15 +988,24 @@ batch_size = 250
                 "{scheme}app@db.example.com:5432/prod?%7\t0assword={pw1}&%\n73slpassword={pw2}"
             ),
             format!("postgresql:?host=localhost&password={pw1}&sslpassword={pw2}"),
+            format!("postgresql:?%7\t0assword={pw1}"),
             format!("postgres:prod?oauth_client_secret={pw1}"),
             format!("postgresql:app:{pw1}@db.example.com:5432/prod"),
             format!("postgresql:app:1234/{pw1}@db.example.com:5432/prod?sslpassword={pw2}"),
+            format!("postgresql:app:1234#{pw1}@db.example.com:5432/prod"),
+            format!("postgresql:app:1234?{pw1}@db.example.com:5432/prod"),
+            format!("postgresql:app:1234#frag?k={pw1}@db.example.com:5432/prod"),
+            format!("postgresql:app:p1@p2#frag?k={pw1}@db.example.com:5432/prod"),
             format!("{scheme}app:1234#frag?k={pw1}@db.example.com:5432/prod"),
             format!("{scheme}app:p1@p2#frag?k={pw1}@db.example.com:5432/prod"),
             format!("foo:bar password={pw1}"),
+            format!("foo:bar\tpassword={pw1}"),
             format!("db.example.com:5432 password={pw1}"),
+            format!("db.example.com:5432\npassword={pw1}"),
             format!("postgresql: host=localhost password={pw1}"),
+            format!("postgresql: host=localhost\tpassword={pw1}"),
             format!("foo:bar?baz=1 password={pw1}"),
+            format!("foo:bar?baz=1\tpassword={pw1}"),
             format!(
                 "{scheme}app@db.example.com:5432/prod?ssl\tpassword={pw1}&ssl-password={pw2}&oauth_client_secret={pw1}"
             ),
