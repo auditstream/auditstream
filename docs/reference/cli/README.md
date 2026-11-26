@@ -17,6 +17,7 @@ auditstream [GLOBAL OPTIONS] <COMMAND> [COMMAND OPTIONS]
 | `--schema <SCHEMA>` | `AUDITSTREAM_SCHEMA` | `auditstream` | Postgres schema holding Auditstream tables and functions |
 | `-v`, `--verbose` | `AUDITSTREAM_LOG` | `warn` | Increase stderr log verbosity (`-v` info, `-vv` debug) |
 | `-q`, `--quiet` | `AUDITSTREAM_LOG` | off | Emit error logs only |
+| `--log-format <text\|json>` | `AUDITSTREAM_LOG_FORMAT` | `text` | Format stderr logs and fatal error lines as plain text or single-line JSON |
 | `-h`, `--help` | — | — | Print help on stdout and exit `0` |
 | `-V`, `--version` | — | — | Print version on stdout and exit `0` |
 
@@ -28,7 +29,7 @@ auditstream [GLOBAL OPTIONS] <COMMAND> [COMMAND OPTIONS]
 | [`status`](status.md) | Show audit schema, trigger and partition status (`--format`) |
 | [`verify`](verify.md) | Verify triggers, schema integrity and default partition health (`--format`, `--fix`) |
 | [`history`](history.md) | Inspect recorded audit history and row diffs (`--table`, `--record-id`, `--actor`, `--tenant`, `--since`, `--until`, `--limit`, `--format`, `--diff`) |
-| [`export`](export.md) | Export recorded audit events (`--format`, `--output`, `--cursor-file`, `--batch-size`, `--from-start`, `--since`, `--until`, `--actor`, `--tenant`, `--source`) |
+| [`export`](export.md) | Export recorded audit events (`--format`, `--output`, `--cursor-file`, `--batch-size`, `--from-start`, `--stats-format`, `--since`, `--until`, `--actor`, `--tenant`, `--source`) |
 
 ## Streams, logging and secrets
 

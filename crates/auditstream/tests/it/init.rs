@@ -54,6 +54,26 @@ async fn no_table_selected_exits_2_and_lists_discovered_tables_on_stderr() {
         .stderr(predicate::str::contains("public.customer"))
         .stderr(predicate::str::contains("public.invoice"))
         .stderr(predicate::str::contains("public.line_item"));
+
+    // Under `--log-format json`, every stderr line (both discovered tables and exit-2 error) is JSON.
+    let json_out = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["--log-format", "json", "init", "--migrations", "sql"])
+        .output()
+        .expect("run init --log-format json");
+    assert_eq!(json_out.status.code(), Some(2));
+    assert_eq!(json_out.stdout.as_slice(), b"");
+    let stderr = String::from_utf8(json_out.stderr).expect("utf8 stderr");
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(lines.len(), 2, "expected 2 JSON lines, got: {stderr}");
+    let first: serde_json::Value = serde_json::from_str(lines[0]).expect("valid JSON info line");
+    assert_eq!(first["level"], "INFO");
+    let first_msg = first["message"].as_str().expect("info message");
+    assert!(first_msg.contains("public.invoice"), "{first_msg}");
+    let second: serde_json::Value = serde_json::from_str(lines[1]).expect("valid JSON error line");
+    assert_eq!(second["level"], "ERROR");
+    assert_eq!(second["exit_code"], 2);
 }
 
 #[tokio::test]

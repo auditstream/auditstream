@@ -50,6 +50,16 @@ Options:
       --since <TIME>
           Inclusive lower bound on `occurred_at` (RFC 3339 timestamp or `YYYY-MM-DD` UTC)
 
+      --log-format <LOG_FORMAT>
+          Format for stderr log messages
+
+          Possible values:
+          - text: Human-readable plain text logs (default)
+          - json: Structured single-line JSON log records on stderr
+          
+          [env: AUDITSTREAM_LOG_FORMAT=]
+          [default: text]
+
       --until <TIME>
           Exclusive upper bound on `occurred_at` (RFC 3339 timestamp or `YYYY-MM-DD` UTC)
 

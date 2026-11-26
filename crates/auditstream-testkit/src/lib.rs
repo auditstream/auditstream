@@ -316,6 +316,67 @@ impl TestDb {
             .await?;
         Ok(rows)
     }
+
+    /// Opens a dedicated connection with an explicit transaction and allocates a real `xid8` via
+    /// `pg_current_xact_id()` so PostgreSQL's cluster-wide `pg_snapshot_xmin()` stays pinned at or
+    /// below that `xid8` until [`HeldTransaction::rollback`] is called or the guard is dropped.
+    ///
+    /// Uses a standalone [`PgConnection`] (outside `self.pool`) so dropping the guard without
+    /// calling [`HeldTransaction::rollback`] closes the TCP session immediately and PostgreSQL
+    /// aborts the transaction without leaving any pooled connection idle in transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Sqlx`] if connecting, opening the transaction, or allocating an `xid8`
+    /// fails.
+    pub async fn hold_snapshot_xmin(&self) -> Result<(u64, HeldTransaction), Error> {
+        let mut conn = PgConnection::connect(&self.url).await?;
+        conn.execute("BEGIN").await?;
+        let raw_xid: String = sqlx::query_scalar("SELECT pg_catalog.pg_current_xact_id()::text")
+            .fetch_one(&mut conn)
+            .await?;
+        let xid = raw_xid.parse::<u64>().map_err(|err| {
+            Error::Sqlx(sqlx::Error::Decode(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid pg_current_xact_id `{raw_xid}`: {err}"),
+            ))))
+        })?;
+        Ok((xid, HeldTransaction { conn: Some(conn) }))
+    }
+}
+
+/// Guard holding a dedicated PostgreSQL connection in an open transaction that pins
+/// `pg_snapshot_xmin()`.
+///
+/// The transaction is rolled back either explicitly via [`HeldTransaction::rollback`] or
+/// automatically by PostgreSQL when the guard is dropped and its dedicated connection closes.
+#[derive(Debug)]
+pub struct HeldTransaction {
+    conn: Option<PgConnection>,
+}
+
+impl HeldTransaction {
+    /// Explicitly rolls back the open transaction and closes its dedicated connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Sqlx`] if issuing `ROLLBACK` or closing the connection fails.
+    pub async fn rollback(mut self) -> Result<(), Error> {
+        if let Some(mut conn) = self.conn.take() {
+            conn.execute("ROLLBACK").await?;
+            conn.close().await?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for HeldTransaction {
+    fn drop(&mut self) {
+        // Dropping the standalone PgConnection closes the TCP socket immediately,
+        // causing PostgreSQL to abort the open transaction even during a panic unwind
+        // without leaving any pooled connection idle-in-transaction.
+        let _ = self.conn.take();
+    }
 }
 
 impl Drop for TestDb {

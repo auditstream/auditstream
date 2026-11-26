@@ -2,9 +2,19 @@
 
 use std::path::PathBuf;
 
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 use crate::commands;
+
+/// Output format for stderr log records (`--log-format` / `AUDITSTREAM_LOG_FORMAT`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub(crate) enum LogFormat {
+    /// Human-readable plain text logs (default).
+    #[default]
+    Text,
+    /// Structured single-line JSON log records on stderr.
+    Json,
+}
 
 /// Top-level `auditstream` CLI arguments (public contract: `docs/reference/cli/README.md`).
 #[derive(Debug, Parser)]
@@ -39,6 +49,16 @@ pub(crate) struct Cli {
     /// Silence warnings and info logs (errors only).
     #[arg(short, long, global = true)]
     pub(crate) quiet: bool,
+
+    /// Format for stderr log messages.
+    #[arg(
+        long,
+        global = true,
+        env = "AUDITSTREAM_LOG_FORMAT",
+        value_enum,
+        default_value_t = LogFormat::Text
+    )]
+    pub(crate) log_format: LogFormat,
 
     /// Subcommand to execute.
     #[command(subcommand)]

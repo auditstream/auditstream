@@ -23,6 +23,7 @@ use crate::commands::common::{
 };
 use crate::config::Config;
 use crate::exit::{Exit, ExitCodeExt, write_stdout};
+use crate::logging;
 
 /// Default maximum number of history rows returned by `auditstream history`.
 const DEFAULT_LIMIT: i64 = 100;
@@ -111,7 +112,7 @@ pub(crate) fn run(args: &Args, config: &Config) -> anyhow::Result<()> {
     })?;
 
     if events.is_empty() {
-        eprintln!("no events matched");
+        logging::emit_note(config.log_format, config.quiet, "no events matched");
         return Ok(());
     }
 

@@ -10,7 +10,7 @@ use auditstream_export::SinkConfig;
 use clap::ValueEnum;
 use serde::Deserialize;
 
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, Command, LogFormat};
 use crate::commands::export::Format;
 use crate::exit::{Exit, ExitCodeExt};
 
@@ -647,6 +647,8 @@ pub(crate) struct Config {
     pub(crate) file_path: PathBuf,
     /// Whether `-q` / `--quiet` was passed on the command line.
     pub(crate) quiet: bool,
+    /// Configured stderr log format (`text` or `json`).
+    pub(crate) log_format: LogFormat,
     /// Postgres connection URL (password redacted in debug/logs).
     pub(crate) database_url: Option<RedactedUrl>,
     /// Audit schema name.
@@ -829,6 +831,7 @@ impl Config {
         Ok(Self {
             file_path,
             quiet: cli.quiet,
+            log_format: cli.log_format,
             database_url,
             schema,
             capture,

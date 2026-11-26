@@ -233,3 +233,75 @@ fn database_password_never_appears_in_help_logs_or_errors() {
         }
     }
 }
+
+#[test]
+fn log_format_json_emits_structured_stderr_records_and_redacts_secrets() {
+    let dir = tempdir().unwrap();
+    let secret = "json_log_secret_pw_42";
+    let url = format!("postgresql://app_user:{secret}@db.internal:5432/auditdb");
+
+    for (extra_args, env_format) in [
+        (&["--log-format", "json"][..], None),
+        (&[][..], Some("json")),
+    ] {
+        let mut cmd = auditstream_cmd();
+        cmd.current_dir(dir.path())
+            .env("AUDITSTREAM_DATABASE_URL", &url)
+            .args(extra_args)
+            .args(SHOW_CONFIG);
+        if let Some(fmt) = env_format {
+            cmd.env("AUDITSTREAM_LOG_FORMAT", fmt);
+        }
+        let output = cmd.output().expect("run json log cli");
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.stdout.as_slice(), b"");
+
+        let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+        let lines: Vec<&str> = stderr.lines().collect();
+        assert!(
+            lines.len() >= 2,
+            "expected debug log + error record as JSONL, got: {stderr}"
+        );
+        for line in &lines {
+            assert!(!line.contains(secret), "secret leaked in JSON log: {line}");
+            let parsed: serde_json::Value =
+                serde_json::from_str(line).expect("every stderr line must be valid JSON");
+            assert!(parsed["timestamp"].as_str().is_some());
+            assert!(parsed["level"].as_str().is_some());
+            assert!(parsed["message"].as_str().is_some());
+        }
+        let last: serde_json::Value =
+            serde_json::from_str(lines.last().expect("last line")).expect("parse error record");
+        assert_eq!(last["level"], "ERROR");
+        assert_eq!(last["exit_code"], 2);
+    }
+
+    // Clap parse errors also emit single-line JSON when `--log-format json` or
+    // `AUDITSTREAM_LOG_FORMAT=json` is active.
+    for (extra_args, env_format) in [
+        (
+            &["--log-format", "json", "export", "--bogus-flag"][..],
+            None,
+        ),
+        (&["export", "--bogus-flag"][..], Some("json")),
+    ] {
+        let mut cmd = auditstream_cmd();
+        cmd.current_dir(dir.path()).args(extra_args);
+        if let Some(fmt) = env_format {
+            cmd.env("AUDITSTREAM_LOG_FORMAT", fmt);
+        }
+        let output = cmd.output().expect("run json clap error");
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.stdout.as_slice(), b"");
+        let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+        let lines: Vec<&str> = stderr.lines().collect();
+        assert_eq!(lines.len(), 1, "expected 1 JSON clap error line: {stderr}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("clap error must be valid JSON");
+        assert_eq!(parsed["level"], "ERROR");
+        assert_eq!(parsed["exit_code"], 2);
+        let msg = parsed["message"].as_str().expect("message string");
+        assert!(msg.contains("--bogus-flag"), "{msg}");
+        assert!(!msg.starts_with("error: "), "no double error prefix: {msg}");
+    }
+}
