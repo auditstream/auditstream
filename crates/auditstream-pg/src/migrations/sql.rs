@@ -46,7 +46,13 @@ pub(crate) fn write(options: &MigrationOptions) -> Result<WriteOutcome, Migratio
 pub(crate) fn render_plain_sql(manifest: &Manifest, statements: &[String]) -> String {
     let mut out = String::new();
     out.push_str(&header_comment(manifest));
-    out.push_str("\n\nBEGIN;\n\n");
+    out.push_str("\n\n");
+    out.push_str(&format_transaction_script(statements));
+    out
+}
+
+pub(crate) fn format_transaction_script(statements: &[String]) -> String {
+    let mut out = String::from("BEGIN;\n\n");
     for (idx, stmt) in statements.iter().enumerate() {
         if idx > 0 {
             out.push_str("\n\n");

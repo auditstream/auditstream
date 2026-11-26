@@ -1127,3 +1127,95 @@ fn rejects_primary_key_column_in_excluded_columns() {
         "unexpected error: {err2}"
     );
 }
+
+#[tokio::test]
+async fn install_statements_and_render_install_sql_install_clean_schema_and_reject_autocommit() {
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+
+    let ddl = DdlOptions::default();
+    let tables = fixture_tables();
+    let stmts = migrations::install_statements(&ddl, &tables).expect("compose install statements");
+    let script = migrations::render_install_sql(&ddl, &tables).expect("render install sql");
+
+    // 1. Statement-by-statement autocommit must be rejected before creating the audit schema.
+    let db_stmt = TestDb::new().await.expect("create TestDb for statements");
+    db_stmt
+        .execute_batch(
+            "CREATE TABLE public.invoice (id int PRIMARY KEY, status text, password_hash text); \
+             CREATE TABLE public.line_item (id int PRIMARY KEY, invoice_id int, qty int);",
+        )
+        .await
+        .expect("create fixture tables");
+
+    let mut conn = PgConnection::connect(db_stmt.url()).await.expect("connect");
+    conn.execute(AssertSqlSafe(stmts[0].clone()))
+        .await
+        .expect("first statement sets transaction marker");
+    let err = conn
+        .execute(AssertSqlSafe(stmts[1].clone()))
+        .await
+        .expect_err("second statement must reject autocommit execution");
+    assert!(err.to_string().contains("single transaction"), "{err}");
+    let schema_exists: bool =
+        sqlx::query_scalar("SELECT to_regnamespace('auditstream') IS NOT NULL")
+            .fetch_one(&mut conn)
+            .await
+            .expect("check schema");
+    assert!(!schema_exists);
+
+    // 2. Transactional execution of `install_statements` yields a clean `verify::check` report.
+    db_stmt
+        .execute_statements(&stmts)
+        .await
+        .expect("apply install_statements transactionally");
+    let report = verify::check(db_stmt.pool(), &tables)
+        .await
+        .expect("verify install_statements");
+    assert!(
+        report.findings.is_empty(),
+        "unexpected findings after install_statements: {:?}",
+        report.findings
+    );
+
+    // 3. `render_install_sql` runs directly as a single SQL script (matching `psql`) and is idempotent.
+    let db_script = TestDb::new().await.expect("create TestDb for script");
+    db_script
+        .execute_batch(
+            "CREATE TABLE public.invoice (id int PRIMARY KEY, status text, password_hash text); \
+             CREATE TABLE public.line_item (id int PRIMARY KEY, invoice_id int, qty int);",
+        )
+        .await
+        .expect("create fixture tables");
+    db_script
+        .execute_batch(&script)
+        .await
+        .expect("apply render_install_sql");
+    db_script
+        .execute_batch(&script)
+        .await
+        .expect("re-apply render_install_sql idempotently");
+    let script_report = verify::check(db_script.pool(), &tables)
+        .await
+        .expect("verify render_install_sql");
+    assert!(
+        script_report.findings.is_empty(),
+        "unexpected findings after render_install_sql: {:?}",
+        script_report.findings
+    );
+
+    db_script
+        .execute(
+            "INSERT INTO public.invoice (id, status, password_hash) VALUES (1, 'open', 'secret') \
+             /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzEifQ'*/",
+        )
+        .await
+        .expect("insert audited invoice");
+    let captured: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM auditstream.changes \
+          WHERE table_name = 'invoice' AND actor_source = 'comment'",
+    )
+    .fetch_one(db_script.pool())
+    .await
+    .expect("count captured invoice rows");
+    assert_eq!(captured, 1);
+}

@@ -128,6 +128,10 @@ impl TriggerOptions {
 /// Callers MUST execute the returned statements sequentially inside a single transaction
 /// (`BEGIN; ... COMMIT;`) so any temporary `auditstream_owner` self-grant acquired for a
 /// non-superuser migrator is atomic and cleanly revoked before commit.
+///
+/// When installing both the history schema (D2) and capture triggers (D3) together, prefer
+/// [`crate::migrations::install_statements`] or [`crate::migrations::render_install_sql`]
+/// instead of manually combining [`crate::ddl::generate`] with this function.
 pub fn generate(options: &TriggerOptions) -> Vec<String> {
     let owner_q = quote_ident(OWNER_ROLE);
     let owner_lit = quote_literal(OWNER_ROLE);
