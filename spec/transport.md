@@ -12,7 +12,7 @@ The trailing SQL comment is the default transport. It requires no explicit trans
 
 ### Comment placement and grammar
 
-An encoder MUST append the comment at the very end of the SQL statement, preceded by a single ASCII space (`0x20`), or by a single ASCII line feed (`LF`, `0x0A`) when the SQL statement ends inside an unterminated `--` single-line comment so PostgreSQL does not treat the block comment as part of the line comment. Only ASCII SQL whitespace (`SP`, `HTAB`, `CR`, `LF`, `FF` `0x0C`, `VT` `0x0B`) or semicolons (`;`) MAY follow the closing `*/`.
+An encoder MUST append the comment at the very end of the SQL statement, preceded by a single ASCII space (`0x20`), or by a single ASCII line feed (`LF`, `0x0A`) when the SQL statement ends inside an unterminated `--` single-line comment so PostgreSQL does not treat the block comment as part of the line comment. Only ASCII SQL whitespace (`SP`, `HTAB`, `CR`, `LF`, `FF` `0x0C`, and on PostgreSQL 17+ `VT` `0x0B`) or semicolons (`;`) MAY follow the closing `*/`.
 
 The comment follows sqlcommenter syntax and MAY share the comment block with other sqlcommenter key-value pairs (such as `traceparent`), separated by `,` with no spaces around the comma. The comment body MUST NOT contain `/`. Encoders MUST emit at most one `auditstream` key in the trailing comment.
 

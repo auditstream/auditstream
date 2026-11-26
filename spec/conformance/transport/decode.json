@@ -562,10 +562,10 @@
       }
     },
     {
-      "name": "accept-trailing-vertical-tab-and-form-feed",
-      "description": "Trailing ASCII SQL whitespace including form feed (0x0C) and vertical tab (0x0B) plus semicolon is trimmed cleanly.",
+      "name": "accept-trailing-form-feed-and-ascii-whitespace",
+      "description": "Trailing ASCII SQL whitespace including horizontal tab, CR, LF, and form feed (0x0C) plus semicolon is trimmed cleanly across PostgreSQL 15+.",
       "input": {
-        "sql": "UPDATE invoice SET status = 'ok' /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzQyIn0'*/ \t\r\n\f\u000b;"
+        "sql": "UPDATE invoice SET status = 'ok' /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzQyIn0'*/ \t\r\n\f;"
       },
       "expected": {
         "actor": {

@@ -1356,8 +1356,14 @@ async fn comment_transport_hardening_resolves_line_comments_embedded_tags_and_lo
     );
 
     // 3. Valid Drizzle-escaped tag, earlier `,auditstream=` value before a real `auditstream` key,
-    //    and trailing vertical tab (0x0B) / form feed (0x0C) all resolve cleanly in PostgreSQL.
-    let extra_valid_queries = [
+    //    and trailing ASCII SQL whitespace (form feed 0x0C on PG 15+, plus vertical tab 0x0B on
+    //    PG 17+ where `scan.l` added `\v` to SQL whitespace) all resolve cleanly in PostgreSQL.
+    let pg_version_num: i32 =
+        sqlx::query_scalar("SELECT pg_catalog.current_setting('server_version_num')::int")
+            .fetch_one(&mut fx.app_conn)
+            .await
+            .expect("read server_version_num");
+    let mut extra_valid_queries = vec![
         format!(
             "UPDATE invoice SET total = 307 WHERE id = 1 /*route='O\\'Reilly',auditstream='{fake_encoded}'*/"
         ),
@@ -1365,9 +1371,14 @@ async fn comment_transport_hardening_resolves_line_comments_embedded_tags_and_lo
             "UPDATE invoice SET total = 308 WHERE id = 1 /*a_route='foo,auditstream=',auditstream='{fake_encoded}'*/"
         ),
         format!(
-            "UPDATE invoice SET total = 309 WHERE id = 1 /*auditstream='{fake_encoded}'*/ \t\r\n\x0c\x0b;"
+            "UPDATE invoice SET total = 309 WHERE id = 1 /*auditstream='{fake_encoded}'*/ \t\r\n\x0c;"
         ),
     ];
+    if pg_version_num >= 170_000 {
+        extra_valid_queries.push(format!(
+            "UPDATE invoice SET total = 310 WHERE id = 1 /*auditstream='{fake_encoded}'*/ \t\r\n\x0c\x0b;"
+        ));
+    }
     let extra_start = fx.max_change_id().await;
     for sql in &extra_valid_queries {
         assert_eq!(tag(sql, &real_actor).expect("keep valid tag"), *sql);
