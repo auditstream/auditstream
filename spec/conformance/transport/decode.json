@@ -440,6 +440,153 @@
         "context": null,
         "actor_source": "invalid"
       }
+    },
+    {
+      "name": "ignore-embedded-auditstream-in-other-sqlcommenter-value",
+      "description": "An auditstream-like substring inside another sqlcommenter key's single-quoted value is not an auditstream key and yields null.",
+      "input": {
+        "sql": "UPDATE invoice SET status = 'ok' /*route='foo,auditstream=',other='bar'*/"
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": null
+      }
+    },
+    {
+      "name": "ignore-freeform-comment-containing-auditstream",
+      "description": "A non-sqlcommenter free-form trailing block comment containing ,auditstream='...' is ignored and yields null.",
+      "input": {
+        "sql": "UPDATE invoice SET status = 'ok' /* free text ,auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzQyIn0' */"
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": null
+      }
+    },
+    {
+      "name": "ignore-malformed-sqlcommenter-trailing-garbage",
+      "description": "A malformed sqlcommenter trailing comment with non-pair trailing text is ignored and yields null.",
+      "input": {
+        "sql": "UPDATE invoice SET status = 'ok' /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzQyIn0',garbage*/"
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": null
+      }
+    },
+    {
+      "name": "reject-duplicate-auditstream-key",
+      "description": "Duplicate auditstream keys inside a valid sqlcommenter comment yield actor_source='invalid'.",
+      "input": {
+        "sql": "UPDATE invoice SET status = 'ok' /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzQyIn0',auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzQyIn0'*/"
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": "invalid"
+      }
+    },
+    {
+      "name": "accept-comma-in-other-sqlcommenter-value",
+      "description": "A comma inside another sqlcommenter key's quoted value does not prevent decoding the auditstream key.",
+      "input": {
+        "sql": "UPDATE invoice SET status = 'ok' /*route='a,b',auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzQyIn0'*/"
+      },
+      "expected": {
+        "actor": {
+          "type": "user",
+          "id": "usr_42"
+        },
+        "context": null,
+        "actor_source": "comment"
+      }
+    },
+    {
+      "name": "accept-escaped-apostrophe-in-other-sqlcommenter-value",
+      "description": "Drizzle/Google sqlcommenter escaped apostrophes (\\') in another key's value do not prevent decoding the auditstream key.",
+      "input": {
+        "sql": "UPDATE invoice SET status = 'ok' /*route='O\\'Reilly',auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzQyIn0'*/"
+      },
+      "expected": {
+        "actor": {
+          "type": "user",
+          "id": "usr_42"
+        },
+        "context": null,
+        "actor_source": "comment"
+      }
+    },
+    {
+      "name": "accept-comment-after-line-comment-newline",
+      "description": "A trailing auditstream comment preceded by LF after a -- single-line comment decodes cleanly.",
+      "input": {
+        "sql": "UPDATE invoice SET status = 'ok' -- user note\n/*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzQyIn0'*/"
+      },
+      "expected": {
+        "actor": {
+          "type": "user",
+          "id": "usr_42"
+        },
+        "context": null,
+        "actor_source": "comment"
+      }
+    },
+    {
+      "name": "accept-comment-after-line-comment-with-spoof-newline",
+      "description": "A trailing auditstream comment on a new line after a -- line comment containing a spoof tag resolves the trailing tag.",
+      "input": {
+        "sql": "UPDATE invoice SET status = 'ok' -- /*auditstream='eyJ0eXBlIjoiYXBpX2tleSIsImlkIjoia2V5XzkifQ'*/\n/*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzQyIn0'*/"
+      },
+      "expected": {
+        "actor": {
+          "type": "user",
+          "id": "usr_42"
+        },
+        "context": null,
+        "actor_source": "comment"
+      }
+    },
+    {
+      "name": "ignore-mid-query-comment-followed-by-v",
+      "description": "A mid-query comment followed by identifier 'v' and semicolon is not a trailing comment (vertical tab is 0x0B, not literal 'v').",
+      "input": {
+        "sql": "UPDATE invoice SET status = 'ok' WHERE id = 1 RETURNING id AS /*auditstream='eyJ0eXBlIjoiYXBpX2tleSIsImlkIjoia2V5XzkifQ'*/ v;"
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": null
+      }
+    },
+    {
+      "name": "accept-trailing-form-feed-and-ascii-whitespace",
+      "description": "Trailing ASCII SQL whitespace including horizontal tab, CR, LF, and form feed (0x0C) plus semicolon is trimmed cleanly across PostgreSQL 15+.",
+      "input": {
+        "sql": "UPDATE invoice SET status = 'ok' /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzQyIn0'*/ \t\r\n\f;"
+      },
+      "expected": {
+        "actor": {
+          "type": "user",
+          "id": "usr_42"
+        },
+        "context": null,
+        "actor_source": "comment"
+      }
+    },
+    {
+      "name": "ignore-nested-block-comment-star-adjacent-spoof",
+      "description": "A nested PostgreSQL block comment whose inner '*/' is followed by '*auditstream=...' is not a valid trailing sqlcommenter tag.",
+      "input": {
+        "sql": "UPDATE invoice SET status = 'ok' /* outer /* inner */*auditstream='eyJ0eXBlIjoiYXBpX2tleSIsImlkIjoia2V5XzkifQ'*/"
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": null
+      }
     }
   ]
 }

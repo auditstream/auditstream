@@ -282,6 +282,37 @@
         "context": null,
         "actor_source": "invalid"
       }
+    },
+    {
+      "name": "embedded-auditstream-in-other-sqlcommenter-falls-through-to-jwt",
+      "description": "An auditstream-like substring inside another sqlcommenter value is absent and MUST fall through to valid JWT claims.",
+      "input": {
+        "sql": "UPDATE invoice SET status='paid' WHERE id=1 /*route='foo,auditstream=',other='bar'*/;",
+        "set_config": null,
+        "jwt_claims": "{\"sub\":\"auth0|abc\"}"
+      },
+      "expected": {
+        "actor": {
+          "type": "user",
+          "id": "auth0|abc"
+        },
+        "context": null,
+        "actor_source": "jwt"
+      }
+    },
+    {
+      "name": "duplicate-auditstream-comment-does-not-fall-through-to-jwt",
+      "description": "Duplicate auditstream keys in a valid sqlcommenter comment MUST yield invalid and MUST NOT fall through to valid JWT claims.",
+      "input": {
+        "sql": "UPDATE invoice SET status='paid' WHERE id=1 /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzQyIn0',auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzQyIn0'*/;",
+        "set_config": null,
+        "jwt_claims": "{\"sub\":\"auth0|abc\"}"
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": "invalid"
+      }
     }
   ]
 }

@@ -7,6 +7,9 @@
 //! (pinning direct-partition bypass behavior reported by D7), and `ON CONFLICT DO UPDATE`
 //! upserts across PostgreSQL 15–19.
 
+use auditstream_core::{
+    Actor, ActorType, Context, decode, encode, encode_with_context, tag, tag_with_context,
+};
 use auditstream_pg::ddl::{self, DEFAULT_SCHEMA, DdlOptions, OWNER_ROLE, quote_ident};
 use auditstream_pg::triggers::{self, TableTriggerSpec, TriggerOptions};
 use auditstream_pg::verify::{self, FindingKind};
@@ -1117,4 +1120,287 @@ async fn owner_role_owns_history_and_trigger_functions_after_install() {
     .await
     .expect("read changes owner");
     assert_eq!(owners, vec![("changes".to_owned(), OWNER_ROLE.to_owned())]);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn comment_transport_hardening_resolves_line_comments_embedded_tags_and_long_sqlcommenter() {
+    let mut fx = CaptureFixture::kit_default().await;
+    let start_id = fx.seed_invoices_for_update_tests().await;
+
+    let real_actor = Actor::new(ActorType::User, "usr_real");
+    let fake_encoded = encode(&Actor::new(ActorType::User, "usr_spoof")).expect("encode spoof");
+    let ctx = Context {
+        request_id: Some("req_153".to_owned()),
+        source: Some("api".to_owned()),
+        ..Context::default()
+    };
+
+    // 1. Queries tagged via `auditstream_core::tag_with_context()` with trailing `--` comments,
+    //    embedded `,auditstream='...'` values, malformed comments, and long sqlcommenter blocks
+    //    MUST all execute cleanly on PostgreSQL and resolve `usr_real` (`actor_source = 'comment'`).
+    let real_encoded = encode_with_context(&real_actor, Some(&ctx)).expect("encode real + ctx");
+    // Exact 4,096-char merged comment overhead: `/*auditstream='<E>',z_trace=''*/;`
+    let merged_z_overhead =
+        4 + "auditstream='".len() + real_encoded.len() + "',z_trace='".len() + 1 + 1;
+    let exact_z_len = 4096 - merged_z_overhead;
+    let long_z_exact = "z".repeat(exact_z_len);
+    let long_z_over = "z".repeat(exact_z_len + 1);
+    let long_z_utf8_exact = "日".repeat(exact_z_len);
+    let long_z_utf8_over = "日".repeat(exact_z_len + 1);
+    let evicted_z_pad = "z".repeat(4100);
+
+    // Explicitly verify exact-boundary merge vs >4096 standalone append before executing in PG.
+    let exact_ascii_sql =
+        format!("UPDATE invoice SET total = 215 WHERE id = 1 /*z_trace='{long_z_exact}'*/;");
+    let exact_ascii_tagged =
+        tag_with_context(&exact_ascii_sql, &real_actor, Some(&ctx)).expect("merge exact ascii");
+    assert!(
+        exact_ascii_tagged.contains(&format!("/*auditstream='{real_encoded}',z_trace='")),
+        "exact 4,096-char ASCII sqlcommenter must merge"
+    );
+    let exact_utf8_sql =
+        format!("UPDATE invoice SET total = 217 WHERE id = 1 /*z_trace='{long_z_utf8_exact}'*/;");
+    let exact_utf8_tagged =
+        tag_with_context(&exact_utf8_sql, &real_actor, Some(&ctx)).expect("merge exact utf8");
+    assert!(
+        exact_utf8_tagged.contains(&format!("/*auditstream='{real_encoded}',z_trace='")),
+        "exact 4,096-char multi-byte UTF-8 sqlcommenter must merge"
+    );
+    let over_ascii_sql =
+        format!("UPDATE invoice SET total = 216 WHERE id = 1 /*z_trace='{long_z_over}'*/;");
+    let over_ascii_tagged =
+        tag_with_context(&over_ascii_sql, &real_actor, Some(&ctx)).expect("append over ascii");
+    assert_eq!(
+        over_ascii_tagged,
+        format!("{over_ascii_sql} /*auditstream='{real_encoded}'*/")
+    );
+
+    let tagged_cases = [
+        // Trailing `--` single-line comments (need `\n` before `/*auditstream='...'*/`).
+        "UPDATE invoice SET total = 201 WHERE id = 1 -- user note".to_owned(),
+        "UPDATE invoice SET total = 202 WHERE id = 1 --".to_owned(),
+        format!(
+            "UPDATE invoice SET total = 203 WHERE id = 1 -- /*auditstream='{fake_encoded}'*/"
+        ),
+        format!(
+            "UPDATE invoice SET total = 204 WHERE id = 1 /*auditstream='{fake_encoded}'*/ -- trailing"
+        ),
+        "UPDATE invoice SET status = E'a'\n'b\\' ' || 'x', total = 205 WHERE id = 1 -- after quotecontinue"
+            .to_owned(),
+        "UPDATE invoice SET status = $tag$-- inside$tag$, total = 206 WHERE id = 1 -- after dollar quote"
+            .to_owned(),
+        // Non-trailing `--` inside quotes/comments (normal space before `/*auditstream='...'*/`).
+        "UPDATE invoice SET status = 'foo -- bar', total = 207 WHERE id = 1".to_owned(),
+        "UPDATE invoice SET status = 'ok', total = 208 WHERE id = 1 /* -- in block */".to_owned(),
+        // Embedded `,auditstream='...'`, malformed/freeform comments, and invalid/duplicate tags.
+        "UPDATE invoice SET total = 209 WHERE id = 1 /*route='foo,auditstream=',other='bar'*/"
+            .to_owned(),
+        "UPDATE invoice SET total = 210 WHERE id = 1 /*a_route='foo,auditstream='*/;".to_owned(),
+        format!(
+            "UPDATE invoice SET total = 211 WHERE id = 1 /* free text ,auditstream='{fake_encoded}' */"
+        ),
+        format!(
+            "UPDATE invoice SET total = 212 WHERE id = 1 /*auditstream='{fake_encoded}',garbage*/"
+        ),
+        "UPDATE invoice SET total = 213 WHERE id = 1 /*auditstream='!!!notbase64'*/".to_owned(),
+        format!(
+            "UPDATE invoice SET total = 214 WHERE id = 1 /*auditstream='{fake_encoded}',auditstream='{fake_encoded}'*/"
+        ),
+        // Long existing sqlcommenter keys at exact 4,096 (merged) and 4,097 (standalone append).
+        exact_ascii_sql,
+        over_ascii_sql,
+        exact_utf8_sql,
+        format!("UPDATE invoice SET total = 218 WHERE id = 1 /*z_trace='{long_z_utf8_over}'*/;"),
+        format!(
+            "UPDATE invoice SET total = 219 WHERE id = 1 /*auditstream='{fake_encoded}',z_pad='{evicted_z_pad}'*/"
+        ),
+        // Star-adjacent block comments (`RETURNING */*...*/`) must append standalone, not merge/skip.
+        "UPDATE invoice SET total = 220 WHERE id = 1 RETURNING */*traceparent='00-abc'*/;"
+            .to_owned(),
+        format!(
+            "UPDATE invoice SET total = 221 WHERE id = 1 RETURNING */*auditstream='{fake_encoded}'*/;"
+        ),
+    ];
+
+    for (idx, raw_sql) in tagged_cases.iter().enumerate() {
+        let tagged = tag_with_context(raw_sql, &real_actor, Some(&ctx))
+            .unwrap_or_else(|e| panic!("case {idx} tag failed: {e}"));
+        assert_eq!(
+            decode(&tagged).into_actor().expect("decode tagged"),
+            Some(real_actor.clone()),
+            "case {idx} Rust decode mismatch for {tagged}"
+        );
+        fx.exec_app(&tagged).await;
+    }
+
+    let parse_opt_json = |raw: Option<String>| -> Option<Value> {
+        raw.as_deref()
+            .map(|s| serde_json::from_str::<Value>(s).expect("valid jsonb text"))
+    };
+
+    let captured: Vec<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT actor::text, context::text, actor_source \
+           FROM auditstream.changes \
+          WHERE id > $1 AND table_name = 'invoice' \
+          ORDER BY id ASC",
+    )
+    .bind(start_id)
+    .fetch_all(&mut fx.app_conn)
+    .await
+    .expect("read hardened comment rows");
+
+    assert_eq!(captured.len(), tagged_cases.len());
+    for (idx, (actor, context, source)) in captured.into_iter().enumerate() {
+        assert_eq!(
+            parse_opt_json(actor),
+            Some(json!({"type": "user", "id": "usr_real"})),
+            "case {idx} actor"
+        );
+        assert_eq!(
+            parse_opt_json(context),
+            Some(json!({"requestId": "req_153", "source": "api"})),
+            "case {idx} context"
+        );
+        assert_eq!(source.as_deref(), Some("comment"), "case {idx} source");
+    }
+
+    // 2. Untagged queries with embedded `,auditstream='...'` or free-form comments fall through
+    //    to JWT cleanly in PostgreSQL `resolve_actor()`, while duplicate `auditstream` keys yield
+    //    `actor_source = 'invalid'` without falling through.
+    let jwt_start = fx.max_change_id().await;
+    let mut tx = fx.app_conn.begin().await.expect("begin jwt tx");
+    sqlx::query(
+        "SELECT pg_catalog.set_config('request.jwt.claims', '{\"sub\":\"jwt_user_153\"}', true)",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("set jwt claims");
+
+    tx.execute(
+        "UPDATE invoice SET total = 301 WHERE id = 1 /*route='foo,auditstream=',other='bar'*/",
+    )
+    .await
+    .expect("embedded auditstream falls through to jwt");
+    tx.execute(AssertSqlSafe(format!(
+        "UPDATE invoice SET total = 302 WHERE id = 1 /* free text ,auditstream='{fake_encoded}' */"
+    )))
+    .await
+    .expect("freeform comment falls through to jwt");
+    tx.execute(AssertSqlSafe(format!(
+        "UPDATE invoice SET total = 303 WHERE id = 1 /*auditstream='{fake_encoded}',auditstream='{fake_encoded}'*/"
+    )))
+    .await
+    .expect("duplicate auditstream yields invalid");
+    tx.execute(AssertSqlSafe(format!(
+        "UPDATE invoice SET total = 304 WHERE id = 1 RETURNING id AS /*auditstream='{fake_encoded}'*/ v;"
+    )))
+    .await
+    .expect("mid-query comment before identifier v falls through to jwt");
+    tx.execute(AssertSqlSafe(format!(
+        "UPDATE invoice SET total = 305 WHERE id = 1 /* outer /* inner */*auditstream='{fake_encoded}'*/"
+    )))
+    .await
+    .expect("nested block comment star-adjacent spoof falls through to jwt");
+    // Exact 4,096-char boundary nested-comment spoof (`/` of inner `*/` is char 4,096 from end
+    // -> `open_pos = 1`, while `*` of inner `*/` is char 4,097 from end).
+    let boundary_after_slash = format!("*auditstream='{fake_encoded}'*/");
+    let boundary_spaces = " ".repeat(4096 - 1 - boundary_after_slash.len());
+    tx.execute(AssertSqlSafe(format!(
+        "UPDATE invoice SET total = 306 WHERE id = 1 /* /* */{boundary_after_slash}{boundary_spaces}"
+    )))
+    .await
+    .expect("exact 4096-boundary nested spoof falls through to jwt");
+    tx.commit().await.expect("commit jwt tx");
+
+    let jwt_rows: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT actor::text, actor_source \
+           FROM auditstream.changes \
+          WHERE id > $1 AND table_name = 'invoice' \
+          ORDER BY id ASC",
+    )
+    .bind(jwt_start)
+    .fetch_all(&mut fx.app_conn)
+    .await
+    .expect("read jwt precedence rows");
+
+    let parsed_jwt_rows: Vec<(Option<Value>, Option<String>)> = jwt_rows
+        .into_iter()
+        .map(|(a, src)| (parse_opt_json(a), src))
+        .collect();
+    assert_eq!(
+        parsed_jwt_rows,
+        vec![
+            (
+                Some(json!({"type": "user", "id": "jwt_user_153"})),
+                Some("jwt".to_owned()),
+            ),
+            (
+                Some(json!({"type": "user", "id": "jwt_user_153"})),
+                Some("jwt".to_owned()),
+            ),
+            (None, Some("invalid".to_owned())),
+            (
+                Some(json!({"type": "user", "id": "jwt_user_153"})),
+                Some("jwt".to_owned()),
+            ),
+            (
+                Some(json!({"type": "user", "id": "jwt_user_153"})),
+                Some("jwt".to_owned()),
+            ),
+            (
+                Some(json!({"type": "user", "id": "jwt_user_153"})),
+                Some("jwt".to_owned()),
+            ),
+        ]
+    );
+
+    // 3. Valid Drizzle-escaped tag, earlier `,auditstream=` value before a real `auditstream` key,
+    //    and trailing ASCII SQL whitespace (form feed 0x0C on PG 15+, plus vertical tab 0x0B on
+    //    PG 17+ where `scan.l` added `\v` to SQL whitespace) all resolve cleanly in PostgreSQL.
+    let pg_version_num: i32 =
+        sqlx::query_scalar("SELECT pg_catalog.current_setting('server_version_num')::int")
+            .fetch_one(&mut fx.app_conn)
+            .await
+            .expect("read server_version_num");
+    let mut extra_valid_queries = vec![
+        format!(
+            "UPDATE invoice SET total = 307 WHERE id = 1 /*route='O\\'Reilly',auditstream='{fake_encoded}'*/"
+        ),
+        format!(
+            "UPDATE invoice SET total = 308 WHERE id = 1 /*a_route='foo,auditstream=',auditstream='{fake_encoded}'*/"
+        ),
+        format!(
+            "UPDATE invoice SET total = 309 WHERE id = 1 /*auditstream='{fake_encoded}'*/ \t\r\n\x0c;"
+        ),
+    ];
+    if pg_version_num >= 170_000 {
+        extra_valid_queries.push(format!(
+            "UPDATE invoice SET total = 310 WHERE id = 1 /*auditstream='{fake_encoded}'*/ \t\r\n\x0c\x0b;"
+        ));
+    }
+    let extra_start = fx.max_change_id().await;
+    for sql in &extra_valid_queries {
+        assert_eq!(tag(sql, &real_actor).expect("keep valid tag"), *sql);
+        fx.exec_app(sql).await;
+    }
+    let extra_rows: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT actor::text, actor_source \
+           FROM auditstream.changes \
+          WHERE id > $1 AND table_name = 'invoice' \
+          ORDER BY id ASC",
+    )
+    .bind(extra_start)
+    .fetch_all(&mut fx.app_conn)
+    .await
+    .expect("read extra valid rows");
+    assert_eq!(extra_rows.len(), extra_valid_queries.len());
+    for (idx, (actor_txt, src)) in extra_rows.into_iter().enumerate() {
+        assert_eq!(
+            parse_opt_json(actor_txt),
+            Some(json!({"type": "user", "id": "usr_spoof"})),
+            "extra case {idx} actor"
+        );
+        assert_eq!(src.as_deref(), Some("comment"), "extra case {idx} source");
+    }
 }

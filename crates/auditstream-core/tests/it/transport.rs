@@ -238,6 +238,356 @@ fn tag_merges_into_sqlcommenter_sorted_and_never_double_tags() {
 }
 
 #[test]
+fn tag_and_decode_handle_trailing_line_comments_and_pg_quoting_lexically() {
+    let actor = Actor::new(ActorType::User, "usr_42");
+    let encoded = encode(&actor).expect("encode usr_42");
+    let fake_encoded = encode(&Actor::new(ActorType::User, "usr_fake")).expect("encode fake");
+
+    let trailing_line_comments = [
+        "SELECT 1 -- user note".to_owned(),
+        "SELECT 1 --".to_owned(),
+        format!("SELECT 1 -- /*auditstream='{fake_encoded}'*/"),
+        format!("SELECT 1 /*auditstream='{fake_encoded}'*/ -- trailing comment"),
+        "SELECT 1 -- /*traceparent='00-abc'*/".to_owned(),
+        "SELECT $1 -- positional param is not dollar-quote".to_owned(),
+        "SELECT $foo -- unclosed dollar tag is not dollar-quote".to_owned(),
+        "SELECT col$a$ FROM t -- ident dollar is not dollar-quote".to_owned(),
+        r"SELECT 'backslash \' -- standard_conforming_strings ends string here".to_owned(),
+        r"SELECT E'\\' -- E-string ended after escaped backslash".to_owned(),
+        "SELECT E'a'\n'b\\' ' || 'x' -- trailing after E-string quotecontinue".to_owned(),
+        "SELECT E'a' -- join\n'b\\' ' || 'x' -- trailing after commented quotecontinue".to_owned(),
+        r#"SELECT "col" -- after double-quoted ident"#.to_owned(),
+        "SELECT 1 /* block */ -- line after block".to_owned(),
+        "SELECT $tag$body$tag$ -- after dollar-quoted string".to_owned(),
+    ];
+
+    for sql in &trailing_line_comments {
+        assert_eq!(decode(sql), DecodedActor::Absent, "decode({sql:?})");
+        let tagged = tag(sql, &actor).expect("tag trailing line comment");
+        assert_eq!(
+            tagged,
+            format!("{sql}\n/*auditstream='{encoded}'*/"),
+            "tag({sql:?})"
+        );
+        assert_eq!(
+            decode(&tagged).into_actor().expect("parse"),
+            Some(actor.clone()),
+            "round-trip({sql:?})"
+        );
+        assert_eq!(
+            tag(&tagged, &Actor::new(ActorType::Service, "other")).expect("idempotent re-tag"),
+            tagged,
+            "no double tag({sql:?})"
+        );
+    }
+
+    let non_trailing_line_comments = [
+        "SELECT 1 -- closed with LF\n",
+        "SELECT 1 -- closed with CR\r",
+        "SELECT '-- inside single quotes'",
+        "SELECT 'it''s -- still in single quotes'",
+        r"SELECT E'escaped \' -- still in E-string'",
+        "SELECT E'it''s -- doubled quote still in E-string'",
+        r#"SELECT "col--name" FROM t"#,
+        r#"SELECT "a""--b" FROM t"#,
+        "SELECT $$-- inside dollar quote$$",
+        "SELECT $tag$-- inside tagged dollar quote$tag$",
+        "SELECT $a$ $b$ -- inside $a$",
+        "SELECT 1 /* -- inside block comment */",
+        "SELECT 1 /* outer /* inner */ -- still in outer block */",
+    ];
+
+    for sql in non_trailing_line_comments {
+        assert_eq!(decode(sql), DecodedActor::Absent, "decode({sql:?})");
+        let tagged = tag(sql, &actor).expect("tag non-trailing line comment");
+        assert_eq!(
+            tagged,
+            format!("{sql} /*auditstream='{encoded}'*/"),
+            "tag({sql:?})"
+        );
+        assert_eq!(
+            decode(&tagged).into_actor().expect("parse"),
+            Some(actor.clone())
+        );
+    }
+
+    // `--` inside an unclosed block comment is not a line comment (appends with space, not LF).
+    let unclosed_block = "SELECT 1 /* unclosed block -- not a line comment";
+    assert_eq!(decode(unclosed_block), DecodedActor::Absent);
+    assert_eq!(
+        tag(unclosed_block, &actor).expect("tag unclosed block"),
+        format!("{unclosed_block} /*auditstream='{encoded}'*/")
+    );
+}
+
+#[test]
+fn tag_and_decode_parse_sqlcommenter_pairs_lexically_without_suppressing_tagging() {
+    let actor = Actor::new(ActorType::User, "usr_real");
+    let encoded = encode(&actor).expect("encode usr_real");
+    let fake_encoded = encode(&Actor::new(ActorType::User, "usr_fake")).expect("encode fake");
+
+    // Embedded `,auditstream='` in another sqlcommenter value, malformed comments, free-form
+    // comments, nested block comments, unclosed quotes, and non-ASCII trailing whitespace
+    // must decode as Absent and must NOT suppress tagging.
+    let absent_cases = [
+        "SELECT 1 /*route='foo,auditstream=',other='bar'*/".to_owned(),
+        "SELECT 1 /*a_route='foo,auditstream=',other='bar'*/".to_owned(),
+        "SELECT 1 /*note='hello,auditstream=''abc'''*/".to_owned(),
+        format!("SELECT 1 /* free text ,auditstream='{fake_encoded}' */"),
+        format!("SELECT 1 /*garbage,auditstream='{fake_encoded}'*/"),
+        format!("SELECT 1 /*auditstream='{fake_encoded}',*/"),
+        format!("SELECT 1 /*,auditstream='{fake_encoded}'*/"),
+        format!("SELECT 1 /*auditstream='{fake_encoded}',auditstream='{fake_encoded}',garbage*/"),
+        format!("SELECT 1 /* outer /*auditstream='{fake_encoded}'*/ */"),
+        format!("SELECT 'unclosed /*auditstream='{fake_encoded}'*/"),
+        format!("SELECT E'unclosed /*auditstream='{fake_encoded}'*/"),
+        format!("SELECT $$unclosed /*auditstream='{fake_encoded}'*/"),
+        format!("SELECT 1 /*auditstream='{fake_encoded}'*/\u{00A0}"),
+        format!("SELECT 1 /*auditstream='{fake_encoded}'*/\u{2028}"),
+        format!("SELECT 1 /*auditstream='{fake_encoded}'*/\u{FEFF}"),
+        "/*/*/".to_owned(),
+        "/*/".to_owned(),
+        "/**/".to_owned(),
+        "SELECT 1 /*auditstream='*/".to_owned(),
+    ];
+
+    for sql in &absent_cases {
+        assert_eq!(decode(sql), DecodedActor::Absent, "decode({sql:?})");
+        let tagged = tag(sql, &actor).expect("tag absent case");
+        assert_ne!(tagged, *sql, "must not suppress tagging for {sql:?}");
+        if !sql.starts_with("SELECT 'unclosed")
+            && !sql.starts_with("SELECT E'unclosed")
+            && !sql.starts_with("SELECT $$unclosed")
+            && !sql.starts_with("/*/")
+        {
+            assert_eq!(
+                decode(&tagged).into_actor().expect("parse"),
+                Some(actor.clone()),
+                "tagged output must decode to active actor for {sql:?} -> {tagged:?}"
+            );
+        }
+    }
+
+    // Merging into `a_route='foo,auditstream='` (key < "auditstream") falls back to appending
+    // a standalone comment so legacy `strpos` readers never hit `,auditstream='` inside `a_route`.
+    let collision_sql = "UPDATE invoice SET status = 'ok' /*a_route='foo,auditstream='*/;";
+    let collision_tagged = tag(collision_sql, &actor).expect("tag collision sql");
+    assert_eq!(
+        collision_tagged,
+        format!("{collision_sql} /*auditstream='{encoded}'*/")
+    );
+    assert_eq!(
+        decode(&collision_tagged).into_actor().expect("parse"),
+        Some(actor.clone())
+    );
+
+    // Invalid or duplicate `auditstream` tags decode as Invalid, yet still do NOT suppress
+    // tagging so the active actor wins in the final trailing comment.
+    let invalid_cases = [
+        "SELECT 1 /*auditstream=''*/".to_owned(),
+        "SELECT 1 /*auditstream='!!!notbase64'*/".to_owned(),
+        "SELECT 1 /*auditstream='bm90IGpzb24'*/".to_owned(),
+        format!("SELECT 1 /*auditstream='{fake_encoded}',auditstream='{fake_encoded}'*/"),
+        format!(
+            "SELECT 1 /*route='O\\'Reilly',auditstream='{fake_encoded}',auditstream='{fake_encoded}'*/"
+        ),
+    ];
+
+    for sql in &invalid_cases {
+        assert_eq!(decode(sql), DecodedActor::Invalid, "decode({sql:?})");
+        let tagged = tag(sql, &actor).expect("tag invalid case");
+        assert_eq!(tagged, format!("{sql} /*auditstream='{encoded}'*/"));
+        assert_eq!(
+            decode(&tagged).into_actor().expect("parse"),
+            Some(actor.clone()),
+            "re-tagged invalid comment must resolve active actor: {sql:?}"
+        );
+    }
+
+    // Valid sqlcommenter comments with commas in values, Drizzle/Prisma key chars, and `\'` escapes
+    // decode cleanly and are recognized as already tagged (never double-tagged).
+    let existing = Actor::new(ActorType::User, "usr_42");
+    let existing_b64 = encode(&existing).expect("encode usr_42");
+    let valid_already_tagged = [
+        format!("SELECT 1 /*route='a,b',auditstream='{existing_b64}'*/"),
+        format!("SELECT 1 /*db.driver='pg',auditstream='{existing_b64}'*/"),
+        format!("SELECT 1 /*k%20v='1',app~1='2',k!*(x)='3',auditstream='{existing_b64}'*/"),
+        format!("SELECT 1 /*a\\'b='v',auditstream='{existing_b64}'*/"),
+        format!("SELECT 1 /*route='O\\'Reilly',auditstream='{existing_b64}'*/"),
+        format!("SELECT 1 /*route='O\\'Reilly',path='a\\\\',auditstream='{existing_b64}'*/"),
+        format!("SELECT 1 /*x='foo\\',auditstream='{existing_b64}'*/"),
+        format!("SELECT 1 /*auditstream='{existing_b64}',x='foo\\'*/"),
+        format!("SELECT E'a'\n'b\\' ' || 'x' /*auditstream='{existing_b64}'*/"),
+        format!("SELECT 1 -- note\n/*auditstream='{existing_b64}'*/ \t\r\n\x0c\x0b;"),
+    ];
+
+    for sql in &valid_already_tagged {
+        assert_eq!(
+            decode(sql).into_actor().expect("parse"),
+            Some(existing.clone()),
+            "decode({sql:?})"
+        );
+        assert_eq!(
+            tag(sql, &actor).expect("skip already tagged"),
+            *sql,
+            "must not double-tag valid comment {sql:?}"
+        );
+    }
+}
+
+#[test]
+fn tag_preserves_4096_char_tail_window_on_long_sqlcommenter_merge_and_boundaries() {
+    let actor = Actor::new(ActorType::User, "usr_42");
+    let encoded = encode(&actor).expect("encode usr_42");
+    // Merged comment `/*auditstream='<39>',z_trace='<N>'*/;` has overhead:
+    // `/*` (2) + `auditstream='` (13) + 39 + `',z_trace='` (11) + `'` (1) + `*/` (2) + `;` (1) = 69 chars.
+    let overhead = 4 + "auditstream='".len() + encoded.len() + "',z_trace='".len() + 1 + 1;
+
+    // Exact 4,096 chars (ASCII): merges cleanly and stays inside PostgreSQL's 4,096-char window.
+    let exact_len = 4096 - overhead;
+    let exact_sql = format!(
+        "UPDATE invoice SET status = 'ok' /*z_trace='{}'*/;",
+        "a".repeat(exact_len)
+    );
+    let exact_tagged = tag(&exact_sql, &actor).expect("merge at exact 4096 boundary");
+    let exact_comment_start = exact_tagged.rfind("/*").expect("opening /*");
+    assert_eq!(exact_tagged[exact_comment_start..].chars().count(), 4096);
+    assert!(
+        exact_tagged.contains(&format!("/*auditstream='{encoded}',z_trace='")),
+        "should merge when merged comment + suffix is exactly 4096 chars"
+    );
+    assert_eq!(
+        decode(&exact_tagged).into_actor().expect("parse"),
+        Some(actor.clone())
+    );
+    assert_eq!(
+        tag(&exact_tagged, &Actor::new(ActorType::Service, "other")).expect("no double tag"),
+        exact_tagged
+    );
+
+    // 4,097 chars (1 char past window): MUST NOT merge (would evict `/*`), appends standalone tag.
+    let over_sql = format!(
+        "UPDATE invoice SET status = 'ok' /*z_trace='{}'*/;",
+        "a".repeat(exact_len + 1)
+    );
+    let over_tagged = tag(&over_sql, &actor).expect("append when merge exceeds 4096");
+    assert_eq!(
+        over_tagged,
+        format!("{over_sql} /*auditstream='{encoded}'*/")
+    );
+    assert_eq!(
+        decode(&over_tagged).into_actor().expect("parse"),
+        Some(actor.clone())
+    );
+
+    // Exact 4,096 vs 4,097 Unicode scalar values with 4-byte astral emoji (16,000+ UTF-8 bytes!).
+    let emoji_exact = format!(
+        "UPDATE invoice SET status = 'ok' /*z_trace='{}'*/;",
+        "🚀".repeat(exact_len)
+    );
+    let emoji_exact_tagged = tag(&emoji_exact, &actor).expect("merge emoji at 4096 chars");
+    let emoji_start = emoji_exact_tagged.rfind("/*").expect("opening /*");
+    assert_eq!(emoji_exact_tagged[emoji_start..].chars().count(), 4096);
+    assert!(emoji_exact_tagged[emoji_start..].len() > 12_000);
+    assert_eq!(
+        decode(&emoji_exact_tagged).into_actor().expect("parse"),
+        Some(actor.clone())
+    );
+
+    let emoji_over = format!(
+        "UPDATE invoice SET status = 'ok' /*z_trace='{}'*/;",
+        "🚀".repeat(exact_len + 1)
+    );
+    let emoji_over_tagged = tag(&emoji_over, &actor).expect("append emoji at 4097 chars");
+    assert_eq!(
+        emoji_over_tagged,
+        format!("{emoji_over} /*auditstream='{encoded}'*/")
+    );
+    assert_eq!(
+        decode(&emoji_over_tagged).into_actor().expect("parse"),
+        Some(actor.clone())
+    );
+
+    // Existing comment already outside 4,096-char tail window (even with a valid `auditstream` key)
+    // decodes as Absent and MUST be tagged with a new standalone trailing comment.
+    let evicted = format!(
+        "UPDATE invoice SET status = 'ok' /*auditstream='{encoded}',z_pad='{}'*/",
+        "z".repeat(4100)
+    );
+    assert_eq!(decode(&evicted), DecodedActor::Absent);
+    let retagged = tag(&evicted, &actor).expect("tag evicted comment");
+    assert_eq!(retagged, format!("{evicted} /*auditstream='{encoded}'*/"));
+    assert_eq!(
+        decode(&retagged).into_actor().expect("parse"),
+        Some(actor.clone())
+    );
+
+    // Huge trailing whitespace suffix pushing merged comment past 4,096 chars also falls back to append.
+    let huge_suffix = format!(
+        "UPDATE invoice SET status = 'ok' /*traceparent='00-abc'*/{}",
+        " ".repeat(4080)
+    );
+    let huge_suffix_tagged = tag(&huge_suffix, &actor).expect("tag huge suffix");
+    assert_eq!(
+        huge_suffix_tagged,
+        format!("{huge_suffix} /*auditstream='{encoded}'*/")
+    );
+    assert_eq!(
+        decode(&huge_suffix_tagged).into_actor().expect("parse"),
+        Some(actor)
+    );
+}
+
+#[test]
+fn decode_and_tag_reject_star_adjacent_block_comments_matching_pg_resolve_actor() {
+    let actor = Actor::new(ActorType::User, "usr_real");
+    let encoded = encode(&actor).expect("encode usr_real");
+    let fake = encode(&Actor::new(ActorType::User, "usr_spoof")).expect("encode spoof");
+
+    // `RETURNING */*traceparent='00-abc'*/` is valid PG SQL, but `/*` immediately follows `*`,
+    // which PG `resolve_actor()` rejects per spec/transport.md. `tag()` must append a standalone
+    // space-delimited comment rather than merging after `*`.
+    let merge_candidate = "UPDATE invoice SET status = 'ok' RETURNING */*traceparent='00-abc'*/;";
+    let tagged_merge = tag(merge_candidate, &actor).expect("append after star-adjacent comment");
+    assert_eq!(
+        tagged_merge,
+        format!("{merge_candidate} /*auditstream='{encoded}'*/")
+    );
+    assert_eq!(
+        decode(&tagged_merge).into_actor().expect("parse"),
+        Some(actor.clone())
+    );
+
+    // Star-adjacent `/*auditstream='...'*/` must decode as Absent and must not suppress tagging.
+    let star_tagged =
+        format!("UPDATE invoice SET status = 'ok' RETURNING */*auditstream='{fake}'*/;");
+    assert_eq!(decode(&star_tagged), DecodedActor::Absent);
+    let retagged = tag(&star_tagged, &actor).expect("tag star-adjacent auditstream");
+    assert_eq!(
+        retagged,
+        format!("{star_tagged} /*auditstream='{encoded}'*/")
+    );
+    assert_eq!(
+        decode(&retagged).into_actor().expect("parse"),
+        Some(actor.clone())
+    );
+
+    // Exact 4,096-char boundary nested comment `/* /* */*auditstream='...'*/<spaces>` (where `/`
+    // of `*/` is char 4,096 from end and `*` of `*/` is char 4,097) must decode as Absent and must
+    // not suppress tagging.
+    let spoof_after_slash = format!("*auditstream='{fake}'*/");
+    let pad_spaces = " ".repeat(4096 - 1 - spoof_after_slash.len());
+    let boundary_nested =
+        format!("UPDATE invoice SET status = 'ok' /* /* */{spoof_after_slash}{pad_spaces}");
+    assert_eq!(decode(&boundary_nested), DecodedActor::Absent);
+    let tagged_nested = tag(&boundary_nested, &actor).expect("tag boundary nested spoof");
+    assert_eq!(
+        decode(&tagged_nested).into_actor().expect("parse"),
+        Some(actor)
+    );
+}
+
+#[test]
 fn decode_handles_multibyte_chars_across_4096_char_window_and_kit_t4_spoofs() {
     let actor = Actor::new(ActorType::User, "usr_window");
     let encoded = encode(&actor).expect("encode");
@@ -418,12 +768,44 @@ fn arb_context() -> impl Strategy<Value = Context> {
         })
 }
 
+fn arb_sql_fragment() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("UPDATE invoice SET status = 'ok'".to_owned()),
+        Just("UPDATE invoice SET status = 'it''s -- still quoted'".to_owned()),
+        Just(r"UPDATE invoice SET status = E'a\' -- esc'".to_owned()),
+        Just("UPDATE invoice SET status = E'a'\n'b\\' ' || 'x'".to_owned()),
+        Just("UPDATE invoice SET status = $$-- dollar$$".to_owned()),
+        Just("UPDATE invoice SET status = $café$/*not comment*/$café$".to_owned()),
+        Just(r#"UPDATE "col--x" SET status = 'ok'"#.to_owned()),
+        Just("UPDATE invoice SET status = 'ok' /* outer /* inner */ -- nested */".to_owned()),
+        Just("UPDATE invoice SET status = 'ok' -- trailing note".to_owned()),
+        Just(
+            "UPDATE invoice SET status = 'ok' -- /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzQyIn0'*/"
+                .to_owned(),
+        ),
+        Just("UPDATE invoice SET status = 'ok' /*traceparent='00-abc-01'*/;".to_owned()),
+        Just("UPDATE invoice SET status = 'ok' /*route='foo,auditstream=',other='bar'*/".to_owned()),
+        Just("UPDATE invoice SET status = 'ok' /*a_route='foo,auditstream='*/;".to_owned()),
+        Just("UPDATE invoice SET status = 'ok' /*route='O\\'Reilly'*/".to_owned()),
+        Just("UPDATE invoice SET status = 'ok' /* free text ,auditstream='bad' */".to_owned()),
+        Just("UPDATE invoice SET status = 'ok' /*auditstream='!!!bad'*/".to_owned()),
+        Just(format!(
+            "UPDATE invoice SET status = 'ok' /*z_trace='{}'*/;",
+            "z".repeat(4050)
+        )),
+        Just(format!(
+            "UPDATE invoice SET status = 'ok' /*z_trace='{}'*/;",
+            "🚀".repeat(3990)
+        )),
+    ]
+}
+
 proptest! {
     #[test]
     fn round_trips_tag_and_decode_for_any_valid_actor(
         actor in arb_actor(),
         context in proptest::option::of(arb_context()),
-        sql in "(SELECT 1|UPDATE invoice SET status = 'ok'|DELETE FROM line_item WHERE id = 1)"
+        sql in arb_sql_fragment()
     ) {
         let encoded = encode_with_context(&actor, context.as_ref()).expect("valid small actor");
         prop_assert!(!encoded.contains("*/"));
@@ -433,7 +815,33 @@ proptest! {
 
         let tagged = tag_with_context(&sql, &actor, context.as_ref()).expect("tag sql");
         let decoded = decode(&tagged);
-        let parsed = decoded.into_actor().expect("parse decoded actor");
-        prop_assert_eq!(parsed, Some(actor));
+        let expected_ctx = context
+            .as_ref()
+            .map(|c| serde_json::to_value(c).expect("serialize context"));
+        match decoded {
+            DecodedActor::Valid {
+                actor: actual_actor,
+                context: actual_ctx,
+            } => {
+                let parsed: Actor = serde_json::from_value(actual_actor).expect("parse actor");
+                prop_assert_eq!(parsed, actor);
+                prop_assert_eq!(actual_ctx, expected_ctx);
+            }
+            other => prop_assert!(false, "expected Valid, got {other:?} for {tagged:?}"),
+        }
+
+        // Re-tagging an already-tagged statement MUST be idempotent.
+        let other = Actor::new(ActorType::Service, "other_svc");
+        let retagged = tag_with_context(&tagged, &other, None).expect("retag idempotent");
+        prop_assert_eq!(retagged, tagged);
+    }
+
+    #[test]
+    fn decode_and_tag_never_panic_on_arbitrary_utf8_sql(
+        raw_sql in ".*",
+        actor in arb_actor(),
+    ) {
+        let _ = decode(&raw_sql);
+        let _ = tag(&raw_sql, &actor).expect("tag arbitrary utf8");
     }
 }
