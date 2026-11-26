@@ -32,9 +32,9 @@ The cursor file is JSON. `cursor` contains the transaction ID `xact_id` and row 
 
 Use one cursor and output file per export. Rows excluded by filters still advance the cursor, so resuming requires the same filters, format, output path, and effective `export.redaction` policy (use `--from-start` to replay under a new policy). On resume, the CLI trims any bytes beyond the last acknowledged length before appending. It refuses to extend a shortened file. Keep other writers off this output, since recovery discards anything appended after the checkpoint. For stdout, a downstream consumer may receive the last batch again after an interruption.
 
-A sidecar named `<cursor-file>.lock` (mode `0600` on Unix) stays in place between runs. Newly created `--output` files (`.jsonl` or `.csv`) are also created with mode `0600` on Unix so exported row snapshots are not world-readable. The CLI holds its OS lock while exporting and replaces the cursor atomically. Closing the process releases the lock.
+A sidecar named `<cursor-file>.lock` (mode `0600` on Unix; pre-existing lock files are tightened to `0600`) stays in place between runs. Newly created `--output` files (`.jsonl` or `.csv`) are also created with mode `0600` on Unix so exported row snapshots are not world-readable (pre-existing output files keep their permissions). On Unix, `--cursor-file`, `<cursor-file>.lock`, and `--output` reject symbolic links (`O_NOFOLLOW`) to prevent symlink overwrite, truncation, or append attacks. The CLI holds its OS lock while exporting and replaces the cursor atomically. Closing the process releases the lock.
 
-For non-loopback PostgreSQL hosts, pass `sslmode=verify-full` in `AUDITSTREAM_DATABASE_URL` / `--database-url` so exported audit data is encrypted and server certificates are verified; `disable`, `allow`, and `prefer` emit a stderr warning.
+For non-loopback PostgreSQL hosts, pass `sslmode=verify-full` in `AUDITSTREAM_DATABASE_URL` / `--database-url` so exported audit data is encrypted and server certificates are verified; `disable`, `allow`, `prefer`, `require`, and `verify-ca` emit a stderr warning.
 
 ## Export-time redaction
 

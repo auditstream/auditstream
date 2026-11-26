@@ -19,7 +19,7 @@ auditstream [GLOBAL OPTIONS] verify [--format text|json] [--fix]
 | `--format` | `text`, `json` | `text` | Output format written to stdout |
 | `--fix` | — | off | Create missing monthly partitions 3 months ahead before verifying |
 
-When `capture.tables` is absent or empty, `verify` checks installed triggers only and prints a notice on stderr.
+When `capture.tables` is absent or empty, `verify` checks installed triggers, configured `capture.exclude` entries, and audit schema/history security, and prints a notice on stderr.
 
 ## Checks and finding kinds
 
@@ -32,6 +32,8 @@ When `capture.tables` is absent or empty, `verify` checks installed triggers onl
 | `default_partition_rows` | `error` | `changes_default` holds rows, blocking monthly partition attachment |
 | `invalid_exclusion` | `error` | A primary key column is listed in `capture.exclude` or on an installed trigger, nullifying `record_id` |
 | `insufficient_partitions` | `error` | Fewer than 2 contiguous monthly partitions exist ahead of the current UTC month |
+| `unsafe_privileges` | `error` | Unexpected `PUBLIC` or non-owner privileges exist on the audit schema, `changes`, child partitions, `changes_id_seq`, or helper functions |
+| `invalid_ownership` | `error` | Audit schema, `changes`, a child partition, `changes_id_seq`, or a helper function is not owned by `auditstream_owner` |
 
 ## Output
 

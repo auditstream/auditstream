@@ -22,6 +22,7 @@ auditstream init --migrations sql \
 ```
 
 Plain SQL migrations are wrapped in `BEGIN; ... COMMIT;`.
+Keep this transaction wrapper intact: stripping `BEGIN; ... COMMIT;` or executing statements in autocommit mode causes the migration's transaction guard to abort before DDL so lock bounds, ownership reconciliation, and temporary role grants remain atomic.
 
 ## 2. Apply and verify
 

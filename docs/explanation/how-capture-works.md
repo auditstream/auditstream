@@ -52,13 +52,13 @@ Do not place names, emails, or personal data in actor fields unless your project
 
 ## Security model and bypasses
 
-- The `auditstream` schema, `auditstream.changes`, and helper functions are owned by a dedicated `NOLOGIN` role (`auditstream_owner`).
-- Trigger functions and `auditstream.log_event()` execute as `SECURITY DEFINER` with `SET search_path = pg_catalog, pg_temp` and schema-qualified names.
-- Application roles receive `SELECT` on `auditstream.changes` and `EXECUTE` on `auditstream.log_event()`, with no direct write grants.
-- On managed PostgreSQL 16 and newer, migrations self-grant `auditstream_owner` temporarily when `CREATEROLE` lacks `USAGE`, then revoke it.
+- The `auditstream` schema, `auditstream.changes`, all child partitions, `changes_id_seq`, and helper functions are owned by a dedicated `NOLOGIN` role (`auditstream_owner`).
+- Trigger functions and `auditstream.log_event()` execute as `SECURITY DEFINER` with `SET search_path = pg_catalog, pg_temp` and schema-qualified names. `auditstream.capture()` also checks `pg_partition_ancestors(TG_RELID)` so triggers attached to unrelated tables cannot forge `source = 'db'` rows.
+- Migrations and partition maintenance sanitize ACLs with `CASCADE` to neutralize permissive `ALTER DEFAULT PRIVILEGES` rules; application roles receive only `SELECT` on `auditstream.changes` and `EXECUTE` on `auditstream.log_event()`, with no direct write or `GRANT OPTION` privileges and no non-owner grants on child partitions or `changes_id_seq`.
+- On managed PostgreSQL 16 and newer, migrations temporarily self-grant only the missing `INHERIT` / `SET` options on `auditstream_owner` inside the migration transaction, then revoke them before committing.
 
 Triggers can still be bypassed by superusers or roles running `SET session_replication_role = replica`, or by disabling or dropping triggers.
-Run [`auditstream verify`](../reference/cli/verify.md) in CI and on a schedule to detect missing, disabled, or outdated triggers.
+Run [`auditstream verify`](../reference/cli/verify.md) in CI and on a schedule to detect missing, disabled, or outdated triggers, primary-key exclusions, unsafe privileges, and ownership drift.
 
 ## Write overhead
 
