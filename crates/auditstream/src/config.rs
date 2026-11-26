@@ -240,18 +240,12 @@ enum TailRegion {
     Fragment,
 }
 
-struct TailAtScan {
-    best_authority_at: Option<usize>,
-    fallback_non_query_at: Option<usize>,
-}
-
 struct TailAtScanner {
     authority_shape: AuthorityShape,
     has_nonempty_path: bool,
     path_has_colon: bool,
     region: TailRegion,
     best_authority_at: Option<usize>,
-    fallback_non_query_at: Option<usize>,
 }
 
 impl TailAtScanner {
@@ -272,7 +266,6 @@ impl TailAtScanner {
             path_has_colon: false,
             region: TailRegion::Path { seen_at: false },
             best_authority_at: None,
-            fallback_non_query_at: None,
         }
     }
 
@@ -312,17 +305,15 @@ impl TailAtScanner {
         let has_following_at = host_end < bytes.len() && bytes[host_end] == b'@';
         let host = &after[..rel_end];
         let after_delim = bytes.get(host_end).copied();
-        let valid_host = !has_following_at && !host.is_empty() && is_host_port_authority(host);
-
-        // Only rescue empty-host Unix-socket URIs (e.g. `app:p1/p2@/prod?host=/var/run/pg`) on
-        // malformed authorities; invalid non-empty hosts must fail closed.
-        if !matches!(self.region, TailRegion::Query { pair_has_eq: true })
-            && !has_following_at
-            && host.is_empty()
-            && matches!(after_delim, Some(b'/' | b'?'))
-        {
-            self.fallback_non_query_at = Some(authority_end + idx);
-        }
+        // Treat empty-host Unix-socket authorities (`@/db` / `@?host=...`) as valid hosts
+        // subject to `qualifies`, while rejecting invalid non-empty hosts so malformed URIs
+        // fail closed.
+        let valid_host = !has_following_at
+            && if host.is_empty() {
+                matches!(after_delim, Some(b'/' | b'?'))
+            } else {
+                is_host_port_authority(host)
+            };
 
         if valid_host && self.qualifies(host, after_delim) {
             self.best_authority_at = Some(authority_end + idx);
@@ -338,7 +329,7 @@ fn scan_tail_at_candidates(
     authority_end: usize,
     tail: &str,
     malformed_authority: bool,
-) -> TailAtScan {
+) -> Option<usize> {
     let mut scanner = TailAtScanner::new(authority, tail, malformed_authority);
     for (idx, &byte) in tail.as_bytes().iter().enumerate() {
         match byte {
@@ -359,10 +350,7 @@ fn scan_tail_at_candidates(
             _ => {}
         }
     }
-    TailAtScan {
-        best_authority_at: scanner.best_authority_at,
-        fallback_non_query_at: scanner.fallback_non_query_at,
-    }
+    scanner.best_authority_at
 }
 
 fn append_redacted_query_pair(out: &mut String, mut pair: &str) {
@@ -424,9 +412,10 @@ fn redact_uri_password(raw: &str, scheme_end: usize, sep_len: usize) -> String {
         .rfind('@')
         .map_or(authority, |at| &authority[at + 1..]);
     let malformed_authority = !is_host_port_authority(authority_host);
-    let scan = scan_tail_at_candidates(authority, authority_end, tail, malformed_authority);
-    if malformed_authority || scan.best_authority_at.is_some() {
-        if let Some(later_at) = scan.best_authority_at.or(scan.fallback_non_query_at) {
+    let best_authority_at =
+        scan_tail_at_candidates(authority, authority_end, tail, malformed_authority);
+    if malformed_authority || best_authority_at.is_some() {
+        if let Some(later_at) = best_authority_at {
             let after_at = &rest[later_at + 1..];
             let host_end = after_at.find(['/', '?', '#']).unwrap_or(after_at.len());
             let new_end = later_at + 1 + host_end;
@@ -463,6 +452,18 @@ fn advance_escaped(raw: &str, backslash_idx: usize) -> usize {
         .chars()
         .next()
         .map_or(raw.len(), |ch| after_slash + ch.len_utf8())
+}
+
+fn ends_with_secret_eq(inner: &str) -> bool {
+    let Some(before_eq) = inner.trim_end_matches(is_libpq_ws_char).strip_suffix('=') else {
+        return false;
+    };
+    let trimmed = before_eq.trim_end_matches(is_libpq_ws_char);
+    let key_start = trimmed
+        .bytes()
+        .rposition(|b| is_libpq_whitespace(b) || matches!(b, b'=' | b'\''))
+        .map_or(0, |pos| pos + 1);
+    is_secret_pg_param(&trimmed[key_start..])
 }
 
 fn starts_with_secret_kv(rest: &str) -> bool {
@@ -603,20 +604,21 @@ fn redact_libpq_kv_password(raw: &str) -> String {
                 out.push_str("***");
             } else if closed && (i >= len || is_libpq_whitespace(bytes[i])) {
                 out.push_str(&raw[val_start..i]);
-            } else if closed && starts_with_secret_kv(&raw[i..]) {
-                // Adjacent secret parameter immediately follows a closing quote (e.g.
-                // `host='localhost'password=SECRET` or a misaligned quote right before
-                // `password=...`); redact the inner span (which has no unescaped `'`, so
-                // recursion depth is at most 1) and keep `i` positioned at the secret key.
+            } else if closed && ends_with_secret_eq(&raw[val_start + 1..i - 1]) {
+                // Misaligned quote opened right before a quoted secret (e.g.
+                // `application_name='broken password='SECRET'` or
+                // `application_name='broken password='s3cr3t=='`); rewind so `password='...'`
+                // is parsed as a secret quoted value.
+                out.push('\'');
+                i = val_start + 1;
+            } else if closed {
+                // Adjacent parameter after a closing quote (e.g. `host='localhost'password=...`
+                // or `options='-c search_path='dbname=prod password=...`) or misaligned quote
+                // ending at a non-secret quote: redact the inner span in isolation (depth <= 1,
+                // no unescaped `'`) and keep `i` positioned after the closing quote.
                 out.push('\'');
                 out.push_str(&redact_libpq_kv_password(&raw[val_start + 1..i - 1]));
                 out.push('\'');
-            } else if closed {
-                // Misaligned quote (e.g. `application_name='broken password='SECRET'` or
-                // `application_name='broken password='s3cr3t=='`) must not swallow a following
-                // secret parameter.
-                out.push('\'');
-                i = val_start + 1;
             } else {
                 // Unclosed quote in a non-secret value must not swallow a following `password=...`.
                 out.push('\'');
@@ -1265,6 +1267,11 @@ batch_size = 250
             format!("{scheme}app:p1/p2@p3:{pw1}"),
             format!("{scheme}app:p1/p2@#{pw1}"),
             format!("{scheme}app:p1/{pw1}@/prod?host=/var/run/postgresql"),
+            format!("{scheme}app:1234/{pw1}@/prod?host=/var/run/postgresql"),
+            format!("{scheme}app:p1@p2/{pw1}@/prod?host=/var/run/postgresql"),
+            format!("{scheme}app:p1@p2/{pw1}@?host=/var/run/postgresql"),
+            format!("{scheme}app:1234?{pw1}@/prod?host=/var/run/postgresql"),
+            format!("{scheme}app:1234#{pw1}@/prod?host=/var/run/postgresql"),
             format!("{scheme}app:1234/{pw1}@db.example.com"),
             format!("{scheme}app:1234/{pw1}@localhost"),
             format!("{scheme}app:1234/{pw1}@host1,host2"),
@@ -1321,6 +1328,7 @@ batch_size = 250
             format!("{scheme}db.example.com/prod?application_name=svc:1#ops@corp.com"),
             format!("{scheme}db.example.com:5432/prod@v2"),
             format!("{scheme}db.example.com:5432/prod@v2?sslmode=verify-full"),
+            format!("{scheme}db.example.com:5432/prod@?sslmode=verify-full"),
             format!("{scheme}app@db.example.com:5432/prod@v2?sslmode=verify-full"),
             format!("{scheme}db.example.com:5432/prod?application_name=worker@node1:8080"),
             format!("{scheme}db.example.com:5432/prod?application_name=ops@corp.com/team"),
@@ -1383,6 +1391,17 @@ batch_size = 250
             format!(
                 "host=db.example.com options='-c search_path=public'dbname='prod'password={pw1}"
             ),
+            format!(
+                "host=db.example.com options='-c search_path='dbname=prod password=' {pw1}' sslmode=verify-full"
+            ),
+            format!(
+                "host=db.example.com options='-c search_path='dbname=prod password={pw1}' sslmode=verify-full"
+            ),
+            format!(
+                "host=db.example.com options='-c search_path='dbname=prod password={pw1} application_name=ops'"
+            ),
+            format!("host=db.example.com options='-c search_path='password='{pw1}' dbname=prod"),
+            format!("application_name='broken password={pw1} sslpassword='{pw2}' dbname=prod"),
             format!("host=db.example.com application_name='env=prod'dbname='app'password={pw1}"),
             format!("application_name='broken k=v'x'password={pw1}"),
             format!(
