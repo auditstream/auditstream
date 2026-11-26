@@ -83,7 +83,7 @@ fully supported for application queries.
 When writing a new migration, `init` creates `auditstream.toml` (or the `--config` path) if it does not exist.
 When the file already exists, `init` updates only `[capture]` and `[migrations]` using `toml_edit`.
 Comments, formatting, `schema`, and `[export]` remain untouched.
-`init` replaces the file atomically through an exclusively created temporary file with mode `0600` on Unix so restrictive permissions are preserved and `auditstream.toml` is never written world-readable.
+`init` rejects symbolic links at `auditstream.toml` / `--config` and replaces the file atomically through an exclusively created temporary file with mode `0600` on Unix so restrictive permissions are preserved and `auditstream.toml` is never written world-readable.
 `init` never writes `database_url` or any secret into `auditstream.toml`.
 
 ## Validation and re-run behavior
@@ -91,7 +91,7 @@ Comments, formatting, `schema`, and `[export]` remain untouched.
 - **No tables selected:** Lists all introspected user tables on stderr and exits `2`.
 - **Unknown schema, table, or column:** Names the invalid entry on stderr and exits `2`.
 - **Primary key column in `--exclude` / `capture.exclude`:** Rejected on stderr with exit code `2`, because primary key columns are required to build `record_id`.
-- `init` compares the selection and a digest of the generated function and trigger definitions against the newest Auditstream migration in `--out`. When both match, it prints `up to date` on stderr and exits `0`.
+- `init` compares the selection and a digest of the generated DDL, ACL, function, and trigger definitions against the newest Auditstream migration in `--out`. When both match, it prints `up to date` on stderr and exits `0`.
 - When upgrading from v0.1.0, run `auditstream init` in the project with its existing migrations, apply the new migration with your usual migration tool, then run `auditstream verify`. The v0.1.0 manifest has no digest, so the first run writes a refresh migration even with the same selection. It preserves recorded history.
 - **Changed selection:** Leaves earlier migrations byte-identical and writes one new migration. Removed tables receive `DROP TRIGGER IF EXISTS` statements while keeping their recorded history.
 
