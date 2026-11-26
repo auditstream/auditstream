@@ -28,31 +28,48 @@
     },
     "schema_name": {
       "type": ["string", "null"],
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "^[^\\u0000]+$"
     },
     "table_name": {
       "type": ["string", "null"],
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "^[^\\u0000]+$"
     },
     "op": {
       "type": "string",
       "minLength": 1,
-      "maxLength": 64
+      "maxLength": 64,
+      "pattern": "^[^\\u0000]+$"
     },
     "record_id": {
-      "type": ["object", "null"]
+      "type": ["object", "null"],
+      "allOf": [
+        {
+          "$ref": "#/$defs/noNulValue"
+        }
+      ]
     },
     "before": {
-      "type": ["object", "null"]
+      "type": ["object", "null"],
+      "allOf": [
+        {
+          "$ref": "#/$defs/noNulValue"
+        }
+      ]
     },
     "after": {
-      "type": ["object", "null"]
+      "type": ["object", "null"],
+      "allOf": [
+        {
+          "$ref": "#/$defs/noNulValue"
+        }
+      ]
     },
     "changed": {
       "type": ["array", "null"],
       "items": {
-        "type": "string",
-        "minLength": 1
+        "$ref": "#/$defs/nonEmptyString"
       }
     },
     "actor": {
@@ -131,8 +148,7 @@
       "enum": ["set_config", "comment", "jwt", "invalid", null]
     },
     "db_user": {
-      "type": "string",
-      "minLength": 1
+      "$ref": "#/$defs/nonEmptyString"
     },
     "schema_version": {
       "type": "integer",

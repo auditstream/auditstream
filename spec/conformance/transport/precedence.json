@@ -251,6 +251,37 @@
         "context": null,
         "actor_source": "invalid"
       }
+    },
+    {
+      "name": "set-config-escaped-backslash-before-u0000-valid",
+      "description": "set_config with an escaped backslash followed by literal u0000 (\\\\u0000 in JSON) is valid and MUST resolve as set_config.",
+      "input": {
+        "sql": "UPDATE invoice SET total=55 WHERE id=2;",
+        "set_config": "{\"type\":\"user\",\"id\":\"u\\\\u00001\"}",
+        "jwt_claims": null
+      },
+      "expected": {
+        "actor": {
+          "type": "user",
+          "id": "u\\u00001"
+        },
+        "context": null,
+        "actor_source": "set_config"
+      }
+    },
+    {
+      "name": "set-config-escaped-backslash-plus-nul-invalid",
+      "description": "set_config with an escaped backslash followed by a real \\u0000 escape (\\\\\\u0000 in JSON) MUST yield invalid.",
+      "input": {
+        "sql": "UPDATE invoice SET total=55 WHERE id=2;",
+        "set_config": "{\"type\":\"user\",\"id\":\"u\\\\\\u00001\"}",
+        "jwt_claims": null
+      },
+      "expected": {
+        "actor": null,
+        "context": null,
+        "actor_source": "invalid"
+      }
     }
   ]
 }
