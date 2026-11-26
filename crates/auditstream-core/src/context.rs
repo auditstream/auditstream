@@ -2,10 +2,11 @@
 
 use std::fmt;
 
-use serde::de::{self, IgnoredAny, MapAccess, Visitor};
+use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::CoreError;
+use crate::actor::NoNulIgnoredAny;
 
 /// Optional request or execution context carried alongside an actor payload.
 ///
@@ -98,61 +99,38 @@ impl<'de> Deserialize<'de> for Context {
                         ));
                     }
                     match key.as_str() {
-                        "requestId" => {
-                            let value: String = map.next_value()?;
-                            if value.is_empty() {
-                                return Err(de::Error::custom(
-                                    "context.requestId must not be empty",
-                                ));
-                            }
-                            if value.contains('\0') {
-                                return Err(de::Error::custom(
-                                    "context.requestId must not contain NUL characters",
-                                ));
-                            }
-                            request_id = Some(value);
-                        }
-                        "source" => {
-                            let value: String = map.next_value()?;
-                            if value.is_empty() {
-                                return Err(de::Error::custom("context.source must not be empty"));
-                            }
-                            if value.contains('\0') {
-                                return Err(de::Error::custom(
-                                    "context.source must not contain NUL characters",
-                                ));
-                            }
-                            source = Some(value);
-                        }
-                        "ip" => {
-                            let value: String = map.next_value()?;
-                            if value.is_empty() {
-                                return Err(de::Error::custom("context.ip must not be empty"));
-                            }
-                            if value.contains('\0') {
-                                return Err(de::Error::custom(
-                                    "context.ip must not contain NUL characters",
-                                ));
-                            }
-                            ip = Some(value);
-                        }
-                        "userAgent" => {
-                            let value: String = map.next_value()?;
-                            if value.is_empty() {
-                                return Err(de::Error::custom(
-                                    "context.userAgent must not be empty",
-                                ));
-                            }
-                            if value.contains('\0') {
-                                return Err(de::Error::custom(
-                                    "context.userAgent must not contain NUL characters",
-                                ));
-                            }
-                            user_agent = Some(value);
-                        }
-                        // Readers MUST ignore unknown keys for forward compatibility (spec/actor.md).
+                        "requestId" => parse_unique_context_field(
+                            &mut request_id,
+                            "requestId",
+                            "context.requestId must not be empty",
+                            "context.requestId must not contain NUL characters",
+                            &mut map,
+                        )?,
+                        "source" => parse_unique_context_field(
+                            &mut source,
+                            "source",
+                            "context.source must not be empty",
+                            "context.source must not contain NUL characters",
+                            &mut map,
+                        )?,
+                        "ip" => parse_unique_context_field(
+                            &mut ip,
+                            "ip",
+                            "context.ip must not be empty",
+                            "context.ip must not contain NUL characters",
+                            &mut map,
+                        )?,
+                        "userAgent" => parse_unique_context_field(
+                            &mut user_agent,
+                            "userAgent",
+                            "context.userAgent must not be empty",
+                            "context.userAgent must not contain NUL characters",
+                            &mut map,
+                        )?,
+                        // Readers MUST ignore unknown keys for forward compatibility (spec/actor.md),
+                        // while still rejecting NUL characters inside nested strings and keys.
                         _ => {
-                            let _: IgnoredAny = map.next_value()?;
+                            let _: NoNulIgnoredAny = map.next_value()?;
                         }
                     }
                 }
@@ -168,4 +146,28 @@ impl<'de> Deserialize<'de> for Context {
 
         deserializer.deserialize_map(ContextVisitor)
     }
+}
+
+fn parse_unique_context_field<'de, A>(
+    slot: &mut Option<String>,
+    field: &'static str,
+    empty_msg: &'static str,
+    nul_msg: &'static str,
+    map: &mut A,
+) -> Result<(), A::Error>
+where
+    A: MapAccess<'de>,
+{
+    if slot.is_some() {
+        return Err(de::Error::duplicate_field(field));
+    }
+    let value: String = map.next_value()?;
+    if value.is_empty() {
+        return Err(de::Error::custom(empty_msg));
+    }
+    if value.contains('\0') {
+        return Err(de::Error::custom(nul_msg));
+    }
+    *slot = Some(value);
+    Ok(())
 }

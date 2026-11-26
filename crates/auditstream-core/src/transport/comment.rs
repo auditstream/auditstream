@@ -182,23 +182,33 @@ fn is_valid_context_object(value: &Value) -> bool {
         .all(|key| is_valid_optional_non_empty_string(ctx, key))
 }
 
-/// Returns `true` if `root` contains a NUL (`U+0000`) character in any JSON string value
-/// or object key. Iterative to avoid stack overflow on deeply nested untrusted payloads.
-pub(crate) fn json_contains_nul(root: &Value) -> bool {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        match node {
-            Value::String(s) if s.contains('\0') => return true,
-            Value::Array(items) => stack.extend(items),
-            Value::Object(map) => {
-                for (key, value) in map {
-                    if key.contains('\0') {
-                        return true;
-                    }
-                    stack.push(value);
-                }
+/// Returns `true` if a syntactically valid JSON text `raw` contains a raw NUL byte (`0x00`)
+/// or an unescaped `\u0000` escape inside any JSON string literal (object key or string value).
+///
+/// Scanning the raw JSON text rather than only the deduplicated `serde_json::Value` tree catches
+/// `\u0000` even inside overwritten duplicate object keys, matching PostgreSQL's `::jsonb` lexer
+/// (`SQLSTATE 22P05`) without heap allocations. Escaped backslashes (`\\u0000`) are skipped cleanly.
+pub(crate) fn raw_json_contains_nul(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut in_string = false;
+
+    while i < len {
+        match bytes[i] {
+            0 => return true,
+            b'"' => {
+                in_string = !in_string;
+                i += 1;
             }
-            _ => {}
+            b'\\' if in_string => {
+                if bytes.get(i + 1..i + 6) == Some(b"u0000") {
+                    return true;
+                }
+                // Advance past the escaped byte so `\\u0000` is treated as literal `\` + `u0000`.
+                i = (i + 2).min(len);
+            }
+            _ => i += 1,
         }
     }
     false
@@ -209,16 +219,13 @@ pub(crate) fn json_contains_nul(root: &Value) -> bool {
 /// single-level `onBehalfOf`, optional `context` object with non-empty known fields, and no
 /// NUL characters (`U+0000`) anywhere in the payload.
 pub(crate) fn parse_trigger_actor_json(raw_json: &str) -> DecodedActor {
-    if raw_json.len() > MAX_PAYLOAD_BYTES || raw_json.contains('\0') {
+    if raw_json.len() > MAX_PAYLOAD_BYTES || raw_json_contains_nul(raw_json) {
         return DecodedActor::Invalid;
     }
 
     let Ok(val) = serde_json::from_str::<Value>(raw_json) else {
         return DecodedActor::Invalid;
     };
-    if !val.is_object() || json_contains_nul(&val) {
-        return DecodedActor::Invalid;
-    }
     let Value::Object(mut map) = val else {
         return DecodedActor::Invalid;
     };

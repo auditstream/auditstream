@@ -139,6 +139,88 @@ where
     Ok(())
 }
 
+/// Discards an unknown forward-compatible JSON value while still rejecting NUL (`U+0000`)
+/// characters anywhere inside nested strings, arrays, or object keys/values (`spec/actor.md`).
+pub(crate) struct NoNulIgnoredAny;
+
+impl<'de> Deserialize<'de> for NoNulIgnoredAny {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct NoNulIgnoredVisitor;
+
+        impl<'de> Visitor<'de> for NoNulIgnoredVisitor {
+            type Value = NoNulIgnoredAny;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("any JSON value without NUL characters")
+            }
+
+            fn visit_bool<E>(self, _v: bool) -> Result<Self::Value, E> {
+                Ok(NoNulIgnoredAny)
+            }
+
+            fn visit_i64<E>(self, _v: i64) -> Result<Self::Value, E> {
+                Ok(NoNulIgnoredAny)
+            }
+
+            fn visit_u64<E>(self, _v: u64) -> Result<Self::Value, E> {
+                Ok(NoNulIgnoredAny)
+            }
+
+            fn visit_f64<E>(self, _v: f64) -> Result<Self::Value, E> {
+                Ok(NoNulIgnoredAny)
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if v.contains('\0') {
+                    return Err(de::Error::custom(
+                        "payload string values must not contain NUL characters",
+                    ));
+                }
+                Ok(NoNulIgnoredAny)
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(NoNulIgnoredAny)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(NoNulIgnoredAny)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                while seq.next_element::<NoNulIgnoredAny>()?.is_some() {}
+                Ok(NoNulIgnoredAny)
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                while let Some(key) = map.next_key::<String>()? {
+                    if key.contains('\0') {
+                        return Err(de::Error::custom(
+                            "payload object keys must not contain NUL characters",
+                        ));
+                    }
+                    let _: NoNulIgnoredAny = map.next_value()?;
+                }
+                Ok(NoNulIgnoredAny)
+            }
+        }
+
+        deserializer.deserialize_any(NoNulIgnoredVisitor)
+    }
+}
+
 fn parse_actor_map<'de, A>(mut map: A, kind: ActorMapKind) -> Result<ParsedActorMap, A::Error>
 where
     A: MapAccess<'de>,
@@ -191,7 +273,7 @@ where
                 parse_unique_field(&mut context, "context", &mut map)?;
             }
             _ => {
-                let _: IgnoredAny = map.next_value()?;
+                let _: NoNulIgnoredAny = map.next_value()?;
             }
         }
     }

@@ -211,22 +211,82 @@ fn actor_and_context_reject_nul_characters_across_all_fields() {
             "expected NullByteInField({expected_field}), got {err:?}"
         );
     }
+}
 
-    // Deserialization must also reject NUL characters in keys or string fields.
+#[test]
+fn deserialization_and_op_reject_nul_characters() {
+    // Deserialization must also reject NUL characters in keys, known fields, or unknown values.
     assert!(serde_json::from_str::<Actor>(r#"{"type":"user","id":"u\u00001"}"#).is_err());
     assert!(
         serde_json::from_str::<Actor>(r#"{"type":"user","id":"u1","bad\u0000key":1}"#).is_err()
     );
+    assert!(
+        serde_json::from_str::<Actor>(r#"{"type":"user","id":"u1","extra":"a\u0000b"}"#).is_err()
+    );
+    assert!(
+        serde_json::from_str::<Actor>(
+            r#"{"type":"user","id":"u1","context":{"requestId":"r\u00001"}}"#
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_str::<ActorPayload>(
+            r#"{"type":"user","id":"u1","extra":{"bad\u0000k":"v"}}"#
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_str::<ActorPayload>(r#"{"type":"user","id":"u1","extra":["a\u0000b"]}"#)
+            .is_err()
+    );
+    assert!(
+        serde_json::from_str::<NestedActor>(r#"{"type":"user","id":"u2","extra":"a\u0000b"}"#)
+            .is_err()
+    );
     assert!(serde_json::from_str::<Context>(r#"{"requestId":"r\u00001"}"#).is_err());
     assert!(serde_json::from_str::<Context>(r#"{"bad\u0000key":"v"}"#).is_err());
+    assert!(serde_json::from_str::<Context>(r#"{"extra":"a\u0000b"}"#).is_err());
+    assert!(serde_json::from_str::<Context>(r#"{"requestId":"r1","requestId":"r2"}"#).is_err());
 
-    // JSON schemas also reject NUL characters.
+    // Application event action must also reject NUL characters.
+    assert!(matches!(
+        Op::app("invoice\0exported"),
+        Err(CoreError::NullByteInField { field: "action" })
+    ));
+}
+
+#[test]
+fn actor_schema_rejects_nul_in_keys_and_nested_values_while_allowing_escaped_backslash() {
     let actor_validator = load_schema("schemas/actor.schema.json");
-    assert!(!actor_validator.is_valid(&serde_json::json!({"type": "user", "id": "u\u{0000}1"})));
-    assert!(!actor_validator.is_valid(&serde_json::json!({
+    for invalid in [
+        serde_json::json!({"type": "user", "id": "u\u{0000}1"}),
+        serde_json::json!({"type": "user", "id": "u1", "bad\u{0000}key": 1}),
+        serde_json::json!({"type": "user", "id": "u1", "extra": "a\u{0000}b"}),
+        serde_json::json!({
+            "type": "ai_agent",
+            "id": "a1",
+            "onBehalfOf": {"type": "user", "id": "u2", "extra": "a\u{0000}b"}
+        }),
+        serde_json::json!({
+            "type": "user",
+            "id": "u1",
+            "context": {"requestId": "r\u{0000}1"}
+        }),
+        serde_json::json!({
+            "type": "user",
+            "id": "u1",
+            "context": {"extra": ["a\u{0000}b"], "nested": {"k\u{0000}1": "v"}}
+        }),
+    ] {
+        assert!(
+            !actor_validator.is_valid(&invalid),
+            "actor.schema.json must reject {invalid}"
+        );
+    }
+    assert!(actor_validator.is_valid(&serde_json::json!({
         "type": "user",
-        "id": "u1",
-        "context": {"requestId": "r\u{0000}1"}
+        "id": "usuário\\u0000\n🚀",
+        "extra": {"empty": "", "list": [1, true, null, "ok"]}
     })));
 }
 
@@ -345,6 +405,29 @@ fn event_preserves_arbitrary_precision_numeric_and_validates_against_event_schem
         !validator.is_valid(&bad_obo),
         "event.schema.json must reject unknown actor.onBehalfOf.type"
     );
+    for (field, payload) in [
+        (
+            "actor",
+            serde_json::json!({"type": "user", "id": "u\u{0000}1"}),
+        ),
+        (
+            "actor",
+            serde_json::json!({"type": "user", "id": "u1", "bad\u{0000}k": 1}),
+        ),
+        (
+            "actor",
+            serde_json::json!({"type": "user", "id": "u1", "extra": "a\u{0000}b"}),
+        ),
+        ("context", serde_json::json!({"requestId": "r\u{0000}1"})),
+        ("context", serde_json::json!({"extra": ["a\u{0000}b"]})),
+    ] {
+        let mut bad_nul = value.clone();
+        bad_nul[field] = payload;
+        assert!(
+            !validator.is_valid(&bad_nul),
+            "event.schema.json must reject NUL in {field}: {bad_nul}"
+        );
+    }
 
     let round_tripped: Event = serde_json::from_str(&serialized).expect("deserialize event");
     assert_eq!(round_tripped, event);
@@ -372,6 +455,41 @@ fn cursor_orders_by_xact_id_then_id_and_batch_holds_cursor() {
     assert!(empty.is_empty());
     assert_eq!(empty.len(), 0);
     assert_eq!(empty.cursor, None);
+}
+
+fn assert_invalid_actor_examples(actor_validator: &jsonschema::Validator) {
+    let actor_invalid_dir = spec_dir().join("schemas/examples/actor/invalid");
+    let mut actor_invalid_count = 0usize;
+    for entry in fs::read_dir(&actor_invalid_dir).expect("read actor/invalid") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = fs::read_to_string(&path).expect("read invalid actor example");
+        let ok = serde_json::from_str::<ActorPayload>(&raw)
+            .ok()
+            .and_then(|p| p.validate().ok())
+            .is_some();
+        assert!(
+            !ok,
+            "invalid actor example {} unexpectedly passed",
+            path.display()
+        );
+        if let Ok(val) = serde_json::from_str::<Value>(&raw)
+            && !path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("oversized"))
+        {
+            assert!(
+                !actor_validator.is_valid(&val),
+                "invalid actor example {} unexpectedly passed actor.schema.json",
+                path.display()
+            );
+        }
+        actor_invalid_count += 1;
+    }
+    assert!(actor_invalid_count >= 7);
 }
 
 #[test]
@@ -416,27 +534,8 @@ fn deserializes_every_spec_example_and_validates_schemas_on_disk() {
     }
     assert!(actor_valid_count >= 7);
 
-    // Every invalid actor example on disk must fail deserialization or validation.
-    let actor_invalid_dir = spec_dir().join("schemas/examples/actor/invalid");
-    let mut actor_invalid_count = 0usize;
-    for entry in fs::read_dir(&actor_invalid_dir).expect("read actor/invalid") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
-        let raw = fs::read_to_string(&path).expect("read invalid actor example");
-        let ok = serde_json::from_str::<ActorPayload>(&raw)
-            .ok()
-            .and_then(|p| p.validate().ok())
-            .is_some();
-        assert!(
-            !ok,
-            "invalid actor example {} unexpectedly passed",
-            path.display()
-        );
-        actor_invalid_count += 1;
-    }
-    assert!(actor_invalid_count >= 7);
+    // Every invalid actor example on disk must fail deserialization, validation, and actor.schema.json.
+    assert_invalid_actor_examples(&actor_validator);
 
     // Every valid event example on disk.
     let event_valid_dir = spec_dir().join("schemas/examples/event/valid");

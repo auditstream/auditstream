@@ -77,7 +77,7 @@ pub fn resolve_precedence(
     }
 
     if let Some(claims_str) = jwt_claims_raw.filter(|s| !s.is_empty()) {
-        if claims_str.contains('\0') {
+        if comment::raw_json_contains_nul(claims_str) {
             return ResolvedActor {
                 actor: None,
                 context: None,
@@ -91,13 +91,6 @@ pub fn resolve_precedence(
                 actor_source: Some(ActorSource::Invalid),
             };
         };
-        if !claims_val.is_object() || comment::json_contains_nul(&claims_val) {
-            return ResolvedActor {
-                actor: None,
-                context: None,
-                actor_source: Some(ActorSource::Invalid),
-            };
-        }
         let Value::Object(claims) = claims_val else {
             return ResolvedActor {
                 actor: None,

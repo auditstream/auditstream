@@ -9,6 +9,7 @@ pub type BoxError = Box<dyn StdError + Send + Sync + 'static>;
 
 /// Errors returned when constructing or validating Auditstream domain types.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum CoreError {
     /// Actor `id` was empty.
     #[error("actor id must not be empty")]
