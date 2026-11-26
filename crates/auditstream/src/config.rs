@@ -142,8 +142,21 @@ fn strip_whatwg_ascii_tabs_newlines(trimmed: &str) -> std::borrow::Cow<'_, str> 
     }
 }
 
+const fn is_libpq_whitespace(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || byte == b'\x0b'
+}
+
+const fn is_libpq_ws_char(ch: char) -> bool {
+    ch.is_ascii_whitespace() || ch == '\x0b'
+}
+
 fn redact_url_password(raw: &str) -> String {
-    let trimmed = raw.trim_matches(|c: char| c <= ' ');
+    // Run libpq KV redaction against the raw whitespace-preserving input first so single-token
+    // (`password=...`), vertical-tab (`\x0b`), and mixed whitespace-separated tokens
+    // (`foo:bar\tpassword=...`, `postgresql://db/prod\tpassword=...`,
+    // `postgresql: host=localhost\tpassword=...`) are always masked before WHATWG stripping.
+    let kv_redacted = redact_libpq_kv_password(raw);
+    let trimmed = kv_redacted.trim_matches(|c: char| c <= ' ');
     let normalized = strip_whatwg_ascii_tabs_newlines(trimmed);
     if let Some(scheme_end) = normalized.find("://")
         && is_valid_uri_scheme(&normalized[..scheme_end])
@@ -151,48 +164,80 @@ fn redact_url_password(raw: &str) -> String {
         return redact_uri_password(&normalized, scheme_end, 3);
     }
 
-    // Run libpq KV redaction against the raw whitespace-preserving input first so single-token
-    // (`password=...`) and tab/newline-separated tokens (`foo:bar\tpassword=...`,
-    // `postgresql: host=localhost\tpassword=...`) are always masked before URI normalization.
-    let kv_redacted = redact_libpq_kv_password(raw);
-    let kv_trimmed = kv_redacted.trim_matches(|c: char| c <= ' ');
-    let kv_normalized = strip_whatwg_ascii_tabs_newlines(kv_trimmed);
-    if let Some(scheme_end) = kv_normalized.find(':') {
-        let scheme = &kv_normalized[..scheme_end];
+    if let Some(scheme_end) = normalized.find(':') {
+        let scheme = &normalized[..scheme_end];
         if (scheme.eq_ignore_ascii_case("postgres") || scheme.eq_ignore_ascii_case("postgresql"))
-            && kv_normalized[scheme_end + 1..].contains(['?', '@', ':'])
+            && normalized[scheme_end + 1..].contains(['?', '@', ':'])
         {
-            return redact_uri_password(&kv_normalized, scheme_end, 1);
+            return redact_uri_password(&normalized, scheme_end, 1);
         }
     }
     kv_redacted
 }
 
+fn is_valid_port(port: &str) -> bool {
+    !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
+}
+
+fn is_valid_ipv6_literal(addr: &str) -> bool {
+    let (ip_part, zone_ok) = match addr.split_once('%') {
+        Some((ip, zone)) => (
+            ip,
+            !zone.is_empty()
+                && zone
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'%' | b'.' | b'-' | b'_')),
+        ),
+        None => (addr, true),
+    };
+    zone_ok && ip_part.parse::<std::net::Ipv6Addr>().is_ok()
+}
+
 fn is_host_port_authority(authority: &str) -> bool {
     authority.split(',').all(|segment| {
+        if segment
+            .bytes()
+            .any(|b| is_libpq_whitespace(b) || matches!(b, b'=' | b'&'))
+        {
+            return false;
+        }
         if let Some(rest) = segment.strip_prefix('[') {
             match rest.split_once(']') {
-                Some((_, "")) => true,
-                Some((_, port_part)) => port_part
-                    .strip_prefix(':')
-                    .is_some_and(|p| !p.is_empty() && p.parse::<u16>().is_ok()),
+                Some((addr, "")) => is_valid_ipv6_literal(addr),
+                Some((addr, port_part)) => {
+                    is_valid_ipv6_literal(addr)
+                        && port_part.strip_prefix(':').is_some_and(is_valid_port)
+                }
                 None => false,
             }
         } else {
             match segment.split_once(':') {
                 None => true,
-                Some((_, port)) => !port.is_empty() && port.parse::<u16>().is_ok(),
+                Some((_, port)) => is_valid_port(port),
             }
         }
     })
 }
 
+fn looks_like_uri_host_after_at(after_at: &str) -> bool {
+    let host_end = after_at.find(['/', '?', '#']).unwrap_or(after_at.len());
+    let host = &after_at[..host_end];
+    if host.is_empty() || !is_host_port_authority(host) {
+        return false;
+    }
+    after_at[host_end..].starts_with(['/', '?']) || host.contains(':')
+}
+
 fn tail_at_is_query_value(tail: &str, at_in_tail: usize) -> bool {
     let prefix = &tail[..at_in_tail];
-    !prefix.contains('#')
-        && prefix
-            .find('?')
-            .is_some_and(|q_pos| prefix[q_pos + 1..].contains('='))
+    if prefix.contains('#') {
+        return false;
+    }
+    let Some(q_pos) = prefix.find('?') else {
+        return false;
+    };
+    let current_pair = prefix[q_pos + 1..].rsplit('&').next().unwrap_or("");
+    current_pair.contains('=') && !looks_like_uri_host_after_at(&tail[at_in_tail + 1..])
 }
 
 fn append_redacted_uri_tail(out: &mut String, tail: &str) {
@@ -238,20 +283,29 @@ fn redact_uri_password(raw: &str, scheme_end: usize, sep_len: usize) -> String {
     // If an unencoded `/`, `?`, or `#` appeared inside an authority password (for example
     // `postgresql://app:abc/def@host/db`, `postgresql://app:1234/secret@host/db`, or
     // `postgresql://app:p1@p2/secret@host/db?application_name=ops@corp.com`), re-slice at the
-    // rightmost `@` outside query values (or fail closed) so raw credentials are never echoed,
-    // while preserving legitimate `@` inside query values.
-    let last_non_query_at = rest
+    // rightmost authority `@` outside query values (or fail closed) so raw credentials are never
+    // echoed, while preserving legitimate `@` inside query values, paths, or fragments.
+    let later_authority_at = rest
         .match_indices('@')
         .rev()
         .find(|&(pos, _)| {
-            pos <= authority_end || !tail_at_is_query_value(tail, pos - authority_end)
+            pos > authority_end
+                && rest[..pos].contains(':')
+                && !tail_at_is_query_value(tail, pos - authority_end)
+                && looks_like_uri_host_after_at(&rest[pos + 1..])
         })
         .map(|(pos, _)| pos);
-    let has_later_authority_at =
-        last_non_query_at.is_some_and(|pos| pos > authority_end && rest[..pos].contains(':'));
     let malformed_authority = !authority.contains('@') && !is_host_port_authority(authority);
-    if malformed_authority || has_later_authority_at {
-        if let Some(later_at) = last_non_query_at.filter(|&pos| pos > authority_end) {
+    if malformed_authority || later_authority_at.is_some() {
+        let reslice_at = later_authority_at.or_else(|| {
+            rest.match_indices('@')
+                .rev()
+                .find(|&(pos, _)| {
+                    pos > authority_end && !tail_at_is_query_value(tail, pos - authority_end)
+                })
+                .map(|(pos, _)| pos)
+        });
+        if let Some(later_at) = reslice_at {
             let after_at = &rest[later_at + 1..];
             let host_end = after_at.find(['/', '?', '#']).unwrap_or(after_at.len());
             let new_end = later_at + 1 + host_end;
@@ -296,6 +350,20 @@ fn token_starts_secret_kv(token: &str) -> bool {
         .is_some_and(|(k, _)| is_secret_pg_param(k))
 }
 
+fn starts_with_secret_kv(rest: &str) -> bool {
+    let token_end = rest
+        .bytes()
+        .position(is_libpq_whitespace)
+        .unwrap_or(rest.len());
+    let token = &rest[..token_end];
+    !token.is_empty()
+        && (token_starts_secret_kv(token)
+            || (is_secret_pg_param(token)
+                && rest[token_end..]
+                    .trim_start_matches(is_libpq_ws_char)
+                    .starts_with('=')))
+}
+
 fn redact_libpq_kv_password(raw: &str) -> String {
     let bytes = raw.as_bytes();
     let len = bytes.len();
@@ -304,7 +372,7 @@ fn redact_libpq_kv_password(raw: &str) -> String {
 
     while i < len {
         let ws_start = i;
-        while i < len && bytes[i].is_ascii_whitespace() {
+        while i < len && is_libpq_whitespace(bytes[i]) {
             i += 1;
         }
         out.push_str(&raw[ws_start..i]);
@@ -313,14 +381,19 @@ fn redact_libpq_kv_password(raw: &str) -> String {
         }
 
         let key_start = i;
-        while i < len && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' {
+        while i < len && !is_libpq_whitespace(bytes[i]) && !matches!(bytes[i], b'=' | b'\'') {
             i += 1;
+        }
+        if i < len && bytes[i] == b'\'' {
+            i += 1;
+            out.push_str(&raw[key_start..i]);
+            continue;
         }
         let key = &raw[key_start..i];
         out.push_str(key);
 
         let pre_eq = i;
-        while i < len && bytes[i].is_ascii_whitespace() {
+        while i < len && is_libpq_whitespace(bytes[i]) {
             i += 1;
         }
         if i >= len || bytes[i] != b'=' {
@@ -329,7 +402,7 @@ fn redact_libpq_kv_password(raw: &str) -> String {
         }
         i += 1; // consume '='
         let after_eq = i;
-        while i < len && bytes[i].is_ascii_whitespace() {
+        while i < len && is_libpq_whitespace(bytes[i]) {
             i += 1;
         }
         let had_ws_after_eq = i > after_eq;
@@ -351,20 +424,38 @@ fn redact_libpq_kv_password(raw: &str) -> String {
                 }
             }
             if is_secret_pg_param(key) {
-                // Consume any malformed trailing non-whitespace suffix (e.g. `password='pa'ss'`).
-                while i < len && !bytes[i].is_ascii_whitespace() {
-                    i += 1;
+                // Consume any malformed trailing non-whitespace suffix (e.g. `password='pa'ss'`),
+                // unless an adjacent secret parameter immediately follows the closing quote
+                // (e.g. `password='s3cr3t'sslpassword = s3cr3t2`).
+                if !(closed && starts_with_secret_kv(&raw[i..])) {
+                    while i < len && !is_libpq_whitespace(bytes[i]) {
+                        i += 1;
+                    }
                 }
                 out.push_str("***");
-            } else if closed {
+            } else if closed && (i >= len || is_libpq_whitespace(bytes[i])) {
                 out.push_str(&raw[val_start..i]);
+            } else if closed && starts_with_secret_kv(&raw[i..]) {
+                // Adjacent secret parameter immediately follows a closing quote (e.g.
+                // `host='localhost'password=SECRET` or a misaligned quote right before
+                // `password=...`); redact the inner span (which has no unescaped `'`, so
+                // recursion depth is at most 1) and keep `i` positioned at the secret key.
+                out.push('\'');
+                out.push_str(&redact_libpq_kv_password(&raw[val_start + 1..i - 1]));
+                out.push('\'');
+            } else if closed {
+                // Misaligned quote (e.g. `application_name='broken password='SECRET'` or
+                // `application_name='broken password='s3cr3t=='`) must not swallow a following
+                // secret parameter.
+                out.push('\'');
+                i = val_start + 1;
             } else {
                 // Unclosed quote in a non-secret value must not swallow a following `password=...`.
                 out.push('\'');
                 out.push_str(&redact_libpq_kv_password(&raw[val_start + 1..i]));
             }
         } else {
-            while i < len && !bytes[i].is_ascii_whitespace() {
+            while i < len && !is_libpq_whitespace(bytes[i]) {
                 if bytes[i] == b'\\' {
                     i = advance_escaped(raw, i);
                 } else {
@@ -372,10 +463,7 @@ fn redact_libpq_kv_password(raw: &str) -> String {
                 }
             }
             let val = &raw[val_start..i];
-            if had_ws_after_eq
-                && (token_starts_secret_kv(val)
-                    || (is_secret_pg_param(val) && raw[i..].trim_start().starts_with('=')))
-            {
+            if had_ws_after_eq && starts_with_secret_kv(&raw[val_start..]) {
                 // Previous key had an empty unquoted value (e.g. `sslrootcert= password=SECRET`,
                 // `sslrootcert= password = SECRET`, or `password= sslpassword = SECRET`); rewind
                 // so the following secret pair is parsed and masked on the next iteration.
@@ -998,6 +1086,19 @@ batch_size = 250
             format!("postgresql:app:p1@p2#frag?k={pw1}@db.example.com:5432/prod"),
             format!("{scheme}app:1234#frag?k={pw1}@db.example.com:5432/prod"),
             format!("{scheme}app:p1@p2#frag?k={pw1}@db.example.com:5432/prod"),
+            format!("{scheme}app:1234?k={pw1}@db.example.com:5432/prod"),
+            format!("{scheme}app:p1@p2?k={pw1}@db.example.com:5432/prod"),
+            format!("postgresql:///app:{pw1}?k=v@db.example.com:5432/prod"),
+            format!("{scheme}app:1234?a=1&{pw1}@db.example.com:5432/prod"),
+            format!("{scheme}app:1234/x{pw1}@db.example.com:5432/prod#ops@corp.com"),
+            format!("{scheme}app:1234?k={pw1}@db.example.com:5432/prod#ops@corp.com"),
+            format!("{scheme}app:1234?k={pw1}@[::1]"),
+            format!("{scheme} host=localhost password={pw1}"),
+            format!("{scheme}db.example.com password={pw1}"),
+            format!("{scheme}db.example.com/prod password={pw1}"),
+            format!("{scheme}app:+1234/no-at-sign"),
+            format!("{scheme}[app:{pw1}]/no-at-sign"),
+            format!("{scheme}[::1%{pw1}:x]/no-at-sign"),
             format!("foo:bar password={pw1}"),
             format!("foo:bar\tpassword={pw1}"),
             format!("db.example.com:5432 password={pw1}"),
@@ -1027,21 +1128,21 @@ batch_size = 250
             .redacted(),
             "postgresql://app:***@db.example.com/prod?application_name=ops@corp.com&password=***"
         );
-        let safe_query_at =
-            format!("{scheme}db.example.com:5432/prod?application_name=ops@corp.com");
-        assert_eq!(
-            RedactedUrl::new(safe_query_at.clone()).redacted(),
-            safe_query_at
-        );
-        let safe_uds_at =
-            "postgresql:///prod?host=/var/run/postgresql&application_name=ops@corp.com";
-        assert_eq!(
-            RedactedUrl::new(safe_uds_at.to_owned()).redacted(),
-            safe_uds_at
-        );
+        for safe_uri in [
+            format!("{scheme}db.example.com:5432/prod?application_name=ops@corp.com"),
+            format!("{scheme}db.example.com:5432/prod?sslmode=verify-full#ops@corp.com"),
+            format!("{scheme}app@db.example.com:5432/prod#ops@corp.com"),
+            format!("{scheme}db.example.com/prod?application_name=svc:1#ops@corp.com"),
+            format!("{scheme}db.example.com:5432/prod@v2"),
+            format!("{scheme}[::1]:5432/prod?sslmode=verify-full"),
+            format!("{scheme}:5432/prod"),
+            "postgresql:///prod?host=/var/run/postgresql&application_name=ops@corp.com".to_owned(),
+        ] {
+            assert_eq!(RedactedUrl::new(safe_uri.clone()).redacted(), safe_uri);
+        }
 
-        // 10. Libpq KV empty value (with or without spaces around `=`), malformed quotes, and
-        // unclosed quotes before `password=` never leak.
+        // 10. Libpq KV empty values, vertical tabs (`\x0b`), adjacent quoted secrets, malformed
+        // quotes, and unclosed/misaligned quotes before `password=` never leak.
         for kv_case in [
             format!("password={pw1}"),
             format!(" password={pw1} "),
@@ -1050,13 +1151,25 @@ batch_size = 250
             format!("oauth_client_secret={pw1}"),
             format!("password='{pw1}'"),
             format!("password=foo://{pw1}"),
+            format!("host=db.example.com\x0bpassword={pw1}"),
+            format!("host=db.example.com password\x0b={pw1}"),
+            format!("host=db.example.com password=\x0bsslpassword\x0b=\x0b{pw2}"),
             format!("host=db.example.com sslrootcert= password={pw1} dbname=prod"),
             format!("host=db.example.com sslrootcert= password = {pw1} dbname=prod"),
             format!("host=db.example.com password= sslpassword = {pw2} dbname=prod"),
             format!("host=db.example.com sslpassword= password = {pw1} dbname=prod"),
             format!("host=db.example.com password= sslpassword='first {pw2}' dbname=prod"),
+            format!("host=db.example.com password='{pw1}'sslpassword = {pw2} dbname=prod"),
+            format!("host=db.example.com password='{pw1}'sslpassword='first {pw2}' dbname=prod"),
+            format!("host=db.example.com password='{pw1}'dbname='my db'sslpassword={pw2}"),
             format!("host=db.example.com password='pa'{pw1}' dbname=prod"),
+            format!("host='localhost'password={pw1} dbname=prod"),
+            format!("host='localhost'password = {pw1} dbname=prod"),
             format!("application_name='broken password={pw1} dbname=prod"),
+            format!("application_name='broken password='{pw1}' dbname=prod"),
+            format!("application_name='broken password='{pw1}==' dbname=prod"),
+            format!("application_name='broken password={pw1} dbname='prod'"),
+            format!("application_name='broken password={pw1} dbname='password={pw2}'"),
         ] {
             let red = RedactedUrl::new(kv_case).redacted();
             assert!(
