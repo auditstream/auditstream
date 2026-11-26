@@ -265,6 +265,9 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Validate the config target (rejecting symlinks/non-regular files) before writing migrations.
+    let _ = read_existing_config_doc(&config.file_path)?;
+
     match migrations::write(&migration_opts).exit_code(Exit::Io)? {
         WriteOutcome::UpToDate { existing } => {
             eprintln!(
@@ -359,7 +362,10 @@ fn read_existing_config_doc(path: &Path) -> anyhow::Result<DocumentMut> {
             let mut read_opts = OpenOptions::new();
             read_opts.read(true);
             #[cfg(unix)]
-            std::os::unix::fs::OpenOptionsExt::custom_flags(&mut read_opts, libc::O_NOFOLLOW);
+            std::os::unix::fs::OpenOptionsExt::custom_flags(
+                &mut read_opts,
+                libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            );
             let mut existing = read_opts
                 .open(path)
                 .map_err(|err| anyhow!("failed to read {}: {err}", path.display()))
@@ -681,7 +687,15 @@ mod tests {
         )
         .expect_err("dangling symlink config target must be rejected");
         assert!(err.to_string().contains("symlink"), "{err}");
+    }
 
+    #[test]
+    fn update_config_file_never_leaks_toml_edit_secrets() {
+        use std::path::Path;
+
+        use super::update_config_file;
+
+        let dir = tempdir().unwrap();
         let secret = "TOML_EDIT_SECRET_PW_777";
         let broken_path = dir.path().join("broken.toml");
         fs::write(

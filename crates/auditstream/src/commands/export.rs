@@ -143,11 +143,32 @@ fn sink_path(sink: &SinkConfig) -> Option<&Path> {
     }
 }
 
+fn has_trailing_dir_syntax(path: &Path) -> bool {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    bytes.ends_with(b"/")
+        || bytes.ends_with(b"/.")
+        || (cfg!(windows) && (bytes.ends_with(b"\\") || bytes.ends_with(b"\\.")))
+}
+
+fn check_not_symlink(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to follow symlink at {}", path.display()),
+        )),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 fn resolve_path(path: &Path) -> io::Result<PathBuf> {
-    if !matches!(
-        path.components().next_back(),
-        Some(std::path::Component::Normal(_))
-    ) {
+    if has_trailing_dir_syntax(path)
+        || !matches!(
+            path.components().next_back(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("path must name a file: {}", path.display()),
@@ -159,27 +180,19 @@ fn resolve_path(path: &Path) -> io::Result<PathBuf> {
             format!("path must name a file: {}", path.display()),
         )
     })?;
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("refusing to follow symlink at {}", path.display()),
-            ));
-        }
-        Ok(_) => {}
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err),
-    }
+    check_not_symlink(path)?;
     let parent = path
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    Ok(parent.canonicalize()?.join(name))
+    let resolved = parent.canonicalize()?.join(name);
+    check_not_symlink(&resolved)?;
+    Ok(resolved)
 }
 
 fn open_nofollow(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(options, libc::O_NOFOLLOW);
+    std::os::unix::fs::OpenOptionsExt::custom_flags(options, libc::O_NOFOLLOW | libc::O_NONBLOCK);
     options.open(path)
 }
 
@@ -537,7 +550,19 @@ fn open_checkpoint(
     }
     if args.from_start {
         // Replay starts at the beginning, but a partial batch in this destination still needs repair.
-        let saved = file.read().ok().flatten();
+        // Corrupt cursor JSON is ignored under `--from-start`, whereas symlink/non-file/I/O errors
+        // must fail closed rather than overwriting an unexpected target.
+        let saved = match file.read() {
+            Ok(saved) => saved,
+            Err(err) if matches!(err.get_ref(), Some(inner) if inner.is::<serde_json::Error>()) => {
+                None
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("reading cursor {}", path.display()))
+                    .exit_code(Exit::Io);
+            }
+        };
         let had_saved = saved.is_some();
         if let Some(saved) = saved
             && requested.sink == saved.sink
@@ -1119,6 +1144,33 @@ mod tests {
             resolved_child,
             real_subdir.canonicalize().unwrap().join("events.jsonl")
         );
+
+        // Trailing `/` or `/.` on a symlinked directory must NOT bypass symlink/file validation.
+        let sym_trailing_slash = PathBuf::from(format!("{}/", parent_link.display()));
+        let sym_trailing_dot = PathBuf::from(format!("{}/.", parent_link.display()));
+        assert!(
+            super::resolve_path(&sym_trailing_slash).is_err(),
+            "resolve_path must reject trailing slash on symlinked dir"
+        );
+        assert!(
+            super::resolve_path(&sym_trailing_dot).is_err(),
+            "resolve_path must reject trailing /. on symlinked dir"
+        );
+
+        // Named pipe (FIFO) must fail immediately in CursorFile::read without hanging.
+        let fifo_cursor = dir.path().join("fifo.cursor");
+        if std::process::Command::new("mkfifo")
+            .arg(&fifo_cursor)
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            let locked_fifo = CursorFile::lock(&fifo_cursor).expect("lock sidecar");
+            assert!(
+                locked_fifo.read().is_err(),
+                "FIFO cursor file must fail immediately without hanging"
+            );
+            drop(locked_fifo);
+        }
 
         // restore_output refuses to truncate a symlink target via O_NOFOLLOW.
         let big_victim = dir.path().join("big_victim.jsonl");

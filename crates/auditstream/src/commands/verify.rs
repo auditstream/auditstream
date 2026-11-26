@@ -127,7 +127,6 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
         let installed_schemas: Vec<&str> = installed
             .iter()
             .map(|c| c.schema.as_str())
-            .chain(excludes_by_table.keys().map(|(s, _)| s.as_str()))
             .filter(|s| all_user_schemas.contains(*s))
             .collect::<BTreeSet<_>>()
             .into_iter()

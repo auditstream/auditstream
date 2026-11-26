@@ -73,7 +73,14 @@ impl fmt::Display for RedactedUrl {
 }
 
 fn is_secret_pg_param(key: &str) -> bool {
-    key.eq_ignore_ascii_case("password") || key.eq_ignore_ascii_case("sslpassword")
+    let cleaned: String = key
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    cleaned.eq_ignore_ascii_case("password")
+        || cleaned.eq_ignore_ascii_case("sslpassword")
+        || cleaned.eq_ignore_ascii_case("ssl-password")
+        || cleaned.eq_ignore_ascii_case("oauth_client_secret")
 }
 
 fn is_valid_uri_scheme(prefix: &str) -> bool {
@@ -123,13 +130,17 @@ fn percent_decode_form_key(raw: &str) -> String {
 }
 
 fn redact_url_password(raw: &str) -> String {
-    if let Some(scheme_end) = raw.find("://")
-        && is_valid_uri_scheme(&raw[..scheme_end])
-    {
-        redact_uri_password(raw, scheme_end)
-    } else {
-        redact_libpq_kv_password(raw)
+    let trimmed = raw.trim_matches(|c: char| c <= ' ');
+    if let Some(scheme_end) = trimmed.find("://") {
+        let scheme_clean: String = trimmed[..scheme_end]
+            .chars()
+            .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+            .collect();
+        if is_valid_uri_scheme(&scheme_clean) {
+            return redact_uri_password(trimmed, scheme_end);
+        }
     }
+    redact_libpq_kv_password(raw)
 }
 
 fn is_host_port_authority(authority: &str) -> bool {
@@ -139,16 +150,22 @@ fn is_host_port_authority(authority: &str) -> bool {
                 Some((_, "")) => true,
                 Some((_, port_part)) => port_part
                     .strip_prefix(':')
-                    .is_some_and(|p| p.is_empty() || p.parse::<u16>().is_ok()),
+                    .is_some_and(|p| !p.is_empty() && p.parse::<u16>().is_ok()),
                 None => false,
             }
         } else {
             match segment.split_once(':') {
                 None => true,
-                Some((_, port)) => port.is_empty() || port.parse::<u16>().is_ok(),
+                Some((_, port)) => !port.is_empty() && port.parse::<u16>().is_ok(),
             }
         }
     })
+}
+
+fn tail_at_is_query_value(tail: &str, at_in_tail: usize) -> bool {
+    tail[..at_in_tail]
+        .find('?')
+        .is_some_and(|q_pos| tail[q_pos + 1..at_in_tail].contains('='))
 }
 
 fn redact_uri_password(raw: &str, scheme_end: usize) -> String {
@@ -158,11 +175,17 @@ fn redact_uri_password(raw: &str, scheme_end: usize) -> String {
     let mut tail = &rest[authority_end..];
 
     // If an unencoded `/`, `?`, or `#` appeared inside an authority password (for example
-    // `postgresql://app:abc/def@host/db`), `authority` lacks `@` and has a non-port `:...`
-    // segment, while `@` appears later in `rest`. Re-slice at the real authority boundary
-    // (or fail closed) so raw credentials are never echoed.
-    if !authority.contains('@') && !is_host_port_authority(authority) {
-        if let Some(later_at) = rest.find('@') {
+    // `postgresql://app:abc/def@host/db`, `postgresql://app:1234/secret@host/db`, or
+    // `postgresql://app:p1@p2/secret@host/db`), re-slice at the final `@` (or fail closed) so raw
+    // credentials are never echoed, while preserving legitimate `@` inside query values such as
+    // `postgresql://host:5432/db?application_name=ops@corp.com`.
+    let has_later_authority_at = authority.contains(':')
+        && rest.rfind('@').is_some_and(|last_at| {
+            last_at > authority_end && !tail_at_is_query_value(tail, last_at - authority_end)
+        });
+    let malformed_authority = !authority.contains('@') && !is_host_port_authority(authority);
+    if malformed_authority || has_later_authority_at {
+        if let Some(later_at) = rest.rfind('@') {
             let after_at = &rest[later_at + 1..];
             let host_end = after_at.find(['/', '?', '#']).unwrap_or(after_at.len());
             let new_end = later_at + 1 + host_end;
@@ -290,6 +313,10 @@ fn redact_libpq_kv_password(raw: &str) -> String {
                 }
             }
             if is_secret_pg_param(key) {
+                // Consume any malformed trailing non-whitespace suffix (e.g. `password='pa'ss'`).
+                while i < len && !bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
                 out.push_str("***");
             } else if closed {
                 out.push_str(&raw[val_start..i]);
@@ -309,9 +336,12 @@ fn redact_libpq_kv_password(raw: &str) -> String {
             let val = &raw[val_start..i];
             if is_secret_pg_param(key) {
                 out.push_str("***");
-            } else if had_ws_after_eq && token_starts_secret_kv(val) {
-                // Previous non-secret key had an empty unquoted value (e.g. `sslrootcert= password=SECRET`);
-                // rewind so the secret key-value pair is parsed and masked on the next iteration.
+            } else if had_ws_after_eq
+                && (token_starts_secret_kv(val)
+                    || (is_secret_pg_param(val) && raw[i..].trim_start().starts_with('=')))
+            {
+                // Previous non-secret key had an empty unquoted value (e.g. `sslrootcert= password=SECRET`
+                // or `sslrootcert= password = SECRET`); rewind so the secret pair is masked next.
                 i = val_start;
             } else {
                 out.push_str(val);
@@ -880,26 +910,50 @@ batch_size = 250
             "host=db.example.com password=*** dbname=prod"
         );
 
-        // 9. Unencoded `/`, `?`, or `#` inside URI authority passwords never leak credentials.
+        // 9. Unencoded `/`, `?`, `#`, numeric prefixes, empty prefixes, multi-`@`, leading
+        // whitespace, and embedded tabs/newlines never leak credentials, while legitimate `@` in
+        // query values stays intact.
+        let scheme = "postgresql://";
         let prefix = "part1";
-        for sep in ['/', '?', '#'] {
-            let bad_uri = format!("postgresql://app:{prefix}{sep}{pw1}@db.example.com:5432/prod");
+        for bad_uri in [
+            format!("{scheme}app:{prefix}/{pw1}@db.example.com:5432/prod"),
+            format!("{scheme}app:{prefix}?{pw1}@db.example.com:5432/prod"),
+            format!("{scheme}app:{prefix}#{pw1}@db.example.com:5432/prod"),
+            format!("{scheme}app:/{pw1}@db.example.com:5432/prod"),
+            format!("{scheme}app:?{pw1}@db.example.com:5432/prod"),
+            format!("{scheme}app:#{pw1}@db.example.com:5432/prod"),
+            format!("{scheme}app:1234/{pw1}@db.example.com:5432/prod"),
+            format!("{scheme}app:1234?{pw1}@db.example.com:5432/prod"),
+            format!("{scheme}app:1234#{pw1}@db.example.com:5432/prod"),
+            format!("{scheme}app:p1@p2/{pw1}@db.example.com:5432/prod"),
+            format!("{scheme}app:p1/p2@p3/{pw1}@db.example.com:5432/prod"),
+            format!("{scheme}app:{pw1}/no-at-sign"),
+            format!(" \t{scheme}app:{pw1}@db.example.com:5432/prod "),
+            format!(
+                "{scheme}app@db.example.com:5432/prod?ssl\tpassword={pw1}&ssl-password={pw2}&oauth_client_secret={pw1}"
+            ),
+        ] {
             let red = RedactedUrl::new(bad_uri).redacted();
-            assert!(!red.contains(pw1) && !red.contains(prefix), "leaked: {red}");
+            assert!(!red.contains(pw1) && !red.contains(pw2), "leaked: {red}");
         }
-        let no_at = format!("postgresql://app:{pw1}/no-at-sign");
-        let red_no_at = RedactedUrl::new(no_at).redacted();
-        assert!(!red_no_at.contains(pw1), "leaked: {red_no_at}");
+        let safe_query_at =
+            format!("{scheme}db.example.com:5432/prod?application_name=ops@corp.com");
+        assert_eq!(
+            RedactedUrl::new(safe_query_at.clone()).redacted(),
+            safe_query_at
+        );
 
-        // 10. Libpq KV empty unquoted value or unclosed single quote before `password=` never leaks.
-        let kv_empty_prev = format!("host=db.example.com sslrootcert= password={pw1} dbname=prod");
-        let red_empty_prev = RedactedUrl::new(kv_empty_prev).redacted();
-        assert!(!red_empty_prev.contains(pw1), "{red_empty_prev}");
-        assert!(red_empty_prev.contains("password=***"), "{red_empty_prev}");
-
-        let kv_unclosed_prev = format!("application_name='broken password={pw1} dbname=prod");
-        let red_unclosed_prev = RedactedUrl::new(kv_unclosed_prev).redacted();
-        assert!(!red_unclosed_prev.contains(pw1), "{red_unclosed_prev}");
+        // 10. Libpq KV empty value (with or without spaces around `=`), malformed quotes, and
+        // unclosed quotes before `password=` never leak.
+        for kv_case in [
+            format!("host=db.example.com sslrootcert= password={pw1} dbname=prod"),
+            format!("host=db.example.com sslrootcert= password = {pw1} dbname=prod"),
+            format!("host=db.example.com password='pa'{pw1}' dbname=prod"),
+            format!("application_name='broken password={pw1} dbname=prod"),
+        ] {
+            let red = RedactedUrl::new(kv_case).redacted();
+            assert!(!red.contains(pw1), "leaked in libpq KV: {red}");
+        }
 
         // 11. Non-secret libpq parameters and URIs remain untouched.
         let safe_kv = "host=localhost port=5432 user=postgres dbname=app sslmode=verify-full";

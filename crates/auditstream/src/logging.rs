@@ -12,7 +12,10 @@ const SQLX_OPTIONS_SILENCE: &str = "sqlx_postgres::options=error";
 /// Precedence: `AUDITSTREAM_LOG` environment variable > `-q` > `-v` count > `warn`.
 pub(crate) fn resolve_filter(verbose: u8, quiet: bool, env_log: Option<&str>) -> String {
     if let Some(directive) = env_log.map(str::trim).filter(|val| !val.is_empty()) {
-        return directive.to_owned();
+        if directive.contains("sqlx_postgres::options") {
+            return directive.to_owned();
+        }
+        return format!("{directive},{SQLX_OPTIONS_SILENCE}");
     }
 
     if quiet {
@@ -64,10 +67,17 @@ mod tests {
         );
         assert_eq!(resolve_filter(0, true, None), "error");
         assert_eq!(resolve_filter(2, true, None), "error");
-        assert_eq!(resolve_filter(0, false, Some("trace")), "trace");
+        assert_eq!(
+            resolve_filter(0, false, Some("trace")),
+            "trace,sqlx_postgres::options=error"
+        );
         assert_eq!(
             resolve_filter(2, true, Some("auditstream=debug")),
-            "auditstream=debug"
+            "auditstream=debug,sqlx_postgres::options=error"
+        );
+        assert_eq!(
+            resolve_filter(0, false, Some("debug,sqlx_postgres::options=warn")),
+            "debug,sqlx_postgres::options=warn"
         );
     }
 }
