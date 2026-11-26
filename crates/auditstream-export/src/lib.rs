@@ -20,14 +20,14 @@ pub(crate) fn open_append_file(path: &Path) -> io::Result<std::fs::File> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = options.open(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileTypeExt;
         let file_type = file.metadata()?.file_type();
-        if file_type.is_dir() || file_type.is_fifo() || file_type.is_socket() {
+        if !(file_type.is_file() || file_type.is_char_device()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -249,5 +249,18 @@ mod tests {
             std::fs::read_to_string(&victim).expect("read victim"),
             "KEEP\n"
         );
+
+        // Named pipe (FIFO) with no reader must fail immediately (O_NONBLOCK) without hanging.
+        let fifo = dir.path().join("events.fifo");
+        if std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            assert!(
+                super::open_append_file(&fifo).is_err(),
+                "FIFO export target must be rejected immediately without hanging"
+            );
+        }
     }
 }
