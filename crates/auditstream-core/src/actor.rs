@@ -143,6 +143,39 @@ where
 /// characters anywhere inside nested strings, arrays, or object keys/values (`spec/actor.md`).
 pub(crate) struct NoNulIgnoredAny;
 
+struct NoNulIgnoredKey;
+
+impl<'de> Deserialize<'de> for NoNulIgnoredKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct NoNulKeyVisitor;
+
+        impl Visitor<'_> for NoNulKeyVisitor {
+            type Value = NoNulIgnoredKey;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a JSON object key without NUL characters")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if v.contains('\0') {
+                    return Err(de::Error::custom(
+                        "payload object keys must not contain NUL characters",
+                    ));
+                }
+                Ok(NoNulIgnoredKey)
+            }
+        }
+
+        deserializer.deserialize_str(NoNulKeyVisitor)
+    }
+}
+
 impl<'de> Deserialize<'de> for NoNulIgnoredAny {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -165,7 +198,15 @@ impl<'de> Deserialize<'de> for NoNulIgnoredAny {
                 Ok(NoNulIgnoredAny)
             }
 
+            fn visit_i128<E>(self, _v: i128) -> Result<Self::Value, E> {
+                Ok(NoNulIgnoredAny)
+            }
+
             fn visit_u64<E>(self, _v: u64) -> Result<Self::Value, E> {
+                Ok(NoNulIgnoredAny)
+            }
+
+            fn visit_u128<E>(self, _v: u128) -> Result<Self::Value, E> {
                 Ok(NoNulIgnoredAny)
             }
 
@@ -189,8 +230,22 @@ impl<'de> Deserialize<'de> for NoNulIgnoredAny {
                 Ok(NoNulIgnoredAny)
             }
 
+            fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+            where
+                D2: Deserializer<'de>,
+            {
+                NoNulIgnoredAny::deserialize(deserializer)
+            }
+
             fn visit_unit<E>(self) -> Result<Self::Value, E> {
                 Ok(NoNulIgnoredAny)
+            }
+
+            fn visit_newtype_struct<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+            where
+                D2: Deserializer<'de>,
+            {
+                NoNulIgnoredAny::deserialize(deserializer)
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
@@ -205,12 +260,7 @@ impl<'de> Deserialize<'de> for NoNulIgnoredAny {
             where
                 A: MapAccess<'de>,
             {
-                while let Some(key) = map.next_key::<String>()? {
-                    if key.contains('\0') {
-                        return Err(de::Error::custom(
-                            "payload object keys must not contain NUL characters",
-                        ));
-                    }
+                while map.next_key::<NoNulIgnoredKey>()?.is_some() {
                     let _: NoNulIgnoredAny = map.next_value()?;
                 }
                 Ok(NoNulIgnoredAny)

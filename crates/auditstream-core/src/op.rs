@@ -59,8 +59,10 @@ impl Op {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError`] if `action` is blank, exceeds 64 Unicode scalar values,
-    /// or collides (case-insensitively) with `INSERT`, `UPDATE`, `DELETE`, or `TRUNCATE`.
+    /// Returns [`CoreError::NullByteInField`] if `action` contains a NUL character (`\0`),
+    /// [`CoreError::EmptyAction`] if `action` is blank, [`CoreError::ActionTooLong`] if it
+    /// exceeds 64 Unicode scalar values, or [`CoreError::ReservedAction`] if it collides
+    /// (case-insensitively) with `INSERT`, `UPDATE`, `DELETE`, or `TRUNCATE`.
     pub fn app(action: impl Into<String>) -> Result<Self, CoreError> {
         let action = action.into();
         if action.contains('\0') {

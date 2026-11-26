@@ -190,6 +190,9 @@ fn is_valid_context_object(value: &Value) -> bool {
 /// (`SQLSTATE 22P05`) without heap allocations. Escaped backslashes (`\\u0000`) are skipped cleanly.
 pub(crate) fn raw_json_contains_nul(raw: &str) -> bool {
     let bytes = raw.as_bytes();
+    if bytes.contains(&0) {
+        return true;
+    }
     let len = bytes.len();
     let mut i = 0;
     let mut in_string = false;

@@ -405,7 +405,34 @@ fn event_preserves_arbitrary_precision_numeric_and_validates_against_event_schem
         !validator.is_valid(&bad_obo),
         "event.schema.json must reject unknown actor.onBehalfOf.type"
     );
+    assert_event_schema_rejects_nul(&validator, &value);
+    assert!(serde_json::from_str::<Op>("\"invoice\\u0000exported\"").is_err());
+    let mut bad_op_event = value.clone();
+    bad_op_event["op"] = serde_json::json!("invoice\u{0000}exported");
+    assert!(serde_json::from_value::<Event>(bad_op_event).is_err());
+
+    let round_tripped: Event = serde_json::from_str(&serialized).expect("deserialize event");
+    assert_eq!(round_tripped, event);
+    assert!(
+        round_tripped
+            .before
+            .as_deref()
+            .expect("before present")
+            .get()
+            .contains("12345678901234567890.123456789")
+    );
+}
+
+fn assert_event_schema_rejects_nul(validator: &jsonschema::Validator, base_event: &Value) {
     for (field, payload) in [
+        ("op", serde_json::json!("invoice\u{0000}exported")),
+        ("schema_name", serde_json::json!("pub\u{0000}lic")),
+        ("table_name", serde_json::json!("inv\u{0000}oice")),
+        ("changed", serde_json::json!(["to\u{0000}tal"])),
+        ("db_user", serde_json::json!("app\u{0000}user")),
+        ("record_id", serde_json::json!({"id": "1\u{0000}2"})),
+        ("before", serde_json::json!({"k\u{0000}1": 1})),
+        ("after", serde_json::json!({"nested": ["a\u{0000}b"]})),
         (
             "actor",
             serde_json::json!({"type": "user", "id": "u\u{0000}1"}),
@@ -421,24 +448,69 @@ fn event_preserves_arbitrary_precision_numeric_and_validates_against_event_schem
         ("context", serde_json::json!({"requestId": "r\u{0000}1"})),
         ("context", serde_json::json!({"extra": ["a\u{0000}b"]})),
     ] {
-        let mut bad_nul = value.clone();
+        let mut bad_nul = base_event.clone();
         bad_nul[field] = payload;
         assert!(
             !validator.is_valid(&bad_nul),
             "event.schema.json must reject NUL in {field}: {bad_nul}"
         );
     }
+}
 
-    let round_tripped: Event = serde_json::from_str(&serialized).expect("deserialize event");
-    assert_eq!(round_tripped, event);
-    assert!(
-        round_tripped
-            .before
-            .as_deref()
-            .expect("before present")
-            .get()
-            .contains("12345678901234567890.123456789")
+#[test]
+fn unknown_fields_with_wide_integers_and_arbitrary_precision_round_trip_through_from_value() {
+    let raw = r#"{
+        "type": "user",
+        "id": "u1",
+        "u64_val": 42,
+        "i64_val": -42,
+        "neg_zero": -0,
+        "float_val": 1.5,
+        "u128_val": 18446744073709551616,
+        "i128_val": -9223372036854775809,
+        "huge_dec": 123456789012345678901234567890.123456789,
+        "bool_val": true,
+        "null_val": null,
+        "arr_val": [18446744073709551616, -9223372036854775809, "ok", null],
+        "obj_val": {"nested_u128": 18446744073709551616},
+        "context": {
+            "requestId": "r1",
+            "big_u128": 18446744073709551616,
+            "big_i128": -9223372036854775809
+        }
+    }"#;
+
+    let from_str_actor: Actor = serde_json::from_str(raw).expect("from_str Actor");
+    assert_eq!(from_str_actor.id, "u1");
+
+    let value: Value = serde_json::from_str(raw).expect("parse Value");
+    let from_val_actor: Actor = serde_json::from_value(value.clone()).expect("from_value Actor");
+    assert_eq!(from_val_actor, from_str_actor);
+
+    let from_val_payload: ActorPayload =
+        serde_json::from_value(value.clone()).expect("from_value ActorPayload");
+    assert_eq!(from_val_payload.id, "u1");
+    assert_eq!(
+        from_val_payload
+            .context
+            .as_ref()
+            .and_then(|c| c.request_id.as_deref()),
+        Some("r1")
     );
+
+    let from_val_ctx: Context =
+        serde_json::from_value(value["context"].clone()).expect("from_value Context");
+    assert_eq!(from_val_ctx.request_id.as_deref(), Some("r1"));
+
+    // Verify DecodedActor::into_actor() via transport::decode with u128 unknown field.
+    let decoded = auditstream_core::transport::decode(
+        "UPDATE t SET x=1 /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidTEiLCJzZXEiOjE4NDQ2NzQ0MDczNzA5NTUxNjE2fQ'*/",
+    );
+    let actor = decoded
+        .into_actor()
+        .expect("DecodedActor::into_actor must handle u128 unknown fields")
+        .expect("valid actor");
+    assert_eq!(actor.id, "u1");
 }
 
 #[test]
