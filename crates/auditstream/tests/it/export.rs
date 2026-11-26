@@ -52,6 +52,7 @@ fn invalid_export_options_exit_usage_without_writing() {
     let dir = tempdir().expect("tempdir");
     for args in [
         vec!["--format", "yaml"],
+        vec!["--stats-format", "yaml"],
         vec!["--batch-size", "0"],
         vec!["--since", "yesterday"],
         vec!["--until", "tomorrow"],
@@ -1113,4 +1114,268 @@ async fn export_refuses_symlinks_and_creates_0600_output_files() {
         .mode()
         & 0o777;
     assert_eq!(out_mode, 0o600, "events.jsonl must have mode 0600");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn export_stats_json_stall_detection_failover_anchor_and_future_cursor_guard() {
+    // Setup DB first — `export_db()` acquires and releases `TestDb::cluster_lock()` internally.
+    let db = export_db().await;
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    seed_events(&db).await;
+    let dir = tempdir().expect("tempdir");
+    let args = [
+        "--cursor-file",
+        "cursor.json",
+        "--output",
+        "events.jsonl",
+        "--stats-format",
+        "json",
+    ];
+
+    // 1. Export with `--stats-format json` writes valid JSON telemetry to stderr and leaves stdout empty.
+    let first = export_file_until(&db, dir.path(), &args, 3).await;
+    assert_eq!(first.len(), 3);
+
+    let caught_up = run_export(&db, dir.path(), &args);
+    assert_eq!(caught_up.stdout.as_slice(), b"");
+    let stderr_str = String::from_utf8_lossy(&caught_up.stderr);
+    let lines: Vec<&str> = stderr_str.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected 1 JSON telemetry line: {stderr_str}"
+    );
+    let stats: Value = serde_json::from_str(lines[0]).expect("parse export stats json");
+    assert_eq!(stats["events"], 0);
+    assert_eq!(stats["batches"], 0);
+    assert!(stats["duration_ms"].as_u64().is_some());
+    assert!(stats["cursor"]["xact_id"].as_u64().unwrap() > 0);
+    assert!(
+        stats["snapshot_xmin"].as_u64().unwrap() >= stats["cursor"]["xact_id"].as_u64().unwrap()
+    );
+    assert!(stats["oldest_unexported_age_secs"].is_null());
+    assert_eq!(stats["stalled"], false);
+
+    // Omitting `--stats-format` under `--log-format json` defaults export telemetry to JSON too.
+    let json_log_export = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args([
+            "--log-format",
+            "json",
+            "export",
+            "--cursor-file",
+            "cursor.json",
+            "--output",
+            "events.jsonl",
+        ])
+        .output()
+        .expect("run export with --log-format json");
+    assert!(json_log_export.status.success());
+    assert_eq!(json_log_export.stdout.as_slice(), b"");
+    let json_log_stderr = String::from_utf8_lossy(&json_log_export.stderr);
+    let inherited_stats: Value = serde_json::from_str(json_log_stderr.trim())
+        .expect("--log-format json must default export stats summary to JSON");
+    assert_eq!(inherited_stats["events"], 0);
+    assert_eq!(inherited_stats["stalled"], false);
+
+    // `-q` suppresses JSON telemetry on stderr.
+    let quiet = run_export(
+        &db,
+        dir.path(),
+        &[
+            "--cursor-file",
+            "cursor.json",
+            "--output",
+            "events.jsonl",
+            "--stats-format",
+            "json",
+            "-q",
+        ],
+    );
+    assert_eq!(quiet.stderr.as_slice(), b"");
+
+    // Verify cursor.json persisted `database.timeline_id`, `anchor`, and secret-free `sink`.
+    let cursor_path = dir.path().join("cursor.json");
+    let output_path = dir.path().join("events.jsonl");
+    let mut cp: Value =
+        serde_json::from_slice(&fs::read(&cursor_path).expect("read cursor")).expect("parse");
+    let original_tl = cp["database"]["timeline_id"]
+        .as_u64()
+        .expect("timeline_id persisted");
+    assert!(original_tl >= 1);
+    assert!(cp["anchor"]["xact_id"].as_u64().unwrap() > 0);
+    assert!(cp["anchor"]["id"].as_i64().unwrap() > 0);
+    assert!(cp["anchor"]["event_id"].as_str().is_some());
+    assert_eq!(cp["sink"]["type"], "jsonl");
+
+    // 2. Open transaction pinning `pg_snapshot_xmin()` while a newer row commits surfaces `stalled: true`.
+    let (_held_xid, tx_hold) = db.hold_snapshot_xmin().await.expect("hold snapshot_xmin");
+    db.execute("INSERT INTO auditstream.changes (source, op) VALUES ('app', 'invoice.stalled')")
+        .await
+        .expect("commit row behind open tx");
+
+    let stalled_out = run_export(&db, dir.path(), &args);
+    let stalled_stderr = String::from_utf8_lossy(&stalled_out.stderr);
+    let stalled_stats: Value =
+        serde_json::from_str(stalled_stderr.trim()).expect("pure JSON telemetry on stderr");
+    assert_eq!(stalled_stats["events"], 0);
+    assert_eq!(stalled_stats["stalled"], true);
+    assert!(
+        stalled_stats["oldest_unexported_age_secs"]
+            .as_f64()
+            .is_some_and(|age| age >= 0.0),
+        "{stalled_stats}"
+    );
+
+    // Stalled default text stats append `stalled=true oldest_unexported_age_secs=` and log a WARN.
+    let stalled_text_out = run_export(
+        &db,
+        dir.path(),
+        &["--cursor-file", "cursor.json", "--output", "events.jsonl"],
+    );
+    let stalled_text = String::from_utf8_lossy(&stalled_text_out.stderr);
+    assert!(
+        stalled_text.contains("stalled=true oldest_unexported_age_secs="),
+        "{stalled_text}"
+    );
+    assert!(stalled_text.contains("WARN"), "{stalled_text}");
+
+    // Stalled `--log-format json` emits structured JSON WARN followed by JSON ExportStats.
+    let stalled_json_log = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args([
+            "--log-format",
+            "json",
+            "export",
+            "--cursor-file",
+            "cursor.json",
+            "--output",
+            "events.jsonl",
+        ])
+        .output()
+        .expect("run stalled export with --log-format json");
+    assert!(stalled_json_log.status.success());
+    assert_eq!(stalled_json_log.stdout.as_slice(), b"");
+    let stalled_json_stderr = String::from_utf8_lossy(&stalled_json_log.stderr);
+    let stalled_lines: Vec<&str> = stalled_json_stderr.lines().collect();
+    assert_eq!(
+        stalled_lines.len(),
+        2,
+        "expected JSON WARN + JSON stats lines: {stalled_json_stderr}"
+    );
+    let warn_record: Value = serde_json::from_str(stalled_lines[0]).expect("parse json warn");
+    assert_eq!(warn_record["level"], "WARN");
+    let stats_record: Value = serde_json::from_str(stalled_lines[1]).expect("parse json stats");
+    assert_eq!(stats_record["stalled"], true);
+
+    tx_hold.rollback().await.expect("rollback holder tx");
+
+    // Drain the previously stalled row.
+    let after_stall = export_file_until(&db, dir.path(), &args, 4).await;
+    assert_eq!(after_stall.len(), 4);
+
+    // 3. Upgrading a legacy checkpoint with `timeline_id` omitted persists the current `timeline_id`,
+    //    while a corrupt `timeline_id: 0` fails loudly with exit code 3.
+    cp = serde_json::from_slice(&fs::read(&cursor_path).expect("read cursor")).expect("parse");
+    let saved_good_cp = cp.clone();
+    cp["database"]
+        .as_object_mut()
+        .expect("database object")
+        .remove("timeline_id");
+    fs::write(&cursor_path, serde_json::to_vec(&cp).unwrap()).expect("write legacy cursor");
+    run_export(&db, dir.path(), &args);
+    let updated_cp: Value =
+        serde_json::from_slice(&fs::read(&cursor_path).expect("read cursor")).expect("parse");
+    assert_eq!(
+        updated_cp["database"]["timeline_id"].as_u64(),
+        Some(original_tl),
+        "upgraded legacy checkpoint must persist the current timeline_id"
+    );
+
+    let mut zero_tl_cp = saved_good_cp.clone();
+    zero_tl_cp["database"]["timeline_id"] = Value::from(0);
+    fs::write(&cursor_path, serde_json::to_vec(&zero_tl_cp).unwrap()).expect("write zero tl");
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .arg("export")
+        .args(args)
+        .assert()
+        .code(3)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("timeline_id"));
+
+    // 4. Simulated backward timeline regression (`saved_timeline_id > current_timeline_id`,
+    //    e.g. reconnecting to a fenced old primary) fails with exit 3 even with an intact anchor
+    //    and leaves both cursor.json and any unacknowledged tail bytes in events.jsonl untouched.
+    let unacked_tail = b"{\"unacked_tail\":true}\n";
+    let original_output = fs::read(&output_path).expect("read events.jsonl");
+    let mut output_with_tail = original_output.clone();
+    output_with_tail.extend_from_slice(unacked_tail);
+    fs::write(&output_path, &output_with_tail).expect("append unacked tail");
+
+    let mut regressed_cp = saved_good_cp.clone();
+    regressed_cp["database"]["timeline_id"] = Value::from(original_tl.saturating_add(1));
+    let regressed_bytes = serde_json::to_vec(&regressed_cp).unwrap();
+    fs::write(&cursor_path, &regressed_bytes).expect("write regressed timeline cursor");
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .arg("export")
+        .args(args)
+        .assert()
+        .code(3)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("regressed"));
+    assert_eq!(
+        fs::read(&cursor_path).expect("cursor untouched"),
+        regressed_bytes,
+        "exit 3 must not overwrite cursor.json"
+    );
+    assert_eq!(
+        fs::read(&output_path).expect("output untouched"),
+        output_with_tail,
+        "exit 3 resume verification failure must not truncate events.jsonl"
+    );
+
+    // 5. Simulated PITR divergence (anchor.event_id changed) fails loudly with exit code 3
+    //    without truncating events.jsonl.
+    let mut diverged_cp = saved_good_cp.clone();
+    diverged_cp["anchor"]["event_id"] = Value::from("00000000-0000-4000-8000-ffffffffffff");
+    fs::write(&cursor_path, serde_json::to_vec(&diverged_cp).unwrap()).expect("write diverged");
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .arg("export")
+        .args(args)
+        .assert()
+        .code(3)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("boundary row anchor"));
+    assert_eq!(
+        fs::read(&output_path).expect("output untouched after PITR error"),
+        output_with_tail
+    );
+
+    // 6. Simulated future cursor (`cursor.xact_id > snapshot_xmin`) fails loudly with exit code 3
+    //    without truncating events.jsonl.
+    let mut future_cp = saved_good_cp;
+    future_cp["cursor"]["xact_id"] = Value::from(u64::MAX - 1);
+    fs::write(&cursor_path, serde_json::to_vec(&future_cp).unwrap()).expect("write future cursor");
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .arg("export")
+        .args(args)
+        .assert()
+        .code(3)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("snapshot_xmin"));
+    assert_eq!(
+        fs::read(&output_path).expect("output untouched after future cursor error"),
+        output_with_tail
+    );
 }

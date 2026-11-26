@@ -16,4 +16,4 @@
 
 ## Error formatting
 
-Every non-clap failure prints a single `error:` line on stderr joining the top-level message and its underlying causes, leaving stdout untouched.
+By default (`--log-format text`), every non-clap failure prints a single `error:` line on stderr joining the top-level message and its underlying causes, leaving stdout untouched. With `--log-format json` (or `AUDITSTREAM_LOG_FORMAT=json`), fatal failures (including CLI argument parse errors) emit a single-line JSON record (`{"timestamp","level":"ERROR","message","exit_code"}`) on stderr instead.

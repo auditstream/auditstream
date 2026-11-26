@@ -47,6 +47,16 @@ Options:
   -q, --quiet
           Silence warnings and info logs (errors only)
 
+      --log-format <LOG_FORMAT>
+          Format for stderr log messages
+
+          Possible values:
+          - text: Human-readable plain text logs (default)
+          - json: Structured single-line JSON log records on stderr
+          
+          [env: AUDITSTREAM_LOG_FORMAT=]
+          [default: text]
+
   -h, --help
           Print help (see a summary with '-h')
 

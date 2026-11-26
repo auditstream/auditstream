@@ -100,6 +100,60 @@ pub enum SinkConfig {
     },
 }
 
+/// Secret-free identity of an export sink persisted in resumable checkpoints (`cursor.json`).
+///
+/// Constructed via [`SinkConfig::fingerprint`] using an exhaustive match so future remote sinks
+/// (such as S3 or HTTP webhooks) cannot accidentally serialize credentials, tokens, signing keys,
+/// or URL query secrets into checkpoint files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SinkFingerprint {
+    /// Sink type identifier (for example `"jsonl"` or `"csv"`).
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Resolved local output file path for file-backed sinks (`None` for stdout or remote sinks).
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    /// Secret-free logical target descriptor for non-file sinks (omitted for local sinks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+}
+
+impl SinkFingerprint {
+    /// Returns `true` when this fingerprint represents a stdout destination (no file path or remote target).
+    #[must_use]
+    pub const fn is_stdout(&self) -> bool {
+        self.path.is_none() && self.target.is_none()
+    }
+}
+
+impl SinkConfig {
+    /// Returns the local output file path for file-backed sinks, or `None` for stdout/remote sinks.
+    #[must_use]
+    pub fn output_path(&self) -> Option<&Path> {
+        match self {
+            Self::Jsonl { path } | Self::Csv { path } => path.as_deref(),
+        }
+    }
+
+    /// Returns a secret-free [`SinkFingerprint`] safe to persist in resumable checkpoint files.
+    #[must_use]
+    pub fn fingerprint(&self) -> SinkFingerprint {
+        match self {
+            Self::Jsonl { path } => SinkFingerprint {
+                kind: "jsonl".to_owned(),
+                path: path.clone(),
+                target: None,
+            },
+            Self::Csv { path } => SinkFingerprint {
+                kind: "csv".to_owned(),
+                path: path.clone(),
+                target: None,
+            },
+        }
+    }
+}
+
 /// Closed runtime sink dispatcher implementing [`Sink`] via exhaustive `match` without boxing.
 #[derive(Debug)]
 pub enum AnySink {
@@ -148,9 +202,43 @@ mod tests {
 
     use auditstream_core::{Batch, Sink};
 
-    use super::{AnySink, SinkConfig};
+    use super::{AnySink, SinkConfig, SinkFingerprint};
 
     fn assert_send<F: Future + Send>(_: &F) {}
+
+    #[test]
+    fn sink_fingerprint_matches_legacy_json_and_rejects_secret_fields() {
+        let file_cfg = SinkConfig::Jsonl {
+            path: Some(PathBuf::from("/tmp/events.jsonl")),
+        };
+        let file_fp = file_cfg.fingerprint();
+        assert_eq!(file_fp.kind, "jsonl");
+        assert_eq!(file_fp.path, Some(PathBuf::from("/tmp/events.jsonl")));
+        assert_eq!(file_fp.target, None);
+        assert!(!file_fp.is_stdout());
+
+        let json = serde_json::to_string(&file_fp).expect("serialize fingerprint");
+        assert_eq!(json, r#"{"type":"jsonl","path":"/tmp/events.jsonl"}"#);
+        let roundtrip: SinkFingerprint =
+            serde_json::from_str(&json).expect("deserialize fingerprint");
+        assert_eq!(roundtrip, file_fp);
+
+        let stdout_fp = SinkConfig::Csv { path: None }.fingerprint();
+        assert!(stdout_fp.is_stdout());
+        let legacy_stdout: SinkFingerprint =
+            serde_json::from_str(r#"{"type":"csv","path":null}"#).expect("parse legacy stdout");
+        assert_eq!(legacy_stdout, stdout_fp);
+
+        for secret_json in [
+            r#"{"type":"jsonl","path":null,"secret_access_key":"abc"}"#,
+            r#"{"type":"jsonl","path":null,"token":"bearer"}"#,
+            r#"{"type":"jsonl","path":null,"password":"pw"}"#,
+        ] {
+            let err = serde_json::from_str::<SinkFingerprint>(secret_json)
+                .expect_err("unknown secret field must be rejected");
+            assert!(err.to_string().contains("unknown field"), "{err}");
+        }
+    }
 
     #[test]
     fn deserializes_jsonl_and_csv_variants_from_toml() {

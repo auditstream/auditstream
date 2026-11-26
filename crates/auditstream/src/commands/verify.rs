@@ -22,6 +22,7 @@ use crate::commands::common::{
 };
 use crate::config::Config;
 use crate::exit::{Exit, ExitCodeExt, write_stdout};
+use crate::logging;
 
 /// Minimum future monthly partitions required ahead of the current UTC month.
 const MIN_MONTHS_COVERED_AHEAD: u32 = 2;
@@ -73,6 +74,45 @@ pub(crate) fn run(args: &Args, config: &Config) -> anyhow::Result<()> {
     run_command_async(run_async(args, config))
 }
 
+async fn ensure_partitions_if_requested(
+    pool: &auditstream_pg::PgPool,
+    config: &Config,
+    fix: bool,
+) -> anyhow::Result<Vec<String>> {
+    if !fix {
+        return Ok(Vec::new());
+    }
+    let ensure = partitions::ensure_ahead(pool, &config.schema, DEFAULT_MONTHS_AHEAD)
+        .await
+        .map_err(|err| anyhow!("failed to ensure future partitions: {err}"))
+        .exit_code(Exit::Database)?;
+
+    let created_partitions: Vec<String> = ensure
+        .created
+        .iter()
+        .map(|ym| ym.partition_name())
+        .collect();
+
+    if created_partitions.is_empty() {
+        logging::emit_note(
+            config.log_format,
+            config.quiet,
+            &format!("fix: partitions already covered {DEFAULT_MONTHS_AHEAD} months ahead"),
+        );
+    } else {
+        logging::emit_note(
+            config.log_format,
+            config.quiet,
+            &format!(
+                "fix: created {} partition(s): {}",
+                created_partitions.len(),
+                created_partitions.join(", ")
+            ),
+        );
+    }
+    Ok(created_partitions)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
     let db_url = require_database_url(config)?;
@@ -83,29 +123,7 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
     let pool = connect_database(db_url).await?;
 
     // Optional --fix step runs D8's ensure_ahead(3) before reading verification state.
-    let mut created_partitions = Vec::new();
-    if args.fix {
-        let ensure = partitions::ensure_ahead(&pool, &config.schema, DEFAULT_MONTHS_AHEAD)
-            .await
-            .map_err(|err| anyhow!("failed to ensure future partitions: {err}"))
-            .exit_code(Exit::Database)?;
-
-        created_partitions = ensure
-            .created
-            .iter()
-            .map(|ym| ym.partition_name())
-            .collect();
-
-        if created_partitions.is_empty() {
-            eprintln!("fix: partitions already covered {DEFAULT_MONTHS_AHEAD} months ahead");
-        } else {
-            eprintln!(
-                "fix: created {} partition(s): {}",
-                created_partitions.len(),
-                created_partitions.join(", ")
-            );
-        }
-    }
+    let created_partitions = ensure_partitions_if_requested(&pool, config, args.fix).await?;
 
     let introspect_opts = IntrospectOptions::with_audit_schema(&config.schema);
     let all_user_schemas: BTreeSet<String> = introspect::user_schemas(&pool, &introspect_opts)
@@ -118,7 +136,11 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
     let excludes_by_table = group_excludes_by_table(&configured_excludes);
 
     let specs = if configured_tables.is_empty() {
-        eprintln!("note: no capture.tables configured; verifying installed triggers only");
+        logging::emit_note(
+            config.log_format,
+            config.quiet,
+            "note: no capture.tables configured; verifying installed triggers only",
+        );
         let installed = verify::installed_captures(&pool, &config.schema)
             .await
             .map_err(|err| anyhow!("failed to inspect installed auditstream triggers: {err}"))

@@ -1,8 +1,11 @@
 use std::time::{Duration, Instant};
 
-use auditstream_core::{ActorSource, Cursor, Event, EventSource, Op, Source};
+use auditstream_core::{ActorSource, Cursor, Event, EventSource, Op, Source, SourceError};
 use auditstream_pg::ddl::{self, DEFAULT_SCHEMA, DdlOptions, quote_ident};
-use auditstream_pg::reader::{ExportFilter, HistoryQuery, PgEventSource, RecordIdFilter, lookup};
+use auditstream_pg::reader::{
+    BoundaryAnchor, ExportFilter, HistoryQuery, PgEventSource, RecordIdFilter, ResumeVerification,
+    database_identity, fetch_export_lag, lookup, verify_resume_state,
+};
 use auditstream_pg::triggers::{self, TableTriggerSpec, TriggerOptions};
 use auditstream_testkit::TestDb;
 use sqlx::postgres::{PgConnection, PgPoolOptions};
@@ -30,6 +33,7 @@ struct ReaderFixture {
     app_role: String,
     reader_role: String,
     app_url: String,
+    reader_url: String,
     app_pool: PgPool,
     reader_pool: PgPool,
     admin_url: String,
@@ -126,6 +130,7 @@ async fn setup_reader_db() -> ReaderFixture {
         app_role,
         reader_role,
         app_url,
+        reader_url,
         app_pool,
         reader_pool,
         admin_url,
@@ -185,6 +190,7 @@ async fn deterministic_out_of_order_commits_lose_a_row_with_id_cursor_but_xid8_w
         app_pool,
         reader_pool,
         admin_url,
+        ..
     } = setup_reader_db().await;
 
     let mut conn_a = PgConnection::connect(&app_url).await.expect("conn A");
@@ -291,6 +297,7 @@ async fn open_transaction_holds_window_until_closed_then_delivers_all_later_rows
         app_pool,
         reader_pool,
         admin_url,
+        ..
     } = setup_reader_db().await;
 
     let mut holder_conn = PgConnection::connect(&app_url).await.expect("holder conn");
@@ -946,6 +953,593 @@ async fn tenant_filters_match_direct_delegated_and_advance_cursor() {
         .expect("filtered tenant window must advance cursor");
     assert_eq!(batch.events, Vec::new());
     assert!(batch.cursor.expect("cursor").xact_id > 0);
+
+    app_pool.close().await;
+    reader_pool.close().await;
+    drop(db);
+    cleanup_role(&admin_url, &app_role).await;
+    cleanup_role(&admin_url, &reader_role).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn cursor_ahead_of_xmin_fails_loudly_and_anchor_timeline_and_lag_work_as_reader_role() {
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let ReaderFixture {
+        db,
+        app_role,
+        reader_role,
+        app_url,
+        reader_url,
+        app_pool,
+        reader_pool,
+        admin_url,
+    } = setup_reader_db().await;
+
+    // 1. Least-privilege reader_role resolves timeline_id via pg_walfile_name(pg_current_wal_lsn()).
+    let ident = database_identity(&reader_pool, DEFAULT_SCHEMA)
+        .await
+        .expect("database_identity as reader_role");
+    let current_tl = ident
+        .timeline_id
+        .expect("timeline_id must be readable by least-privilege reader_role");
+    assert!(
+        current_tl >= 1,
+        "expected timeline_id >= 1, got {current_tl}"
+    );
+
+    // 2. Cursor strictly ahead of snapshot_xmin (and xact_id == xmin with id > 0) must fail loudly.
+    let mut future_source =
+        PgEventSource::with_default_schema(reader_pool.clone(), Cursor::new(u64::MAX - 1, 0));
+    let err = future_source
+        .next_batch(10)
+        .await
+        .expect_err("cursor.xact_id > xmin must fail loudly");
+    assert!(matches!(err, SourceError::InvalidCursor(_)), "{err:?}");
+    assert!(err.to_string().contains("snapshot_xmin"), "{err}");
+
+    // Seed 3 rows and paginate with batch_size=1 on a 1-connection pool to verify pinned window
+    // reading + clean connection release after window drain.
+    for id in [1_i32, 2, 3] {
+        app_pool
+            .execute(AssertSqlSafe(format!(
+                "INSERT INTO public.invoice VALUES ({id}, 'open', {id})"
+            )))
+            .await
+            .expect("insert invoice");
+    }
+
+    let single_conn_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&reader_url)
+        .await
+        .expect("connect single-connection reader pool");
+
+    let mut source =
+        PgEventSource::with_default_schema(single_conn_pool.clone(), Cursor::new(0, 0));
+    let delivered = drain_until(&mut source, 1, 3, Duration::from_secs(5)).await;
+    assert_eq!(delivered.len(), 3);
+    let cursor = source.acked_cursor();
+    let anchor = source
+        .acked_anchor()
+        .expect("acked_anchor must be recorded after ack");
+    assert_eq!(anchor.event_id, delivered[2].event_id);
+    assert!(anchor.xact_id < cursor.xact_id);
+
+    // After draining the window, the pinned connection must have been returned to the 1-connection pool.
+    let lag_on_single = fetch_export_lag(&single_conn_pool, DEFAULT_SCHEMA, cursor)
+        .await
+        .expect("pinned connection must be released back to 1-connection pool");
+    assert!(!lag_on_single.stalled);
+
+    let snap_xmin = source
+        .last_snapshot_xmin()
+        .expect("last_snapshot_xmin recorded");
+    assert_eq!(cursor, Cursor::new(snap_xmin, 0));
+    assert!(
+        source
+            .next_batch(10)
+            .await
+            .expect("caught-up cursor returns Ok(None)")
+            .is_none()
+    );
+    single_conn_pool.close().await;
+
+    // 3. Deterministic caught-up vs future cursor check under a pinned snapshot_xmin.
+    let mut pin_conn = PgConnection::connect(&app_url).await.expect("pin conn");
+    let mut tx_pin = pin_conn.begin().await.expect("begin tx_pin");
+    let pinned_xmin: u64 =
+        sqlx::query_scalar::<_, String>("SELECT pg_catalog.pg_current_xact_id()::text")
+            .fetch_one(&mut *tx_pin)
+            .await
+            .expect("allocate pinned xid")
+            .parse()
+            .expect("parse pinned xid");
+
+    // Wait for any older concurrent test transactions on other DBs in the cluster to finish so
+    // cluster-wide pg_snapshot_xmin() converges to our held `pinned_xmin`.
+    let pin_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let cur_xmin: u64 = sqlx::query_scalar::<_, String>(
+            "SELECT pg_catalog.pg_snapshot_xmin(pg_catalog.pg_current_snapshot())::text",
+        )
+        .fetch_one(&reader_pool)
+        .await
+        .expect("query snapshot_xmin")
+        .parse()
+        .expect("parse snapshot_xmin");
+        if cur_xmin == pinned_xmin {
+            break;
+        }
+        assert!(
+            Instant::now() < pin_deadline,
+            "pg_snapshot_xmin ({cur_xmin}) did not converge to pinned_xmin ({pinned_xmin})"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let mut caught_up_exact =
+        PgEventSource::with_default_schema(reader_pool.clone(), Cursor::new(pinned_xmin, 0));
+    assert!(
+        caught_up_exact
+            .next_batch(10)
+            .await
+            .expect("cursor == (xmin, 0) is caught up")
+            .is_none()
+    );
+
+    let mut bad_same_xact =
+        PgEventSource::with_default_schema(reader_pool.clone(), Cursor::new(pinned_xmin, 1));
+    let same_xact_err = bad_same_xact
+        .next_batch(10)
+        .await
+        .expect_err("cursor == (xmin, 1) must fail loudly");
+    assert!(matches!(same_xact_err, SourceError::InvalidCursor(_)));
+
+    let mut bad_future_xact = PgEventSource::with_default_schema(
+        reader_pool.clone(),
+        Cursor::new(pinned_xmin.saturating_add(1), 0),
+    );
+    let future_xact_err = bad_future_xact
+        .next_batch(10)
+        .await
+        .expect_err("cursor.xact_id > xmin must fail loudly");
+    assert!(matches!(future_xact_err, SourceError::InvalidCursor(_)));
+
+    tx_pin.rollback().await.expect("rollback tx_pin");
+    pin_conn.close().await.expect("close pin conn");
+
+    // 4. verify_resume_state allows verified zero-loss HA failover across forward timeline_id
+    //    increment and rejects backward timeline_id regressions, invalid timeline 0, and
+    //    unreadable post-failover timelines.
+    verify_resume_state(
+        &reader_pool,
+        DEFAULT_SCHEMA,
+        ResumeVerification {
+            cursor,
+            anchor: Some(anchor),
+            saved_timeline_id: Some(current_tl),
+            current_timeline_id: Some(current_tl.saturating_add(1)),
+        },
+    )
+    .await
+    .expect("matching boundary anchor must allow verified zero-loss timeline increment");
+
+    let regressed_tl = verify_resume_state(
+        &reader_pool,
+        DEFAULT_SCHEMA,
+        ResumeVerification {
+            cursor,
+            anchor: Some(anchor),
+            saved_timeline_id: Some(current_tl.saturating_add(1)),
+            current_timeline_id: Some(current_tl),
+        },
+    )
+    .await
+    .expect_err("backward timeline_id regression must fail even with matching anchor");
+    assert!(matches!(regressed_tl, SourceError::InvalidCursor(_)));
+    assert!(
+        regressed_tl.to_string().contains("regressed"),
+        "{regressed_tl}"
+    );
+
+    let zero_tl = verify_resume_state(
+        &reader_pool,
+        DEFAULT_SCHEMA,
+        ResumeVerification {
+            cursor,
+            anchor: Some(anchor),
+            saved_timeline_id: Some(0),
+            current_timeline_id: Some(current_tl),
+        },
+    )
+    .await
+    .expect_err("timeline_id 0 must be rejected");
+    assert!(matches!(zero_tl, SourceError::InvalidCursor(_)));
+
+    let post_failover_unknown = verify_resume_state(
+        &reader_pool,
+        DEFAULT_SCHEMA,
+        ResumeVerification {
+            cursor,
+            anchor: Some(anchor),
+            saved_timeline_id: Some(2),
+            current_timeline_id: None,
+        },
+    )
+    .await
+    .expect_err("unreadable current timeline after saved timeline > 1 must fail closed");
+    assert!(matches!(
+        post_failover_unknown,
+        SourceError::InvalidCursor(_)
+    ));
+
+    // Initial timeline (1) with intact boundary anchor still allows reading from an unprivileged
+    // standby whose timeline_id is None, whereas without an anchor it fails closed.
+    verify_resume_state(
+        &reader_pool,
+        DEFAULT_SCHEMA,
+        ResumeVerification {
+            cursor,
+            anchor: Some(anchor),
+            saved_timeline_id: Some(1),
+            current_timeline_id: None,
+        },
+    )
+    .await
+    .expect("saved timeline 1 with matching boundary anchor allows None current timeline");
+
+    let unanchored_unknown = verify_resume_state(
+        &reader_pool,
+        DEFAULT_SCHEMA,
+        ResumeVerification {
+            cursor,
+            anchor: None,
+            saved_timeline_id: Some(1),
+            current_timeline_id: None,
+        },
+    )
+    .await
+    .expect_err("saved timeline without anchor and None current timeline must fail closed");
+    assert!(matches!(unanchored_unknown, SourceError::InvalidCursor(_)));
+
+    // 5. verify_resume_state rejects malformed cursor/anchor bounds, diverged event_id (simulated
+    //    PITR), missing anchor, and unanchored forward timeline change on non-zero cursor.
+    let neg_cursor = verify_resume_state(
+        &reader_pool,
+        DEFAULT_SCHEMA,
+        ResumeVerification {
+            cursor: Cursor::new(cursor.xact_id, -1),
+            anchor: Some(anchor),
+            saved_timeline_id: Some(current_tl),
+            current_timeline_id: Some(current_tl),
+        },
+    )
+    .await
+    .expect_err("negative cursor.id must fail loudly");
+    assert!(matches!(neg_cursor, SourceError::InvalidCursor(_)));
+
+    let anchor_ahead = verify_resume_state(
+        &reader_pool,
+        DEFAULT_SCHEMA,
+        ResumeVerification {
+            cursor: Cursor::new(anchor.xact_id, 0),
+            anchor: Some(anchor),
+            saved_timeline_id: Some(current_tl),
+            current_timeline_id: Some(current_tl),
+        },
+    )
+    .await
+    .expect_err("anchor at or ahead of cursor must fail loudly");
+    assert!(matches!(anchor_ahead, SourceError::InvalidCursor(_)));
+
+    let diverged = verify_resume_state(
+        &reader_pool,
+        DEFAULT_SCHEMA,
+        ResumeVerification {
+            cursor,
+            anchor: Some(BoundaryAnchor {
+                event_id: Uuid::new_v4(),
+                ..anchor
+            }),
+            saved_timeline_id: Some(current_tl),
+            current_timeline_id: Some(current_tl.saturating_add(1)),
+        },
+    )
+    .await
+    .expect_err("diverged anchor event_id must fail loudly");
+    assert!(matches!(diverged, SourceError::InvalidCursor(_)));
+    assert!(diverged.to_string().contains("diverged"), "{diverged}");
+
+    let missing = verify_resume_state(
+        &reader_pool,
+        DEFAULT_SCHEMA,
+        ResumeVerification {
+            cursor,
+            anchor: Some(BoundaryAnchor {
+                id: anchor.id.saturating_sub(1).max(1) + 10_000,
+                ..anchor
+            }),
+            saved_timeline_id: Some(current_tl),
+            current_timeline_id: Some(current_tl),
+        },
+    )
+    .await
+    .expect_err("missing anchor row must fail loudly");
+    assert!(matches!(missing, SourceError::InvalidCursor(_)));
+    assert!(missing.to_string().contains("missing"), "{missing}");
+
+    let unanchored_tl = verify_resume_state(
+        &reader_pool,
+        DEFAULT_SCHEMA,
+        ResumeVerification {
+            cursor,
+            anchor: None,
+            saved_timeline_id: Some(current_tl),
+            current_timeline_id: Some(current_tl.saturating_add(1)),
+        },
+    )
+    .await
+    .expect_err("unanchored timeline change on non-zero cursor must fail loudly");
+    assert!(matches!(unanchored_tl, SourceError::InvalidCursor(_)));
+    assert!(
+        unanchored_tl.to_string().contains("no boundary row anchor"),
+        "{unanchored_tl}"
+    );
+
+    // 6. fetch_export_lag reports clean state when caught up, then stalled=true when an open
+    //    transaction pins snapshot_xmin while a newer transaction commits rows behind it.
+    let clean_lag = fetch_export_lag(&reader_pool, DEFAULT_SCHEMA, cursor)
+        .await
+        .expect("fetch clean export lag");
+    assert!(!clean_lag.stalled);
+    assert!(clean_lag.oldest_unexported_age_secs.is_none());
+    assert!(clean_lag.snapshot_xmin >= cursor.xact_id);
+
+    let mut holder_conn = PgConnection::connect(&app_url).await.expect("holder conn");
+    let mut tx_hold = holder_conn.begin().await.expect("begin tx_hold");
+    let held_xid: u64 =
+        sqlx::query_scalar::<_, String>("SELECT pg_catalog.pg_current_xact_id()::text")
+            .fetch_one(&mut *tx_hold)
+            .await
+            .expect("allocate holder xid")
+            .parse()
+            .expect("parse holder xid");
+
+    let hold_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let cur_xmin: u64 = sqlx::query_scalar::<_, String>(
+            "SELECT pg_catalog.pg_snapshot_xmin(pg_catalog.pg_current_snapshot())::text",
+        )
+        .fetch_one(&reader_pool)
+        .await
+        .expect("query snapshot_xmin")
+        .parse()
+        .expect("parse snapshot_xmin");
+        if cur_xmin == held_xid {
+            break;
+        }
+        assert!(
+            Instant::now() < hold_deadline,
+            "pg_snapshot_xmin ({cur_xmin}) did not converge to held_xid ({held_xid})"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    app_pool
+        .execute("INSERT INTO public.invoice VALUES (99, 'stalled', 99)")
+        .await
+        .expect("commit row behind holder tx");
+
+    let stalled_lag = fetch_export_lag(&reader_pool, DEFAULT_SCHEMA, cursor)
+        .await
+        .expect("fetch stalled export lag");
+    assert!(
+        stalled_lag.stalled,
+        "expected stalled=true: {stalled_lag:?}"
+    );
+    assert_eq!(stalled_lag.snapshot_xmin, held_xid);
+    assert!(
+        stalled_lag
+            .oldest_unexported_age_secs
+            .is_some_and(|age| age >= 0.0),
+        "expected non-negative oldest_unexported_age_secs: {stalled_lag:?}"
+    );
+
+    tx_hold.rollback().await.expect("rollback tx_hold");
+    holder_conn.close().await.expect("close holder");
+
+    // 7. Filtered-out drained window still records latest unfiltered BoundaryAnchor, AND a
+    //    filtered window that matches earlier rows followed by unfiltered tail rows anchors the
+    //    tail unfiltered row in a single deterministic snapshot window.
+    let mut filtered_source = PgEventSource::new(
+        reader_pool.clone(),
+        DEFAULT_SCHEMA,
+        cursor,
+        ExportFilter {
+            actor_or_on_behalf_of: Some("nobody_matches".to_owned()),
+            ..ExportFilter::default()
+        },
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(batch) = filtered_source
+            .next_batch(10)
+            .await
+            .expect("filtered batch")
+        {
+            assert_eq!(batch.events, Vec::new());
+            let next_c = batch.cursor.expect("filtered cursor");
+            filtered_source.ack(&next_c).await.expect("ack filtered");
+            break;
+        }
+        assert!(Instant::now() < deadline, "filtered window timed out");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let filtered_anchor = filtered_source
+        .acked_anchor()
+        .expect("filtered drained window must still record latest unfiltered anchor");
+    assert!(filtered_anchor.xact_id > anchor.xact_id);
+
+    let after_empty_filter_cursor = filtered_source.acked_cursor();
+    app_pool
+        .execute("SELECT auditstream.log_event('app.matched', '{\"n\":1}'::jsonb, NULL)")
+        .await
+        .expect("log matched app event");
+    app_pool
+        .execute("INSERT INTO public.invoice VALUES (100, 'tail_unmatched', 100)")
+        .await
+        .expect("insert trailing db event");
+    let (tail_xact_raw, tail_event_id): (String, String) = sqlx::query_as(
+        "SELECT xact_id::text, event_id::text FROM auditstream.changes \
+         ORDER BY xact_id DESC, id DESC LIMIT 1",
+    )
+    .fetch_one(&reader_pool)
+    .await
+    .expect("read tail row");
+    let tail_xact_id: u64 = tail_xact_raw.parse().expect("parse tail xact_id");
+
+    // Wait until cluster-wide pg_snapshot_xmin() moves strictly past `tail_xact_id` so both the
+    // matched app event and the trailing unmatched db event fall inside one snapshot window.
+    let tail_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let cur_xmin: u64 = sqlx::query_scalar::<_, String>(
+            "SELECT pg_catalog.pg_snapshot_xmin(pg_catalog.pg_current_snapshot())::text",
+        )
+        .fetch_one(&reader_pool)
+        .await
+        .expect("query snapshot_xmin")
+        .parse()
+        .expect("parse snapshot_xmin");
+        if cur_xmin > tail_xact_id {
+            break;
+        }
+        assert!(
+            Instant::now() < tail_deadline,
+            "pg_snapshot_xmin ({cur_xmin}) did not advance past tail_xact_id ({tail_xact_id})"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let mut partial_filtered = PgEventSource::new(
+        reader_pool.clone(),
+        DEFAULT_SCHEMA,
+        after_empty_filter_cursor,
+        ExportFilter {
+            source: Some(Source::App),
+            ..ExportFilter::default()
+        },
+    );
+    let batch = partial_filtered
+        .next_batch(10)
+        .await
+        .expect("partial filtered batch")
+        .expect("expected single batch containing matched app event");
+    assert_eq!(batch.events.len(), 1);
+    assert_eq!(batch.events[0].source, Source::App);
+    let batch_cursor = batch.cursor.expect("batch cursor");
+    partial_filtered
+        .ack(&batch_cursor)
+        .await
+        .expect("ack partial filtered batch");
+    let partial_anchor = partial_filtered
+        .acked_anchor()
+        .expect("partial filtered window must anchor trailing unfiltered row");
+    assert_eq!(partial_anchor.event_id.to_string(), tail_event_id);
+
+    // 8. Mid-window `next_batch(0)` releases its pinned connection cleanly, and `ack` rejects
+    //    cursors ahead of `current_position()`.
+    let pool_one = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&reader_url)
+        .await
+        .expect("connect 1-conn pool");
+    let mut mid_window = PgEventSource::with_default_schema(pool_one.clone(), Cursor::new(0, 0));
+    let first_page = mid_window
+        .next_batch(1)
+        .await
+        .expect("first page")
+        .expect("at least one row");
+    assert_eq!(first_page.events.len(), 1);
+    assert!(
+        mid_window
+            .next_batch(0)
+            .await
+            .expect("next_batch(0) returns None")
+            .is_none()
+    );
+    // Pool connection must now be released so another query on `pool_one` succeeds immediately.
+    let _ = fetch_export_lag(&pool_one, DEFAULT_SCHEMA, Cursor::new(0, 0))
+        .await
+        .expect("next_batch(0) must release pinned connection");
+    let bad_ack = mid_window
+        .ack(&Cursor::new(u64::MAX - 1, 0))
+        .await
+        .expect_err("ack ahead of position must fail");
+    assert!(matches!(bad_ack, SourceError::InvalidCursor(_)));
+    pool_one.close().await;
+
+    // 9. verify_resume_state rejects unexpected audit rows inside the drained gap
+    //    `(anchor, (cursor.xact_id, 0))` (catches PITR/async-failover writes when unaudited
+    //    transactions had advanced `cursor.xact_id` far ahead of `anchor.xact_id`).
+    let gap_divergence = verify_resume_state(
+        &reader_pool,
+        DEFAULT_SCHEMA,
+        ResumeVerification {
+            cursor: partial_filtered.acked_cursor(),
+            anchor: Some(anchor),
+            saved_timeline_id: Some(current_tl),
+            current_timeline_id: Some(current_tl.saturating_add(1)),
+        },
+    )
+    .await
+    .expect_err("unexpected rows in (anchor, cursor) drained gap must fail loudly");
+    assert!(matches!(gap_divergence, SourceError::InvalidCursor(_)));
+    assert!(
+        gap_divergence.to_string().contains("unexpected audit"),
+        "{gap_divergence}"
+    );
+
+    // 10. Per-database privilege fallback in database_identity: revoking `pg_current_wal_lsn()`
+    //     and `pg_control_checkpoint()` from PUBLIC inside this isolated TestDb exercises the
+    //     role-scoped `pg_control_checkpoint()` fallback and the `timeline_id: None` /
+    //     `system_identifier: None` paths cleanly.
+    db.pool()
+        .execute("REVOKE EXECUTE ON FUNCTION pg_catalog.pg_current_wal_lsn() FROM PUBLIC")
+        .await
+        .expect("revoke pg_current_wal_lsn from PUBLIC in isolated TestDb");
+    db.pool()
+        .execute("REVOKE EXECUTE ON FUNCTION pg_catalog.pg_control_checkpoint() FROM PUBLIC")
+        .await
+        .expect("revoke pg_control_checkpoint from PUBLIC in isolated TestDb");
+    db.pool()
+        .execute(AssertSqlSafe(format!(
+            "GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_checkpoint() TO {}",
+            quote_ident(&reader_role)
+        )))
+        .await
+        .expect("grant pg_control_checkpoint to reader_role");
+    let checkpoint_ident = database_identity(&reader_pool, DEFAULT_SCHEMA)
+        .await
+        .expect("database_identity via pg_control_checkpoint fallback");
+    assert_eq!(checkpoint_ident.timeline_id, Some(current_tl));
+
+    db.pool()
+        .execute(AssertSqlSafe(format!(
+            "REVOKE EXECUTE ON FUNCTION pg_catalog.pg_control_checkpoint() FROM {}",
+            quote_ident(&reader_role)
+        )))
+        .await
+        .expect("revoke pg_control_checkpoint from reader_role");
+    db.pool()
+        .execute("REVOKE EXECUTE ON FUNCTION pg_catalog.pg_control_system() FROM PUBLIC")
+        .await
+        .expect("revoke pg_control_system from PUBLIC in isolated TestDb");
+    let restricted_ident = database_identity(&reader_pool, DEFAULT_SCHEMA)
+        .await
+        .expect("database_identity when WAL/control functions are revoked");
+    assert_eq!(restricted_ident.timeline_id, None);
+    assert_eq!(restricted_ident.system_identifier, None);
 
     app_pool.close().await;
     reader_pool.close().await;

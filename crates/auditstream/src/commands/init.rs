@@ -15,17 +15,20 @@ use auditstream_pg::introspect::{self, IntrospectError, IntrospectOptions, Table
 use auditstream_pg::migrations::{
     self, MigrationFormat as PgMigrationFormat, MigrationOptions, PreviewOutcome, WriteOutcome,
 };
+use auditstream_pg::triggers::TableTriggerSpec;
 use clap::Args as ClapArgs;
 use time::OffsetDateTime;
 use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
 use uuid::Uuid;
 
+use crate::cli::LogFormat;
 use crate::commands::common::{
     connect_database, parse_exclude_refs, parse_table_refs, require_database_url,
     run_async as run_command_async, sanitize_terminal, table_trigger_spec,
 };
 use crate::config::{Config, MigrationFormat};
 use crate::exit::{Exit, ExitCodeExt, write_stdout};
+use crate::logging;
 
 const PRISMA_CONFIG_FILES: [&str; 6] = [
     "prisma.config.ts",
@@ -70,93 +73,17 @@ pub(crate) struct Args {
     pub(crate) dry_run: bool,
 }
 
-/// Runs the `init` command.
-pub(crate) fn run(args: &Args, config: &Config) -> anyhow::Result<()> {
-    run_command_async(run_async(args, config))
+struct ValidatedSelection {
+    trigger_specs: Vec<TableTriggerSpec>,
+    canonical_tables: Vec<String>,
+    canonical_excludes: Vec<String>,
 }
 
-#[allow(clippy::too_many_lines)]
-async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
-    let db_url = require_database_url(config)?;
-
-    // Parse table and exclusion specs up front so syntax mistakes exit 2 immediately.
-    // CLI `--table` flags default unqualified names to `public.<table>`; config entries stay explicit.
-    let parsed_tables = parse_table_refs(&config.capture.tables, args.table.is_empty())?;
-    let parsed_excludes = parse_exclude_refs(&config.capture.exclude, args.exclude.is_empty())?;
-
-    // When no tables are selected, introspect all user schemas, list them on stderr, and exit 2.
-    if parsed_tables.is_empty() {
-        let pool = connect_database(db_url).await?;
-        let introspect_opts = IntrospectOptions::with_audit_schema(&config.schema);
-        let schemas = introspect::user_schemas(&pool, &introspect_opts)
-            .await
-            .map_err(|err| anyhow!("failed to list database schemas: {err}"))
-            .exit_code(Exit::Database)?;
-        let schema_refs: Vec<&str> = schemas.iter().map(String::as_str).collect();
-        let discovered = if schema_refs.is_empty() {
-            Vec::new()
-        } else {
-            introspect::tables_with_options(&pool, &schema_refs, &introspect_opts)
-                .await
-                .map_err(|err| anyhow!("failed to introspect database tables: {err}"))
-                .exit_code(Exit::Database)?
-        };
-        pool.close().await;
-
-        if discovered.is_empty() {
-            eprintln!("Available tables: (none)");
-        } else {
-            eprintln!("Available tables:");
-            for table in &discovered {
-                eprintln!(
-                    "  {}.{}",
-                    sanitize_terminal(&table.schema),
-                    sanitize_terminal(&table.name)
-                );
-            }
-        }
-        return Err(anyhow!(
-            "no tables selected: pass --table <[schema.]table> or set capture.tables in auditstream.toml"
-        ))
-        .exit_code(Exit::Usage);
-    }
-
-    // Resolve or autodetect the migration format offline before opening a database connection
-    // so missing or ambiguous layouts exit 2 immediately without requiring a live Postgres instance.
-    let (format, autodetected) = match config.migrations.format {
-        Some(format) => (format, false),
-        None => (detect_migration_format(Path::new("."))?, true),
-    };
-
-    let pool = connect_database(db_url).await?;
-    if autodetected {
-        eprintln!("detected migration format: {}", format_name(format));
-    }
-    let introspect_opts = IntrospectOptions::with_audit_schema(&config.schema);
-
-    // Collect every unique schema referenced by --table or --exclude.
-    let mut referenced_schemas: BTreeSet<&str> = BTreeSet::new();
-    for (schema, _) in &parsed_tables {
-        referenced_schemas.insert(schema.as_str());
-    }
-    for (schema, _, _) in &parsed_excludes {
-        referenced_schemas.insert(schema.as_str());
-    }
-    let schema_list: Vec<&str> = referenced_schemas.into_iter().collect();
-
-    let introspected = introspect::tables_with_options(&pool, &schema_list, &introspect_opts)
-        .await
-        .map_err(|err| match err {
-            IntrospectError::UnknownSchema { schema } => {
-                crate::exit::tag_error(anyhow!("unknown schema `{schema}`"), Exit::Usage)
-            }
-            other => crate::exit::tag_error(
-                anyhow!("failed to introspect database tables: {other}"),
-                Exit::Database,
-            ),
-        })?;
-    pool.close().await;
-
+fn validate_selection_and_build_specs(
+    parsed_tables: &[(String, String)],
+    parsed_excludes: &[(String, String, String)],
+    introspected: &[TableInfo],
+) -> anyhow::Result<ValidatedSelection> {
     let by_key: BTreeMap<(&str, &str), &TableInfo> = introspected
         .iter()
         .map(|t| ((t.schema.as_str(), t.name.as_str()), t))
@@ -164,7 +91,7 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
 
     // Deduplicate and validate selected tables in deterministic order.
     let mut selected_set: BTreeSet<(String, String)> = BTreeSet::new();
-    for (schema, table) in &parsed_tables {
+    for (schema, table) in parsed_tables {
         if !by_key.contains_key(&(schema.as_str(), table.as_str())) {
             return Err(anyhow!("unknown table `{schema}.{table}`")).exit_code(Exit::Usage);
         }
@@ -173,7 +100,7 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
 
     // Validate excluded columns against introspected table metadata and selected tables.
     let mut excludes_by_table: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
-    for (schema, table, column) in &parsed_excludes {
+    for (schema, table, column) in parsed_excludes {
         let Some(info) = by_key.get(&(schema.as_str(), table.as_str())) else {
             return Err(anyhow!(
                 "unknown table `{schema}.{table}` in excluded column `{schema}.{table}.{column}`"
@@ -202,7 +129,6 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
             .insert(column.clone());
     }
 
-    // Build deterministic TableTriggerSpecs + canonical config lists.
     let mut trigger_specs = Vec::with_capacity(selected_set.len());
     let mut canonical_tables = Vec::with_capacity(selected_set.len());
     let mut canonical_excludes = Vec::new();
@@ -228,60 +154,67 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
         ));
     }
 
-    let out_dir = config
-        .migrations
-        .dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(default_out_dir(format)));
-    let pg_format = to_pg_format(format);
-    let ddl = DdlOptions::new(config.schema.clone(), Vec::new());
-    let migration_opts = MigrationOptions::new(
-        pg_format,
-        &out_dir,
-        OffsetDateTime::now_utc(),
-        ddl,
+    Ok(ValidatedSelection {
         trigger_specs,
-    );
+        canonical_tables,
+        canonical_excludes,
+    })
+}
 
-    if args.dry_run {
-        match migrations::preview(&migration_opts).exit_code(Exit::Io)? {
-            PreviewOutcome::Sql { sql, .. } => {
-                let mut out = io::stdout().lock();
-                if sql.ends_with('\n') {
-                    write_stdout(&mut out, sql.as_bytes())?;
-                } else {
-                    let mut buf = sql.into_bytes();
-                    buf.push(b'\n');
-                    write_stdout(&mut out, &buf)?;
-                }
-            }
-            PreviewOutcome::UpToDate { existing } => {
-                eprintln!(
-                    "up to date ({})",
-                    sanitize_terminal(&existing.display().to_string())
-                );
+fn emit_dry_run_preview(migration_opts: &MigrationOptions, config: &Config) -> anyhow::Result<()> {
+    match migrations::preview(migration_opts).exit_code(Exit::Io)? {
+        PreviewOutcome::Sql { sql, .. } => {
+            let mut out = io::stdout().lock();
+            if sql.ends_with('\n') {
+                write_stdout(&mut out, sql.as_bytes())?;
+            } else {
+                let mut buf = sql.into_bytes();
+                buf.push(b'\n');
+                write_stdout(&mut out, &buf)?;
             }
         }
-        return Ok(());
+        PreviewOutcome::UpToDate { existing } => {
+            logging::emit_note(
+                config.log_format,
+                config.quiet,
+                &format!(
+                    "up to date ({})",
+                    sanitize_terminal(&existing.display().to_string())
+                ),
+            );
+        }
     }
+    Ok(())
+}
 
+fn write_migrations_and_config(
+    migration_opts: &MigrationOptions,
+    selection: &ValidatedSelection,
+    format: MigrationFormat,
+    out_dir: &Path,
+    config: &Config,
+) -> anyhow::Result<()> {
     // Validate the config target (rejecting symlinks/non-regular files) before writing migrations.
     let _ = read_existing_config_doc(&config.file_path)?;
 
-    match migrations::write(&migration_opts).exit_code(Exit::Io)? {
+    match migrations::write(migration_opts).exit_code(Exit::Io)? {
         WriteOutcome::UpToDate { existing } => {
-            eprintln!(
-                "up to date ({})",
-                sanitize_terminal(&existing.display().to_string())
+            logging::emit_note(
+                config.log_format,
+                config.quiet,
+                &format!(
+                    "up to date ({})",
+                    sanitize_terminal(&existing.display().to_string())
+                ),
             );
         }
         WriteOutcome::Written { files, .. } => {
             update_config_file(
                 &config.file_path,
-                &canonical_tables,
-                &canonical_excludes,
+                &selection.canonical_tables,
+                &selection.canonical_excludes,
                 format,
-                &out_dir,
+                out_dir,
             )?;
 
             tracing::info!(
@@ -299,8 +232,137 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
             }
         }
     }
-
     Ok(())
+}
+
+fn emit_available_tables(log_format: LogFormat, discovered: &[TableInfo]) {
+    if discovered.is_empty() {
+        logging::emit_diagnostic(log_format, "Available tables: (none)");
+    } else if log_format == LogFormat::Json {
+        let list = discovered
+            .iter()
+            .map(|table| {
+                format!(
+                    "{}.{}",
+                    sanitize_terminal(&table.schema),
+                    sanitize_terminal(&table.name)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        logging::emit_diagnostic(log_format, &format!("Available tables: {list}"));
+    } else {
+        eprintln!("Available tables:");
+        for table in discovered {
+            eprintln!(
+                "  {}.{}",
+                sanitize_terminal(&table.schema),
+                sanitize_terminal(&table.name)
+            );
+        }
+    }
+}
+
+/// Runs the `init` command.
+pub(crate) fn run(args: &Args, config: &Config) -> anyhow::Result<()> {
+    run_command_async(run_async(args, config))
+}
+
+async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
+    let db_url = require_database_url(config)?;
+
+    // Parse table and exclusion specs up front so syntax mistakes exit 2 immediately.
+    // CLI `--table` flags default unqualified names to `public.<table>`; config entries stay explicit.
+    let parsed_tables = parse_table_refs(&config.capture.tables, args.table.is_empty())?;
+    let parsed_excludes = parse_exclude_refs(&config.capture.exclude, args.exclude.is_empty())?;
+
+    // When no tables are selected, introspect all user schemas, list them on stderr, and exit 2.
+    if parsed_tables.is_empty() {
+        let pool = connect_database(db_url).await?;
+        let introspect_opts = IntrospectOptions::with_audit_schema(&config.schema);
+        let schemas = introspect::user_schemas(&pool, &introspect_opts)
+            .await
+            .map_err(|err| anyhow!("failed to list database schemas: {err}"))
+            .exit_code(Exit::Database)?;
+        let schema_refs: Vec<&str> = schemas.iter().map(String::as_str).collect();
+        let discovered = if schema_refs.is_empty() {
+            Vec::new()
+        } else {
+            introspect::tables_with_options(&pool, &schema_refs, &introspect_opts)
+                .await
+                .map_err(|err| anyhow!("failed to introspect database tables: {err}"))
+                .exit_code(Exit::Database)?
+        };
+        pool.close().await;
+
+        emit_available_tables(config.log_format, &discovered);
+        return Err(anyhow!(
+            "no tables selected: pass --table <[schema.]table> or set capture.tables in auditstream.toml"
+        ))
+        .exit_code(Exit::Usage);
+    }
+
+    // Resolve or autodetect the migration format offline before opening a database connection
+    // so missing or ambiguous layouts exit 2 immediately without requiring a live Postgres instance.
+    let (format, autodetected) = match config.migrations.format {
+        Some(format) => (format, false),
+        None => (detect_migration_format(Path::new("."))?, true),
+    };
+
+    let pool = connect_database(db_url).await?;
+    if autodetected {
+        logging::emit_note(
+            config.log_format,
+            config.quiet,
+            &format!("detected migration format: {}", format_name(format)),
+        );
+    }
+    let introspect_opts = IntrospectOptions::with_audit_schema(&config.schema);
+
+    let schema_list: Vec<&str> = parsed_tables
+        .iter()
+        .map(|(schema, _)| schema.as_str())
+        .chain(parsed_excludes.iter().map(|(schema, _, _)| schema.as_str()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    let introspected = introspect::tables_with_options(&pool, &schema_list, &introspect_opts)
+        .await
+        .map_err(|err| match err {
+            IntrospectError::UnknownSchema { schema } => {
+                crate::exit::tag_error(anyhow!("unknown schema `{schema}`"), Exit::Usage)
+            }
+            other => crate::exit::tag_error(
+                anyhow!("failed to introspect database tables: {other}"),
+                Exit::Database,
+            ),
+        })?;
+    pool.close().await;
+
+    let selection =
+        validate_selection_and_build_specs(&parsed_tables, &parsed_excludes, &introspected)?;
+
+    let out_dir = config
+        .migrations
+        .dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(default_out_dir(format)));
+    let pg_format = to_pg_format(format);
+    let ddl = DdlOptions::new(config.schema.clone(), Vec::new());
+    let migration_opts = MigrationOptions::new(
+        pg_format,
+        &out_dir,
+        OffsetDateTime::now_utc(),
+        ddl,
+        selection.trigger_specs.clone(),
+    );
+
+    if args.dry_run {
+        return emit_dry_run_preview(&migration_opts, config);
+    }
+
+    write_migrations_and_config(&migration_opts, &selection, format, &out_dir, config)
 }
 
 const fn default_out_dir(format: MigrationFormat) -> &'static str {
