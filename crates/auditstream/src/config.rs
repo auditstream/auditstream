@@ -72,24 +72,144 @@ impl fmt::Display for RedactedUrl {
     }
 }
 
+fn is_secret_pg_param(key: &str) -> bool {
+    key.eq_ignore_ascii_case("password") || key.eq_ignore_ascii_case("sslpassword")
+}
+
 fn redact_url_password(raw: &str) -> String {
-    let Some(scheme_end) = raw.find("://") else {
-        return raw.to_owned();
-    };
+    if let Some(scheme_end) = raw.find("://") {
+        redact_uri_password(raw, scheme_end)
+    } else {
+        redact_libpq_kv_password(raw)
+    }
+}
+
+fn redact_uri_password(raw: &str, scheme_end: usize) -> String {
     let rest = &raw[scheme_end + 3..];
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
-    let Some(at_pos) = authority.rfind('@') else {
-        return raw.to_owned();
-    };
-    let userinfo = &authority[..at_pos];
-    let Some(colon_pos) = userinfo.find(':') else {
-        return raw.to_owned();
+    let tail = &rest[authority_end..];
+
+    let mut out = String::with_capacity(raw.len());
+    out.push_str(&raw[..scheme_end + 3]);
+
+    if let Some(at_pos) = authority.rfind('@')
+        && let Some(colon_pos) = authority[..at_pos].find(':')
+    {
+        out.push_str(&authority[..=colon_pos]);
+        out.push_str("***");
+        out.push_str(&authority[at_pos..]);
+    } else {
+        out.push_str(authority);
+    }
+
+    let Some(q_pos) = tail.find('?') else {
+        out.push_str(tail);
+        return out;
     };
 
-    let prefix = &raw[..=(scheme_end + 3 + colon_pos)];
-    let suffix = &rest[at_pos..];
-    format!("{prefix}***{suffix}")
+    out.push_str(&tail[..=q_pos]);
+    let after_q = &tail[q_pos + 1..];
+    let (query, fragment) = match after_q.find('#') {
+        Some(hash_pos) => (&after_q[..hash_pos], &after_q[hash_pos..]),
+        None => (after_q, ""),
+    };
+
+    for (idx, pair) in query.split('&').enumerate() {
+        if idx > 0 {
+            out.push('&');
+        }
+        if let Some(eq_pos) = pair.find('=') {
+            let key = &pair[..eq_pos];
+            if is_secret_pg_param(key) {
+                out.push_str(key);
+                out.push_str("=***");
+                continue;
+            }
+        }
+        out.push_str(pair);
+    }
+
+    out.push_str(fragment);
+    out
+}
+
+fn advance_escaped(raw: &str, backslash_idx: usize) -> usize {
+    let after_slash = backslash_idx + 1;
+    raw[after_slash..]
+        .chars()
+        .next()
+        .map_or(raw.len(), |ch| after_slash + ch.len_utf8())
+}
+
+fn redact_libpq_kv_password(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut out = String::with_capacity(len);
+
+    while i < len {
+        let ws_start = i;
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        out.push_str(&raw[ws_start..i]);
+        if i >= len {
+            break;
+        }
+
+        let key_start = i;
+        while i < len && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' {
+            i += 1;
+        }
+        let key = &raw[key_start..i];
+        out.push_str(key);
+
+        let pre_eq = i;
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= len || bytes[i] != b'=' {
+            out.push_str(&raw[pre_eq..i]);
+            continue;
+        }
+        i += 1; // consume '='
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        out.push_str(&raw[pre_eq..i]);
+
+        let val_start = i;
+        if i < len && bytes[i] == b'\'' {
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\\' {
+                    i = advance_escaped(raw, i);
+                } else if bytes[i] == b'\'' {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+        } else {
+            while i < len && !bytes[i].is_ascii_whitespace() {
+                if bytes[i] == b'\\' {
+                    i = advance_escaped(raw, i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        if is_secret_pg_param(key) {
+            out.push_str("***");
+        } else {
+            out.push_str(&raw[val_start..i]);
+        }
+    }
+
+    out
 }
 
 /// Resolved CLI configuration (public contract: `docs/reference/config.md`).
@@ -543,6 +663,80 @@ batch_size = 250
         assert!(!display.contains(&secret));
         assert!(!debug.contains(&secret));
         assert!(display.contains("postgresql://app_user:***@db.example.com:5432/prod"));
+    }
+
+    #[test]
+    fn redacted_url_masks_uri_query_params_and_libpq_key_value_passwords() {
+        let pw1 = "s3cr3t_alpha";
+        let pw2 = "s3cr3t_beta";
+        let pw3 = "s3cr3t_gamma";
+
+        // 1. URI with authority password + query password + sslpassword + fragment.
+        let uri_all = format!(
+            "postgresql://app:{pw1}@db.example.com:5432/prod?sslmode=verify-full&password={pw2}&sslpassword={pw3}#frag"
+        );
+        let red_uri = RedactedUrl::new(uri_all).redacted();
+        for s in [pw1, pw2, pw3] {
+            assert!(!red_uri.contains(s), "URI leaked {s}: {red_uri}");
+        }
+        assert_eq!(
+            red_uri,
+            "postgresql://app:***@db.example.com:5432/prod?sslmode=verify-full&password=***&sslpassword=***#frag"
+        );
+
+        // 2. URI without authority password but with uppercase/mixed-case query secrets.
+        let uri_q = format!("postgres://app@db.example.com/prod?PASSWORD={pw1}&SslPassword={pw2}");
+        let red_q = RedactedUrl::new(uri_q).redacted();
+        assert!(!red_q.contains(pw1) && !red_q.contains(pw2), "{red_q}");
+        assert_eq!(
+            red_q,
+            "postgres://app@db.example.com/prod?PASSWORD=***&SslPassword=***"
+        );
+
+        // 3. Libpq key-value unquoted & escaped whitespace values.
+        let kv_plain = format!(
+            "host=db.example.com port=5432 user=app password={pw1}\\ tail sslpassword={pw2} dbname=prod"
+        );
+        let red_kv = RedactedUrl::new(kv_plain).redacted();
+        assert!(!red_kv.contains(pw1) && !red_kv.contains(pw2), "{red_kv}");
+        assert!(
+            !red_kv.contains("tail"),
+            "escaped space tail leaked: {red_kv}"
+        );
+        assert_eq!(
+            red_kv,
+            "host=db.example.com port=5432 user=app password=*** sslpassword=*** dbname=prod"
+        );
+
+        // 4. Libpq single-quoted values with spaces, escaped quotes, and whitespace around `=`.
+        let kv_quoted = format!(
+            "host = db.example.com password = 'my \\'{pw1}\\' pass' sslpassword='x\\\\{pw2}' dbname=prod"
+        );
+        let red_quoted = RedactedUrl::new(kv_quoted).redacted();
+        assert!(
+            !red_quoted.contains(pw1) && !red_quoted.contains(pw2),
+            "{red_quoted}"
+        );
+        assert_eq!(
+            red_quoted,
+            "host = db.example.com password = *** sslpassword=*** dbname=prod"
+        );
+
+        // 5. Unterminated single-quoted password redacts to end of string safely.
+        let kv_dangling = format!("host=db.example.com password='{pw1} dangling");
+        let red_dangling = RedactedUrl::new(kv_dangling).redacted();
+        assert!(!red_dangling.contains(pw1), "{red_dangling}");
+        assert_eq!(red_dangling, "host=db.example.com password=***");
+
+        // 6. Multi-byte UTF-8 after backslash escapes never panics on char boundaries.
+        let kv_utf8 = format!("application_name='a\\é' password='b\\é{pw1}' dbname=prod");
+        let red_utf8 = RedactedUrl::new(kv_utf8).redacted();
+        assert!(!red_utf8.contains(pw1), "{red_utf8}");
+        assert_eq!(red_utf8, "application_name='a\\é' password=*** dbname=prod");
+
+        // 7. Non-secret libpq parameters and URIs remain untouched.
+        let safe_kv = "host=localhost port=5432 user=postgres dbname=app sslmode=verify-full";
+        assert_eq!(RedactedUrl::new(safe_kv.to_owned()).redacted(), safe_kv);
     }
 
     #[test]

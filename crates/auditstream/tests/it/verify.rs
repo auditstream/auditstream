@@ -364,6 +364,47 @@ async fn verify_without_selection_checks_installed_triggers_only_and_notes_on_st
         .stderr(predicate::str::contains("installed triggers only"));
 }
 
+#[tokio::test]
+async fn verify_reports_invalid_exclusion_when_config_excludes_primary_key() {
+    let db = TestDb::new().await.expect("create TestDb");
+    create_invoice_table(&db).await;
+    install_capture(
+        &db,
+        &[TableTriggerSpec::new(
+            "public",
+            "invoice",
+            vec!["id".to_owned()],
+            vec!["password_hash".to_owned()],
+        )],
+    )
+    .await;
+
+    let dir = tempdir().expect("tempdir");
+    fs::write(
+        dir.path().join("auditstream.toml"),
+        "[capture]\ntables = [\"public.invoice\"]\nexclude = [\"public.invoice.id\"]\n",
+    )
+    .expect("write auditstream.toml");
+
+    let out = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["verify", "--format", "json"])
+        .output()
+        .expect("run verify json");
+    assert_eq!(out.status.code(), Some(1));
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse verify json");
+    assert_eq!(parsed["ok"], false);
+    assert!(
+        parsed["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .any(|f| f["kind"] == "invalid_exclusion" && f["severity"] == "error"),
+        "expected invalid_exclusion error finding, got: {parsed}"
+    );
+}
+
 #[test]
 fn verify_unreachable_database_exits_3() {
     let dir = tempdir().expect("tempdir");

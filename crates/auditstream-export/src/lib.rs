@@ -14,7 +14,11 @@ use serde::{Deserialize, Serialize};
 use tokio as _;
 
 pub(crate) fn open_append_file(path: &Path) -> io::Result<std::fs::File> {
-    OpenOptions::new().create(true).append(true).open(path)
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
 }
 
 macro_rules! impl_opened_sink {
@@ -189,5 +193,26 @@ mod tests {
         assert_send(&write_fut);
         write_fut.await.expect("empty csv batch write succeeds");
         csv.flush().await.expect("csv stdout flush succeeds");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_append_file_creates_export_files_with_0600_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        for filename in ["events.jsonl", "events.csv"] {
+            let path = dir.path().join(filename);
+            let _file = super::open_append_file(&path).expect("open append file");
+            let mode = std::fs::metadata(&path)
+                .expect("stat file")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "export file {filename} must be created with mode 0600, got {mode:o}"
+            );
+        }
     }
 }

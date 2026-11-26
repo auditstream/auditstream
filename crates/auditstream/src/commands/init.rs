@@ -5,8 +5,8 @@
 //! `auditstream.toml` using `toml_edit` without touching comments, other keys, or secrets.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
@@ -188,6 +188,12 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
         if !info.columns.iter().any(|c| c.name == *column) {
             return Err(anyhow!("unknown column `{schema}.{table}.{column}`"))
                 .exit_code(Exit::Usage);
+        }
+        if info.primary_key.iter().any(|pk| pk == column) {
+            return Err(anyhow!(
+                "cannot exclude primary key column `{schema}.{table}.{column}`: primary key columns are required to build `record_id`"
+            ))
+            .exit_code(Exit::Usage);
         }
         excludes_by_table
             .entry((schema.clone(), table.clone()))
@@ -372,20 +378,46 @@ fn update_config_file(
     }
 
     let rendered = doc.to_string();
-    let tmp_name = format!(
-        ".{}.tmp.{}",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("auditstream.toml"),
-        std::process::id()
-    );
-    let tmp_path = path.with_file_name(tmp_name);
-    fs::write(&tmp_path, rendered.as_bytes())
-        .map_err(|err| anyhow!("failed to write {}: {err}", tmp_path.display()))
-        .exit_code(Exit::Io)?;
-    fs::rename(&tmp_path, path)
-        .map_err(|err| anyhow!("failed to replace {}: {err}", path.display()))
-        .exit_code(Exit::Io)?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("auditstream.toml");
+
+    // Exclusive creation with mode 0600 on Unix prevents symlink TOCTOU at the temp path
+    // and avoids ever exposing `database_url` secrets via world-readable permissions.
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+
+    let pid = std::process::id();
+    let mut attempt = 0_u64;
+    let (tmp_path, mut file) = loop {
+        let candidate = path.with_file_name(format!(".{file_name}.tmp.{pid}.{attempt}"));
+        match options.open(&candidate) {
+            Ok(file) => break (candidate, file),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => attempt += 1,
+            Err(err) => {
+                return Err(anyhow!("failed to create {}: {err}", candidate.display()))
+                    .exit_code(Exit::Io);
+            }
+        }
+    };
+
+    if let Err(err) = file
+        .write_all(rendered.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        drop(file);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(anyhow!("failed to write {}: {err}", tmp_path.display())).exit_code(Exit::Io);
+    }
+    drop(file);
+
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(anyhow!("failed to replace {}: {err}", path.display())).exit_code(Exit::Io);
+    }
 
     Ok(())
 }
@@ -485,5 +517,74 @@ mod tests {
         let err = detect_migration_format(empty.path()).unwrap_err();
         assert_eq!(exit_code_for(&err), Exit::Usage);
         assert!(err.to_string().contains("missing migration format"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_config_file_preserves_0600_and_resists_symlink_at_temp_path() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::path::Path;
+
+        use super::update_config_file;
+
+        let dir = tempdir().unwrap();
+        let cfg_path = dir.path().join("auditstream.toml");
+        fs::write(
+            &cfg_path,
+            "database_url = \"postgres://u:p@localhost/db\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&cfg_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Pre-plant symlinks at both the legacy PID path and attempt-0 path pointing to a victim file.
+        let victim = dir.path().join("victim.txt");
+        fs::write(&victim, "DO_NOT_OVERWRITE").unwrap();
+        let pid = std::process::id();
+        symlink(
+            &victim,
+            dir.path().join(format!(".auditstream.toml.tmp.{pid}")),
+        )
+        .unwrap();
+        symlink(
+            &victim,
+            dir.path().join(format!(".auditstream.toml.tmp.{pid}.0")),
+        )
+        .unwrap();
+
+        update_config_file(
+            &cfg_path,
+            &["public.invoice".to_owned()],
+            &[],
+            MigrationFormat::Sql,
+            Path::new("migrations"),
+        )
+        .expect("update_config_file succeeds");
+
+        let mode = fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "auditstream.toml must retain mode 0600, got {mode:o}"
+        );
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "DO_NOT_OVERWRITE",
+            "symlink target must never be overwritten"
+        );
+
+        // Fresh config file creation also uses mode 0600.
+        let fresh_path = dir.path().join("fresh.toml");
+        update_config_file(
+            &fresh_path,
+            &["public.invoice".to_owned()],
+            &[],
+            MigrationFormat::Sql,
+            Path::new("migrations"),
+        )
+        .expect("create fresh config");
+        let fresh_mode = fs::metadata(&fresh_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            fresh_mode, 0o600,
+            "new auditstream.toml must be created with mode 0600, got {fresh_mode:o}"
+        );
     }
 }
