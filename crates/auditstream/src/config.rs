@@ -301,9 +301,6 @@ impl TailAtScanner {
     }
 
     fn inspect_at(&mut self, tail: &str, authority_end: usize, idx: usize) {
-        if !matches!(self.region, TailRegion::Query { pair_has_eq: true }) {
-            self.fallback_non_query_at = Some(authority_end + idx);
-        }
         let bytes = tail.as_bytes();
         let after = &tail[idx + 1..];
         // Stopping at `@` keeps all scanned host slices pairwise disjoint (strictly O(n)).
@@ -316,6 +313,16 @@ impl TailAtScanner {
         let host = &after[..rel_end];
         let after_delim = bytes.get(host_end).copied();
         let valid_host = !has_following_at && !host.is_empty() && is_host_port_authority(host);
+
+        // Only rescue empty-host Unix-socket URIs (e.g. `app:p1/p2@/prod?host=/var/run/pg`) on
+        // malformed authorities; invalid non-empty hosts must fail closed.
+        if !matches!(self.region, TailRegion::Query { pair_has_eq: true })
+            && !has_following_at
+            && host.is_empty()
+            && matches!(after_delim, Some(b'/' | b'?'))
+        {
+            self.fallback_non_query_at = Some(authority_end + idx);
+        }
 
         if valid_host && self.qualifies(host, after_delim) {
             self.best_authority_at = Some(authority_end + idx);
@@ -477,6 +484,41 @@ fn starts_with_secret_kv(rest: &str) -> bool {
             .starts_with('=')
 }
 
+fn scan_secret_unquoted_value(raw: &str, mut i: usize) -> usize {
+    let bytes = raw.as_bytes();
+    while i < bytes.len() && !is_libpq_whitespace(bytes[i]) {
+        if bytes[i] == b'\\' {
+            i = advance_escaped(raw, i);
+        } else if bytes[i] == b'\'' {
+            i += 1;
+            if starts_with_secret_kv(&raw[i..]) {
+                break;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    i
+}
+
+fn scan_plain_unquoted_value(raw: &str, mut i: usize) -> usize {
+    let bytes = raw.as_bytes();
+    while i < bytes.len() && !is_libpq_whitespace(bytes[i]) {
+        if bytes[i] == b'\\' {
+            i = advance_escaped(raw, i);
+        } else if bytes[i] == b'\'' {
+            // Stop at unescaped `'` so adjacent libpq KV parameters after a closing quote
+            // (e.g. `options='-c search_path=public'dbname='prod'password=...`) are never
+            // swallowed by an embedded `k=v`.
+            i += 1;
+            break;
+        } else {
+            i += 1;
+        }
+    }
+    i
+}
+
 fn skip_secret_quoted_trailing(raw: &str, mut i: usize) -> usize {
     let bytes = raw.as_bytes();
     if starts_with_secret_kv(&raw[i..]) {
@@ -580,25 +622,16 @@ fn redact_libpq_kv_password(raw: &str) -> String {
                 out.push('\'');
                 out.push_str(&redact_libpq_kv_password(&raw[val_start + 1..i]));
             }
+        } else if had_ws_after_eq && starts_with_secret_kv(&raw[val_start..]) {
+            // Previous key had an empty unquoted value (e.g. `sslrootcert= password=SECRET`,
+            // `sslrootcert= password = SECRET`, or `password= sslpassword = SECRET`); keep `i`
+            // at `val_start` so the following secret pair is parsed and masked next.
+        } else if is_secret_pg_param(key) {
+            i = scan_secret_unquoted_value(raw, val_start);
+            out.push_str("***");
         } else {
-            while i < len && !is_libpq_whitespace(bytes[i]) {
-                if bytes[i] == b'\\' {
-                    i = advance_escaped(raw, i);
-                } else {
-                    i += 1;
-                }
-            }
-            let val = &raw[val_start..i];
-            if had_ws_after_eq && starts_with_secret_kv(&raw[val_start..]) {
-                // Previous key had an empty unquoted value (e.g. `sslrootcert= password=SECRET`,
-                // `sslrootcert= password = SECRET`, or `password= sslpassword = SECRET`); rewind
-                // so the following secret pair is parsed and masked on the next iteration.
-                i = val_start;
-            } else if is_secret_pg_param(key) {
-                out.push_str("***");
-            } else {
-                out.push_str(val);
-            }
+            i = scan_plain_unquoted_value(raw, val_start);
+            out.push_str(&raw[val_start..i]);
         }
     }
 
@@ -1228,6 +1261,10 @@ batch_size = 250
             format!("{scheme}app:1234/x{pw1}@db.example.com:5432/prod#ops@corp.com"),
             format!("{scheme}app:1234?k={pw1}@db.example.com:5432/prod#ops@corp.com"),
             format!("{scheme}app:1234?k={pw1}@[::1]"),
+            format!("{scheme}app:p1/p2@p3:{pw1}?k=v@db.example.com"),
+            format!("{scheme}app:p1/p2@p3:{pw1}"),
+            format!("{scheme}app:p1/p2@#{pw1}"),
+            format!("{scheme}app:p1/{pw1}@/prod?host=/var/run/postgresql"),
             format!("{scheme}app:1234/{pw1}@db.example.com"),
             format!("{scheme}app:1234/{pw1}@localhost"),
             format!("{scheme}app:1234/{pw1}@host1,host2"),
@@ -1343,6 +1380,15 @@ batch_size = 250
             format!("host=db.example.com password='{pw1}'sslpassword='first {pw2}' dbname=prod"),
             format!("host=db.example.com password='{pw1}'dbname='prod'sslpassword = {pw2}"),
             format!("host=db.example.com password='{pw1}'dbname='prod'sslpassword='first {pw2}'"),
+            format!(
+                "host=db.example.com options='-c search_path=public'dbname='prod'password={pw1}"
+            ),
+            format!("host=db.example.com application_name='env=prod'dbname='app'password={pw1}"),
+            format!("application_name='broken k=v'x'password={pw1}"),
+            format!(
+                "host=db.example.com password='{pw1}'options='-c search_path=public'sslpassword={pw2}"
+            ),
+            format!("host=db.example.com password={pw1}'sslpassword = {pw2} dbname=prod"),
             format!("host=db.example.com password='{pw1}'dbname='my db'sslpassword={pw2}"),
             format!("host=db.example.com password='pa'{pw1}' dbname=prod"),
             format!("host='localhost'password={pw1} dbname=prod"),
@@ -1361,8 +1407,17 @@ batch_size = 250
         }
 
         // 11. Non-secret libpq parameters and URIs remain untouched.
-        let safe_kv = "host=localhost port=5432 user=postgres dbname=app sslmode=verify-full";
-        assert_eq!(RedactedUrl::new(safe_kv.to_owned()).redacted(), safe_kv);
+        for safe_kv in [
+            "host=localhost port=5432 user=postgres dbname=app sslmode=verify-full",
+            "host=localhost application_name=o'brien dbname=app",
+        ] {
+            assert_eq!(RedactedUrl::new(safe_kv.to_owned()).redacted(), safe_kv);
+        }
+        assert_eq!(
+            RedactedUrl::new(format!("{scheme}app:p1/p2@/prod?host=/var/run/postgresql"))
+                .redacted(),
+            "postgresql://app:***@/prod?host=/var/run/postgresql"
+        );
 
         // 12. TOML syntax/unknown-field errors never echo `database_url` credentials.
         let dir = tempdir().unwrap();
