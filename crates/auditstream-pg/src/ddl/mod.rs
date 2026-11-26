@@ -87,9 +87,12 @@ $$"
 /// Transaction-scoped role elevation setup shared by [`generate`] and [`crate::triggers::generate`].
 ///
 /// Rejects autocommit callers via [`TX_GUARD_SETTING`], creates `auditstream_owner` when
-/// `create_role` is `true`, and records the exact temporary grant mode (`none`, `member`,
-/// `inherit`, `set`, or `both`) in a transaction-local GUC so cleanup revokes only what this
+/// `create_role` is `true` (clearing `createrole_self_grant` on PG 16+ so creation never persists
+/// implicit `INHERIT`/`SET` membership), resolves the deterministic `ADMIN` grantor role for
+/// explicit `GRANTED BY`, and records the exact temporary grant mode (`none`, `self_row`,
+/// `inherit`, `set`, or `both`) in transaction-local GUCs so cleanup revokes only what this
 /// transaction granted without disturbing pre-existing memberships or failing on `NOINHERIT` roles.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn role_grant_setup_sql(
     owner_q: &str,
     owner_lit: &str,
@@ -97,11 +100,24 @@ pub(crate) fn role_grant_setup_sql(
     context_label: &str,
     create_role: bool,
 ) -> String {
+    let grantor_setting = format!("{setting_name}_grantor");
+    let prev_self_grant_decl = if create_role {
+        "  prev_self_grant text;\n"
+    } else {
+        ""
+    };
     let create_clause = if create_role {
         format!(
             "  PERFORM pg_catalog.pg_advisory_xact_lock({ROLE_LOCK_KEY});\n  \
   IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = {owner_lit}) THEN\n    \
-    EXECUTE 'CREATE ROLE {owner_q} NOLOGIN';\n  \
+    IF pg_catalog.current_setting('server_version_num')::int >= 160000 THEN\n      \
+      prev_self_grant := pg_catalog.current_setting('createrole_self_grant');\n      \
+      PERFORM pg_catalog.set_config('createrole_self_grant', '', true);\n      \
+      EXECUTE 'CREATE ROLE {owner_q} NOLOGIN';\n      \
+      PERFORM pg_catalog.set_config('createrole_self_grant', prev_self_grant, true);\n    \
+    ELSE\n      \
+      EXECUTE 'CREATE ROLE {owner_q} NOLOGIN';\n    \
+    END IF;\n  \
   END IF;\n"
         )
     } else {
@@ -112,9 +128,12 @@ pub(crate) fn role_grant_setup_sql(
         "DO $$\n\
 DECLARE\n  \
   grant_mode text := 'none';\n  \
+  grantor_role text := '';\n  \
+  grantor_oid oid;\n  \
   need_inherit boolean := false;\n  \
   need_set boolean := false;\n  \
-  has_self_row boolean := false;\n\
+  has_grantor_row boolean := false;\n\
+{prev_self_grant_decl}\
 BEGIN\n  \
   IF pg_catalog.current_setting('{TX_GUARD_SETTING}', true) IS DISTINCT FROM 'on' THEN\n    \
     RAISE EXCEPTION '{context_label} must run inside a single transaction'\n      \
@@ -125,16 +144,17 @@ BEGIN\n  \
     need_inherit := NOT pg_catalog.pg_has_role(current_user, {owner_lit}, 'USAGE');\n    \
     need_set := NOT pg_catalog.pg_has_role(current_user, {owner_lit}, 'SET');\n    \
     IF need_inherit OR need_set THEN\n      \
-      SELECT EXISTS (\n        \
-        SELECT 1\n          \
-          FROM pg_catalog.pg_auth_members m\n          \
-          JOIN pg_catalog.pg_roles r ON r.oid = m.roleid\n          \
-          JOIN pg_catalog.pg_roles u ON u.oid = m.member\n         \
-         WHERE r.rolname = {owner_lit}\n           \
-           AND u.rolname = current_user\n           \
-           AND m.grantor = u.oid\n      \
-      ) INTO has_self_row;\n      \
-      IF NOT has_self_row THEN\n        \
+      SELECT m.member\n        \
+        INTO grantor_oid\n        \
+        FROM pg_catalog.pg_auth_members m\n        \
+        JOIN pg_catalog.pg_roles r ON r.oid = m.roleid\n        \
+        JOIN pg_catalog.pg_roles u ON u.rolname = current_user\n       \
+       WHERE r.rolname = {owner_lit}\n         \
+         AND m.admin_option\n         \
+         AND (m.member = u.oid OR pg_catalog.pg_has_role(u.oid, m.member, 'USAGE'))\n       \
+       ORDER BY (m.member = u.oid) DESC, m.member\n       \
+       LIMIT 1;\n      \
+      IF grantor_oid IS NULL THEN\n        \
         EXECUTE pg_catalog.format(\n          \
           'GRANT {owner_q} TO %I WITH INHERIT %s, SET %s',\n          \
           current_user,\n          \
@@ -142,22 +162,56 @@ BEGIN\n  \
           CASE WHEN need_set THEN 'TRUE' ELSE 'FALSE' END\n        \
         );\n        \
         grant_mode := 'self_row';\n      \
-      ELSIF need_inherit AND need_set THEN\n        \
-        EXECUTE pg_catalog.format('GRANT {owner_q} TO %I WITH INHERIT TRUE, SET TRUE', current_user);\n        \
-        grant_mode := 'both';\n      \
-      ELSIF need_inherit THEN\n        \
-        EXECUTE pg_catalog.format('GRANT {owner_q} TO %I WITH INHERIT TRUE', current_user);\n        \
-        grant_mode := 'inherit';\n      \
       ELSE\n        \
-        EXECUTE pg_catalog.format('GRANT {owner_q} TO %I WITH SET TRUE', current_user);\n        \
-        grant_mode := 'set';\n      \
+        grantor_role := pg_catalog.pg_get_userbyid(grantor_oid)::text;\n        \
+        SELECT EXISTS (\n          \
+          SELECT 1\n            \
+            FROM pg_catalog.pg_auth_members m\n            \
+            JOIN pg_catalog.pg_roles r ON r.oid = m.roleid\n            \
+            JOIN pg_catalog.pg_roles u ON u.oid = m.member\n           \
+           WHERE r.rolname = {owner_lit}\n             \
+             AND u.rolname = current_user\n             \
+             AND m.grantor = grantor_oid\n        \
+        ) INTO has_grantor_row;\n        \
+        IF NOT has_grantor_row THEN\n          \
+          EXECUTE pg_catalog.format(\n            \
+            'GRANT {owner_q} TO %I WITH INHERIT %s, SET %s GRANTED BY %I',\n            \
+            current_user,\n            \
+            CASE WHEN need_inherit THEN 'TRUE' ELSE 'FALSE' END,\n            \
+            CASE WHEN need_set THEN 'TRUE' ELSE 'FALSE' END,\n            \
+            grantor_role\n          \
+          );\n          \
+          grant_mode := 'self_row';\n        \
+        ELSIF need_inherit AND need_set THEN\n          \
+          EXECUTE pg_catalog.format(\n            \
+            'GRANT {owner_q} TO %I WITH INHERIT TRUE, SET TRUE GRANTED BY %I',\n            \
+            current_user,\n            \
+            grantor_role\n          \
+          );\n          \
+          grant_mode := 'both';\n        \
+        ELSIF need_inherit THEN\n          \
+          EXECUTE pg_catalog.format(\n            \
+            'GRANT {owner_q} TO %I WITH INHERIT TRUE GRANTED BY %I',\n            \
+            current_user,\n            \
+            grantor_role\n          \
+          );\n          \
+          grant_mode := 'inherit';\n        \
+        ELSE\n          \
+          EXECUTE pg_catalog.format(\n            \
+            'GRANT {owner_q} TO %I WITH SET TRUE GRANTED BY %I',\n            \
+            current_user,\n            \
+            grantor_role\n          \
+          );\n          \
+          grant_mode := 'set';\n        \
+        END IF;\n      \
       END IF;\n    \
     END IF;\n  \
   ELSIF NOT pg_catalog.pg_has_role(current_user, {owner_lit}, 'MEMBER') THEN\n    \
     EXECUTE pg_catalog.format('GRANT {owner_q} TO %I', current_user);\n    \
     grant_mode := 'self_row';\n  \
   END IF;\n  \
-  PERFORM pg_catalog.set_config('{setting_name}', grant_mode, true);\n\
+  PERFORM pg_catalog.set_config('{setting_name}', grant_mode, true);\n  \
+  PERFORM pg_catalog.set_config('{grantor_setting}', grantor_role, true);\n\
 END\n\
 $$"
     )
@@ -165,23 +219,32 @@ $$"
 
 /// Revokes only the temporary membership or role option acquired by [`role_grant_setup_sql`].
 pub(crate) fn role_grant_cleanup_sql(owner_q: &str, setting_name: &str) -> String {
+    let grantor_setting = format!("{setting_name}_grantor");
     format!(
         "DO $$\n\
 DECLARE\n  \
-  grant_mode text := pg_catalog.current_setting('{setting_name}', true);\n\
+  grant_mode text := pg_catalog.current_setting('{setting_name}', true);\n  \
+  grantor_role text := pg_catalog.current_setting('{grantor_setting}', true);\n  \
+  granted_by text := '';\n\
 BEGIN\n  \
+  IF grantor_role IS NOT NULL AND grantor_role <> '' THEN\n    \
+    granted_by := pg_catalog.format(' GRANTED BY %I', grantor_role);\n  \
+  END IF;\n  \
   IF grant_mode = 'self_row' THEN\n    \
-    EXECUTE pg_catalog.format('REVOKE {owner_q} FROM %I', current_user);\n  \
+    EXECUTE pg_catalog.format('REVOKE {owner_q} FROM %I', current_user) || granted_by;\n  \
   ELSIF grant_mode = 'both' THEN\n    \
-    EXECUTE pg_catalog.format('REVOKE INHERIT OPTION FOR {owner_q} FROM %I', current_user);\n    \
-    EXECUTE pg_catalog.format('REVOKE SET OPTION FOR {owner_q} FROM %I', current_user);\n  \
+    EXECUTE pg_catalog.format('REVOKE INHERIT OPTION FOR {owner_q} FROM %I', current_user) || granted_by;\n    \
+    EXECUTE pg_catalog.format('REVOKE SET OPTION FOR {owner_q} FROM %I', current_user) || granted_by;\n  \
   ELSIF grant_mode = 'inherit' THEN\n    \
-    EXECUTE pg_catalog.format('REVOKE INHERIT OPTION FOR {owner_q} FROM %I', current_user);\n  \
+    EXECUTE pg_catalog.format('REVOKE INHERIT OPTION FOR {owner_q} FROM %I', current_user) || granted_by;\n  \
   ELSIF grant_mode = 'set' THEN\n    \
-    EXECUTE pg_catalog.format('REVOKE SET OPTION FOR {owner_q} FROM %I', current_user);\n  \
+    EXECUTE pg_catalog.format('REVOKE SET OPTION FOR {owner_q} FROM %I', current_user) || granted_by;\n  \
   END IF;\n  \
   IF grant_mode IS NOT NULL AND grant_mode <> '' THEN\n    \
     PERFORM pg_catalog.set_config('{setting_name}', '', true);\n  \
+  END IF;\n  \
+  IF grantor_role IS NOT NULL AND grantor_role <> '' THEN\n    \
+    PERFORM pg_catalog.set_config('{grantor_setting}', '', true);\n  \
   END IF;\n\
 END\n\
 $$"
@@ -318,12 +381,16 @@ pub(crate) fn generate_parts(options: &DdlOptions) -> GeneratedDdl {
 /// Reconciles pre-existing ownership of the audit schema, `changes` (which cascades to owned
 /// identity sequences), all attached child partitions, and `log_event()` as the caller role
 /// *before* switching to `SET LOCAL ROLE auditstream_owner`.
+#[allow(clippy::too_many_lines)]
 fn reconcile_ddl_ownership_sql(schema_lit: &str, owner_lit: &str) -> String {
     do_block(&format!(
         "DECLARE
+  caller name := current_user;
   obj_schema name;
   obj_name name;
   fn_oid oid;
+  need_reconcile boolean := false;
+  granted_schema_usage boolean := false;
 BEGIN
   IF EXISTS (
     SELECT 1 FROM pg_catalog.pg_namespace
@@ -331,6 +398,64 @@ BEGIN
        AND nspowner <> {owner_lit}::pg_catalog.regrole
   ) THEN
     EXECUTE pg_catalog.format('ALTER SCHEMA %I OWNER TO %I', {schema_lit}, {owner_lit});
+  END IF;
+
+  SELECT EXISTS (
+    WITH RECURSIVE tree(relid) AS (
+      SELECT c.oid
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = {schema_lit}
+         AND c.relname = 'changes'
+         AND c.relkind IN ('r', 'p')
+      UNION ALL
+      SELECT i.inhrelid
+        FROM tree
+        JOIN pg_catalog.pg_inherits i ON i.inhparent = tree.relid
+    )
+    SELECT 1
+      FROM tree
+      JOIN pg_catalog.pg_class c ON c.oid = tree.relid
+     WHERE c.relowner <> {owner_lit}::pg_catalog.regrole
+  ) OR EXISTS (
+    SELECT 1
+      FROM pg_catalog.pg_proc p
+      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = {schema_lit}
+       AND p.proname = 'log_event'
+       AND p.prokind = 'f'
+       AND p.pronargs = 3
+       AND p.proargtypes = (ARRAY[
+         'pg_catalog.text'::pg_catalog.regtype::pg_catalog.oid,
+         'pg_catalog.jsonb'::pg_catalog.regtype::pg_catalog.oid,
+         'pg_catalog.jsonb'::pg_catalog.regtype::pg_catalog.oid
+       ])::pg_catalog.oidvector
+       AND p.proowner <> {owner_lit}::pg_catalog.regrole
+  ) INTO need_reconcile;
+
+  IF NOT need_reconcile THEN
+    RETURN;
+  END IF;
+
+  IF NOT pg_catalog.pg_has_role(caller, {owner_lit}, 'USAGE') THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_catalog.pg_namespace n
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(n.nspacl, pg_catalog.acldefault('n', n.nspowner))
+      ) AS a
+       WHERE n.nspname = {schema_lit}
+         AND a.grantee <> 0
+         AND pg_catalog.pg_get_userbyid(a.grantee)::text = caller::text
+         AND a.privilege_type = 'USAGE'
+    ) THEN
+      EXECUTE pg_catalog.format('SET LOCAL ROLE %I', {owner_lit});
+      EXECUTE pg_catalog.format('GRANT USAGE ON SCHEMA %I TO %I', {schema_lit}, caller);
+      SET LOCAL ROLE NONE;
+      IF caller <> current_user THEN
+        EXECUTE pg_catalog.format('SET LOCAL ROLE %I', caller);
+      END IF;
+      granted_schema_usage := true;
+    END IF;
   END IF;
 
   FOR obj_schema, obj_name IN
@@ -373,6 +498,15 @@ BEGIN
      WHERE oid = fn_oid AND proowner <> {owner_lit}::pg_catalog.regrole
   ) THEN
     EXECUTE pg_catalog.format('ALTER FUNCTION %I.log_event(text, jsonb, jsonb) OWNER TO %I', {schema_lit}, {owner_lit});
+  END IF;
+
+  IF granted_schema_usage THEN
+    EXECUTE pg_catalog.format('SET LOCAL ROLE %I', {owner_lit});
+    EXECUTE pg_catalog.format('REVOKE USAGE ON SCHEMA %I FROM %I', {schema_lit}, caller);
+    SET LOCAL ROLE NONE;
+    IF caller <> current_user THEN
+      EXECUTE pg_catalog.format('SET LOCAL ROLE %I', caller);
+    END IF;
   END IF;
 END"
     ))

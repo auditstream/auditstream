@@ -586,15 +586,81 @@ async fn partition_bot_with_admin_only_never_gains_permanent_inherit_on_ensure_a
     );
 
     bot_pool.close().await;
+
+    // On PG 16+, also verify group-role delegated ADMIN OPTION (`ops_admin`) with a pre-existing
+    // `(INHERIT TRUE, SET FALSE)` row is preserved (not deleted or clobbered) across ensure_ahead.
+    let group_admin = format!("ops_admin_{}", db.database_name());
+    let group_bot = format!("grp_bot_{}", db.database_name());
+    if pg_version >= 160_000 {
+        db.execute(&format!(
+            "CREATE ROLE {} NOLOGIN",
+            quote_ident(&group_admin)
+        ))
+        .await
+        .expect("create group_admin");
+        db.execute(&format!(
+            "CREATE ROLE {} LOGIN PASSWORD '{bot_pw}'",
+            quote_ident(&group_bot)
+        ))
+        .await
+        .expect("create group_bot");
+        db.execute(&format!(
+            "GRANT {} TO {} WITH ADMIN OPTION, INHERIT FALSE, SET FALSE",
+            quote_ident(OWNER_ROLE),
+            quote_ident(&group_admin),
+        ))
+        .await
+        .expect("grant owner ADMIN to group_admin");
+        db.execute(&format!(
+            "GRANT {} TO {} WITH INHERIT TRUE, SET FALSE",
+            quote_ident(&group_admin),
+            quote_ident(&group_bot),
+        ))
+        .await
+        .expect("grant group_admin to group_bot");
+        db.execute(&format!(
+            "GRANT {} TO {} WITH INHERIT TRUE, SET FALSE GRANTED BY {}",
+            quote_ident(OWNER_ROLE),
+            quote_ident(&group_bot),
+            quote_ident(&group_admin),
+        ))
+        .await
+        .expect("grant pre-existing INHERIT TRUE, SET FALSE by group_admin");
+
+        let gbot_url = format!("{scheme}://{group_bot}:{bot_pw}@{host_and_db}");
+        let gbot_pool = auditstream_pg::connect(&gbot_url)
+            .await
+            .expect("connect group_bot");
+        let report2 = partitions::ensure_ahead(&gbot_pool, DEFAULT_SCHEMA, 6)
+            .await
+            .expect("group_bot ensure_ahead succeeds");
+        assert_eq!(report2.created.len(), 1);
+        let (g_usage, g_set): (bool, bool) = sqlx::query_as(
+            "SELECT pg_catalog.pg_has_role($1, $2, 'USAGE'), pg_catalog.pg_has_role($1, $2, 'SET')",
+        )
+        .bind(&group_bot)
+        .bind(OWNER_ROLE)
+        .fetch_one(db.pool())
+        .await
+        .expect("check group_bot membership after ensure_ahead");
+        assert!(
+            g_usage && !g_set,
+            "ensure_ahead must preserve pre-existing (INHERIT TRUE, SET FALSE) granted by group_admin, got usage={g_usage}, set={g_set}"
+        );
+        gbot_pool.close().await;
+    }
+
     drop(db);
     let mut admin = PgConnection::connect(&admin_url)
         .await
         .expect("admin cleanup");
-    let _ = admin
-        .execute(AssertSqlSafe(format!(
-            "DROP ROLE IF EXISTS {}",
-            quote_ident(&bot_role)
-        )))
-        .await;
+    for role in [&bot_role, &group_bot, &group_admin] {
+        let _ = admin
+            .execute(AssertSqlSafe(format!(
+                "DROP ROLE IF EXISTS {}",
+                quote_ident(role)
+            )))
+            .await;
+    }
     let _ = admin.close().await;
 }

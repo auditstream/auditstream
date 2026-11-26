@@ -271,8 +271,46 @@ pub(crate) fn encode_json_string_array(items: &[String]) -> String {
 fn reconcile_trigger_functions_ownership_sql(schema_lit: &str, owner_lit: &str) -> String {
     do_block(&format!(
         "DECLARE
+  caller name := current_user;
   fn_name name;
+  need_reconcile boolean := false;
+  granted_schema_usage boolean := false;
 BEGIN
+  SELECT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_proc p
+    JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = {schema_lit}
+       AND p.proname IN ('resolve_actor', 'capture')
+       AND p.prokind = 'f'
+       AND p.pronargs = 0
+       AND p.proowner <> {owner_lit}::pg_catalog.regrole
+  ) INTO need_reconcile;
+
+  IF NOT need_reconcile THEN
+    RETURN;
+  END IF;
+
+  IF NOT pg_catalog.pg_has_role(caller, {owner_lit}, 'USAGE') THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_catalog.pg_namespace n
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(n.nspacl, pg_catalog.acldefault('n', n.nspowner))
+      ) AS a
+       WHERE n.nspname = {schema_lit}
+         AND a.grantee <> 0
+         AND pg_catalog.pg_get_userbyid(a.grantee)::text = caller::text
+         AND a.privilege_type = 'USAGE'
+    ) THEN
+      EXECUTE pg_catalog.format('SET LOCAL ROLE %I', {owner_lit});
+      EXECUTE pg_catalog.format('GRANT USAGE ON SCHEMA %I TO %I', {schema_lit}, caller);
+      SET LOCAL ROLE NONE;
+      IF caller <> current_user THEN
+        EXECUTE pg_catalog.format('SET LOCAL ROLE %I', caller);
+      END IF;
+      granted_schema_usage := true;
+    END IF;
+  END IF;
+
   FOREACH fn_name IN ARRAY ARRAY['resolve_actor', 'capture']::name[] LOOP
     IF EXISTS (
       SELECT 1 FROM pg_catalog.pg_proc p
@@ -286,6 +324,15 @@ BEGIN
       EXECUTE pg_catalog.format('ALTER FUNCTION %I.%I() OWNER TO %I', {schema_lit}, fn_name, {owner_lit});
     END IF;
   END LOOP;
+
+  IF granted_schema_usage THEN
+    EXECUTE pg_catalog.format('SET LOCAL ROLE %I', {owner_lit});
+    EXECUTE pg_catalog.format('REVOKE USAGE ON SCHEMA %I FROM %I', {schema_lit}, caller);
+    SET LOCAL ROLE NONE;
+    IF caller <> current_user THEN
+      EXECUTE pg_catalog.format('SET LOCAL ROLE %I', caller);
+    END IF;
+  END IF;
 END"
     ))
 }

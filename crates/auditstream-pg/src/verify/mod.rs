@@ -390,22 +390,21 @@ impl ExpectedFunctionBodies {
     fn from_generator(audit_schema: &str) -> Self {
         let trigger_stmts = triggers::generate(&TriggerOptions::new(audit_schema, Vec::new()));
         let ddl_stmts = ddl::generate(&DdlOptions::new(audit_schema, Vec::new()));
+        let prefix = format!("CREATE OR REPLACE FUNCTION {}.", quote_ident(audit_schema));
         let mut resolve_actor = None;
         let mut capture = None;
         let mut log_event = None;
 
         for stmt in trigger_stmts.iter().chain(ddl_stmts.iter()) {
-            let Some(first_line) = stmt.lines().next() else {
+            let Some(rest) = stmt.strip_prefix(&prefix) else {
                 continue;
             };
-            if first_line.starts_with("CREATE OR REPLACE FUNCTION ") {
-                if first_line.contains(".resolve_actor(") {
-                    resolve_actor = extract_function_body(stmt);
-                } else if first_line.contains(".capture(") {
-                    capture = extract_function_body(stmt);
-                } else if first_line.contains(".log_event(") {
-                    log_event = extract_function_body(stmt);
-                }
+            if rest.starts_with("resolve_actor(") {
+                resolve_actor = extract_function_body(rest);
+            } else if rest.starts_with("capture(") {
+                capture = extract_function_body(rest);
+            } else if rest.starts_with("log_event(") {
+                log_event = extract_function_body(rest);
             }
         }
 
@@ -1147,7 +1146,8 @@ async fn check_tables(
         .map(|r| r.oid)
         .collect();
 
-    let partition_clones = fetch_partition_update_clones(tx, &partitioned_oids).await?;
+    let partition_clones =
+        fetch_partition_update_clones(tx, &partitioned_oids, audit_schema).await?;
 
     for spec in tables {
         check_single_table(
@@ -1379,6 +1379,7 @@ async fn fetch_table_triggers(
 async fn fetch_partition_update_clones(
     tx: &mut Transaction<'_, Postgres>,
     partitioned_oids: &[i64],
+    audit_schema: &str,
 ) -> Result<HashMap<i64, Vec<PartitionCloneRow>>, sqlx::Error> {
     if partitioned_oids.is_empty() {
         return Ok(HashMap::new());
@@ -1404,10 +1405,18 @@ async fn fetch_partition_update_clones(
          JOIN pg_catalog.pg_class c ON c.oid = tree.child_oid \
          JOIN pg_catalog.pg_namespace cn ON cn.oid = c.relnamespace \
          JOIN pg_catalog.pg_trigger t ON t.tgrelid = tree.child_oid \
+         LEFT JOIN pg_catalog.pg_trigger pt ON pt.oid = t.tgparentid \
+         JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid \
+         JOIN pg_catalog.pg_namespace pn ON pn.oid = p.pronamespace \
         WHERE NOT t.tgisinternal \
-          AND (t.tgparentid <> 0 OR t.tgname = 'auditstream_update')",
+          AND ( \
+            t.tgname = 'auditstream_update' \
+            OR pt.tgname = 'auditstream_update' \
+            OR (pn.nspname = $2 AND p.proname = 'capture') \
+          )",
     )
     .bind(partitioned_oids)
+    .bind(audit_schema)
     .fetch_all(&mut **tx)
     .await?;
 
@@ -1616,8 +1625,24 @@ mod tests {
 
     #[test]
     fn expected_function_bodies_extract_cleanly_from_generator() {
-        let bodies = ExpectedFunctionBodies::from_generator(DEFAULT_SCHEMA);
-        assert!(bodies.resolve_actor.contains("auditstream.actor"));
-        assert!(bodies.capture.contains("TG_OP = 'TRUNCATE'"));
+        for schema in [
+            DEFAULT_SCHEMA,
+            "x.capture(",
+            "x.resolve_actor(",
+            "x.log_event(",
+            "audit\nstream",
+            "x\nAS $fn$",
+        ] {
+            let bodies = ExpectedFunctionBodies::from_generator(schema);
+            assert!(
+                bodies.resolve_actor.contains("auditstream.actor"),
+                "schema {schema:?}"
+            );
+            assert!(
+                bodies.capture.contains("TG_OP = 'TRUNCATE'"),
+                "schema {schema:?}"
+            );
+            assert!(bodies.log_event.contains("v_event_id"), "schema {schema:?}");
+        }
     }
 }

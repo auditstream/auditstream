@@ -786,11 +786,11 @@ async fn sanitize_child_partition_acl(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum OwnerGrantMode {
     None,
-    SelfRow,
-    SetOption,
+    SelfRow(Option<String>),
+    SetOption(String),
 }
 
 async fn ensure_owner_membership(
@@ -812,10 +812,34 @@ async fn ensure_owner_membership(
             return Ok(OwnerGrantMode::None);
         }
 
-        // Check whether a self-granted `pg_auth_members` row already exists. When none exists,
-        // specify `WITH INHERIT FALSE, SET TRUE` explicitly so PG 16+ never defaults `INHERIT` to
-        // `rolinherit` (`TRUE`), then delete only that self-granted row via `REVOKE` at cleanup.
-        let has_self_row: bool = sqlx::query_scalar(
+        // Resolve the deterministic ADMIN grantor role (`current_user` directly, or an inherited
+        // group role holding ADMIN OPTION) and pass `GRANTED BY` explicitly so PostgreSQL never
+        // clobbers or deletes pre-existing group-granted memberships on `GRANT`/`REVOKE`.
+        let grantor: Option<(i64, String)> = sqlx::query_as(
+            "SELECT m.member::bigint, pg_catalog.pg_get_userbyid(m.member)::text \
+               FROM pg_catalog.pg_auth_members m \
+               JOIN pg_catalog.pg_roles r ON r.oid = m.roleid \
+               JOIN pg_catalog.pg_roles u ON u.rolname = current_user \
+              WHERE r.rolname = $1 \
+                AND m.admin_option \
+                AND (m.member = u.oid OR pg_catalog.pg_has_role(u.oid, m.member, 'USAGE')) \
+              ORDER BY (m.member = u.oid) DESC, m.member \
+              LIMIT 1",
+        )
+        .bind(OWNER_ROLE)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        let Some((grantor_oid, grantor_name)) = grantor else {
+            // Let PostgreSQL raise its standard 42501 error for callers lacking ADMIN OPTION.
+            let sql = format!(
+                "DO $$ BEGIN EXECUTE pg_catalog.format('GRANT {owner_q} TO %I WITH INHERIT FALSE, SET TRUE', current_user); END $$"
+            );
+            sqlx::query(AssertSqlSafe(sql)).execute(&mut **tx).await?;
+            return Ok(OwnerGrantMode::SelfRow(None));
+        };
+
+        let has_grantor_row: bool = sqlx::query_scalar(
             "SELECT EXISTS ( \
                SELECT 1 \
                  FROM pg_catalog.pg_auth_members m \
@@ -823,26 +847,30 @@ async fn ensure_owner_membership(
                  JOIN pg_catalog.pg_roles u ON u.oid = m.member \
                 WHERE r.rolname = $1 \
                   AND u.rolname = current_user \
-                  AND m.grantor = u.oid \
+                  AND m.grantor = $2::pg_catalog.oid \
              )",
         )
         .bind(OWNER_ROLE)
+        .bind(grantor_oid)
         .fetch_one(&mut **tx)
         .await?;
 
-        if !has_self_row {
+        let current_user_name: String = sqlx::query_scalar("SELECT current_user::text")
+            .fetch_one(&mut **tx)
+            .await?;
+        let user_q = quote_ident(&current_user_name);
+        let grantor_q = quote_ident(&grantor_name);
+        if !has_grantor_row {
             let sql = format!(
-                "DO $$ BEGIN EXECUTE pg_catalog.format('GRANT {owner_q} TO %I WITH INHERIT FALSE, SET TRUE', current_user); END $$"
+                "GRANT {owner_q} TO {user_q} WITH INHERIT FALSE, SET TRUE GRANTED BY {grantor_q}"
             );
             sqlx::query(AssertSqlSafe(sql)).execute(&mut **tx).await?;
-            return Ok(OwnerGrantMode::SelfRow);
+            return Ok(OwnerGrantMode::SelfRow(Some(grantor_name)));
         }
 
-        let sql = format!(
-            "DO $$ BEGIN EXECUTE pg_catalog.format('GRANT {owner_q} TO %I WITH SET TRUE', current_user); END $$"
-        );
+        let sql = format!("GRANT {owner_q} TO {user_q} WITH SET TRUE GRANTED BY {grantor_q}");
         sqlx::query(AssertSqlSafe(sql)).execute(&mut **tx).await?;
-        return Ok(OwnerGrantMode::SetOption);
+        return Ok(OwnerGrantMode::SetOption(grantor_name));
     }
 
     let has_member: bool =
@@ -851,11 +879,13 @@ async fn ensure_owner_membership(
             .fetch_one(&mut **tx)
             .await?;
     if !has_member {
-        let sql = format!(
-            "DO $$ BEGIN EXECUTE pg_catalog.format('GRANT {owner_q} TO %I', current_user); END $$"
-        );
+        let current_user_name: String = sqlx::query_scalar("SELECT current_user::text")
+            .fetch_one(&mut **tx)
+            .await?;
+        let user_q = quote_ident(&current_user_name);
+        let sql = format!("GRANT {owner_q} TO {user_q}");
         sqlx::query(AssertSqlSafe(sql)).execute(&mut **tx).await?;
-        return Ok(OwnerGrantMode::SelfRow);
+        return Ok(OwnerGrantMode::SelfRow(None));
     }
 
     Ok(OwnerGrantMode::None)
@@ -865,15 +895,25 @@ async fn revoke_owner_membership(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     mode: OwnerGrantMode,
 ) -> Result<(), sqlx::Error> {
+    if matches!(mode, OwnerGrantMode::None) {
+        return Ok(());
+    }
+    let current_user_name: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(&mut **tx)
+        .await?;
     let owner_q = quote_ident(OWNER_ROLE);
+    let user_q = quote_ident(&current_user_name);
     let sql = match mode {
         OwnerGrantMode::None => return Ok(()),
-        OwnerGrantMode::SelfRow => format!(
-            "DO $$ BEGIN EXECUTE pg_catalog.format('REVOKE {owner_q} FROM %I', current_user); END $$"
-        ),
-        OwnerGrantMode::SetOption => format!(
-            "DO $$ BEGIN EXECUTE pg_catalog.format('REVOKE SET OPTION FOR {owner_q} FROM %I', current_user); END $$"
-        ),
+        OwnerGrantMode::SelfRow(Some(grantor)) => {
+            let grantor_q = quote_ident(&grantor);
+            format!("REVOKE {owner_q} FROM {user_q} GRANTED BY {grantor_q}")
+        }
+        OwnerGrantMode::SelfRow(None) => format!("REVOKE {owner_q} FROM {user_q}"),
+        OwnerGrantMode::SetOption(grantor) => {
+            let grantor_q = quote_ident(&grantor);
+            format!("REVOKE SET OPTION FOR {owner_q} FROM {user_q} GRANTED BY {grantor_q}")
+        }
     };
     sqlx::query(AssertSqlSafe(sql)).execute(&mut **tx).await?;
     Ok(())

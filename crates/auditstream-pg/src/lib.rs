@@ -171,40 +171,51 @@ const fn hex_nibble(byte: u8) -> Option<u8> {
 }
 
 fn is_unrecognized_sqlx_secret_key(raw_key: &str) -> bool {
-    let normalized: String = percent_decode_form_key(raw_key)
+    let decoded = percent_decode_form_key(raw_key);
+    let compact: String = decoded
         .chars()
         .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
         .collect();
-    normalized.eq_ignore_ascii_case("sslpassword")
-        || normalized.eq_ignore_ascii_case("ssl-password")
-        || normalized.eq_ignore_ascii_case("oauth_client_secret")
-        || (normalized.eq_ignore_ascii_case("password") && normalized != "password")
+    compact.eq_ignore_ascii_case("sslpassword")
+        || compact.eq_ignore_ascii_case("ssl-password")
+        || compact.eq_ignore_ascii_case("oauth_client_secret")
+        || (compact.eq_ignore_ascii_case("password") && decoded != "password")
 }
 
 /// Strips unrecognized secret query parameters (`sslpassword`, `ssl-password`,
-/// `oauth_client_secret`, and non-lowercase `PASSWORD` variants) before passing a PostgreSQL URI
-/// to `sqlx::PgConnectOptions::from_str`.
+/// `oauth_client_secret`, and non-exact-lowercase `password` variants) before passing a PostgreSQL
+/// URI to `sqlx::PgConnectOptions::from_str`.
 ///
-/// Accounts for WHATWG URL normalization (leading/trailing C0+space trimming and `\t`/`\n`/`\r`
-/// stripping) performed by `url::Url::parse` inside `sqlx-postgres`. Lowercase `password` is
-/// preserved so normal authentication continues to work without triggering `sqlx` warnings.
+/// Mirrors WHATWG URL preprocessing (leading/trailing C0+space trimming and global `\t`/`\n`/`\r`
+/// stripping before scheme, `?`, `#`, and `%XX` parsing) performed by `url::Url::parse` inside
+/// `sqlx-postgres`, including authority-less `postgres:`/`postgresql:` URIs. Exact lowercase
+/// `password` is preserved so normal authentication continues to work without triggering `sqlx`
+/// warnings.
 fn sanitize_database_url_for_sqlx(database_url: &str) -> Cow<'_, str> {
     let trimmed = database_url.trim_matches(|c: char| c <= ' ');
-    let Some(scheme_end) = trimmed.find("://") else {
+    let normalized: Cow<'_, str> = if trimmed.contains(['\t', '\n', '\r']) {
+        Cow::Owned(
+            trimmed
+                .chars()
+                .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(trimmed)
+    };
+    let Some(scheme_end) = normalized.find(':') else {
         return Cow::Borrowed(database_url);
     };
-    let scheme_clean: String = trimmed[..scheme_end]
-        .chars()
-        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
-        .collect();
-    if !is_valid_uri_scheme(&scheme_clean) {
+    if !is_valid_uri_scheme(&normalized[..scheme_end]) {
         return Cow::Borrowed(database_url);
     }
-    let Some(q_rel) = trimmed[scheme_end + 3..].find('?') else {
+    let after_scheme = &normalized[scheme_end + 1..];
+    let q_limit = after_scheme.find('#').unwrap_or(after_scheme.len());
+    let Some(q_rel) = after_scheme[..q_limit].find('?') else {
         return Cow::Borrowed(database_url);
     };
-    let q_pos = scheme_end + 3 + q_rel;
-    let after_q = &trimmed[q_pos + 1..];
+    let q_pos = scheme_end + 1 + q_rel;
+    let after_q = &normalized[q_pos + 1..];
     let (query, fragment) = match after_q.find('#') {
         Some(hash_pos) => (&after_q[..hash_pos], &after_q[hash_pos..]),
         None => (after_q, ""),
@@ -226,8 +237,8 @@ fn sanitize_database_url_for_sqlx(database_url: &str) -> Cow<'_, str> {
         return Cow::Borrowed(database_url);
     }
 
-    let mut out = String::with_capacity(trimmed.len());
-    out.push_str(&trimmed[..q_pos]);
+    let mut out = String::with_capacity(normalized.len());
+    out.push_str(&normalized[..q_pos]);
     if !kept.is_empty() {
         out.push('?');
         out.push_str(&kept.join("&"));
@@ -484,6 +495,26 @@ mod tests {
             "lowercase password param must be preserved for auth: {sanitized}"
         );
         assert!(sanitized.ends_with("#frag"), "fragment lost: {sanitized}");
+
+        // Authority-less URIs, raw tabs/newlines inside `://` or `%XX` escapes, and `%09` inside
+        // `password` (which `url::Url` does NOT strip so `sqlx` logs at WARN) must all be stripped.
+        for edge in [
+            "postgresql:?host=localhost&sslpassword=KEY_SECRET",
+            "postgres:prod?oauth_client_secret=KEY_SECRET",
+            "postgresql:\t//app@db.example.com/prod?sslpassword=KEY_SECRET",
+            "postgresql://app@db.example.com/prod?%5\t3slpassword=KEY_SECRET",
+            "postgresql://app@db.example.com/prod?pass%09word=KEY_SECRET",
+        ] {
+            let cleaned = sanitize_database_url_for_sqlx(edge);
+            assert!(
+                !cleaned.contains("KEY_SECRET"),
+                "edge URI leaked secret into sqlx: {cleaned}"
+            );
+            assert!(
+                PgConnectOptions::from_str(&cleaned).is_ok(),
+                "sanitized edge URI must still parse in sqlx: {cleaned}"
+            );
+        }
     }
 
     #[test]

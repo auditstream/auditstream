@@ -268,6 +268,26 @@ async fn partitioned_table_warns_and_detects_disabled_child_partition_clone() {
     ];
     install_fixture(&db, &specs).await;
 
+    // An unrelated disabled user trigger cloned onto a child partition must NOT be flagged.
+    db.pool()
+        .execute(
+            "CREATE FUNCTION public.touch_orders() RETURNS trigger LANGUAGE plpgsql \
+             AS $$ BEGIN RETURN NEW; END $$",
+        )
+        .await
+        .expect("create unrelated trigger fn");
+    db.pool()
+        .execute(
+            "CREATE TRIGGER app_touch_orders BEFORE UPDATE ON public.orders \
+             FOR EACH ROW EXECUTE FUNCTION public.touch_orders()",
+        )
+        .await
+        .expect("create unrelated user trigger on partitioned parent");
+    db.pool()
+        .execute("ALTER TABLE public.orders_2026 DISABLE TRIGGER app_touch_orders")
+        .await
+        .expect("disable unrelated user trigger on child partition");
+
     // Clean partitioned install reports exactly one warning (no errors).
     let warn_report = verify::check(db.pool(), &specs)
         .await

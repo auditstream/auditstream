@@ -525,11 +525,18 @@ async fn alter_default_privileges_cannot_grant_writes_on_changes_or_child_partit
             .expect("admin connect");
         admin
             .execute(AssertSqlSafe(format!(
-                "DROP ROLE IF EXISTS {}",
-                quote_ident(OWNER_ROLE)
+                "DO $$ BEGIN \
+                   DROP ROLE IF EXISTS {owner}; \
+                 EXCEPTION WHEN dependent_objects_still_exist THEN \
+                   IF pg_catalog.current_setting('server_version_num')::int >= 160000 THEN \
+                     EXECUTE 'GRANT {owner} TO {mig} WITH ADMIN OPTION, INHERIT FALSE, SET FALSE'; \
+                   END IF; \
+                 END $$",
+                owner = quote_ident(OWNER_ROLE),
+                mig = quote_ident(&migrator_role),
             )))
             .await
-            .expect("drop owner role");
+            .expect("reset or delegate owner role");
         admin
             .execute(AssertSqlSafe(format!(
                 "CREATE ROLE {} LOGIN PASSWORD '{app_pw}'",
@@ -902,11 +909,18 @@ async fn autocommit_and_failed_tx_never_leave_migrator_holding_auditstream_owner
             .expect("admin connect");
         admin
             .execute(AssertSqlSafe(format!(
-                "DROP ROLE IF EXISTS {}",
-                quote_ident(OWNER_ROLE)
+                "DO $$ BEGIN \
+                   DROP ROLE IF EXISTS {owner}; \
+                 EXCEPTION WHEN dependent_objects_still_exist THEN \
+                   IF pg_catalog.current_setting('server_version_num')::int >= 160000 THEN \
+                     EXECUTE 'GRANT {owner} TO {mig} WITH ADMIN OPTION, INHERIT FALSE, SET FALSE'; \
+                   END IF; \
+                 END $$",
+                owner = quote_ident(OWNER_ROLE),
+                mig = quote_ident(&migrator_role),
             )))
             .await
-            .expect("drop owner role");
+            .expect("reset or delegate owner role");
         admin.close().await.expect("close admin");
     }
 
@@ -914,6 +928,10 @@ async fn autocommit_and_failed_tx_never_leave_migrator_holding_auditstream_owner
     let mut conn = PgConnection::connect(db.url())
         .await
         .expect("migrator connect");
+    let pg_version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+        .fetch_one(&mut conn)
+        .await
+        .expect("read server_version_num");
 
     // 1. Autocommit execution must fail at the transaction guard BEFORE creating or granting auditstream_owner.
     let autocommit_err = run_statements(&mut conn, &stmts)
@@ -923,24 +941,7 @@ async fn autocommit_and_failed_tx_never_leave_migrator_holding_auditstream_owner
         autocommit_err.to_string().contains("single transaction"),
         "expected transaction-guard error, got: {autocommit_err}"
     );
-
-    let has_member_after_autocommit: bool = sqlx::query_scalar(
-        "SELECT EXISTS ( \
-           SELECT 1 FROM pg_catalog.pg_auth_members m \
-           JOIN pg_catalog.pg_roles r ON r.oid = m.roleid \
-           JOIN pg_catalog.pg_roles u ON u.oid = m.member \
-          WHERE r.rolname = $2 AND u.rolname = $1 \
-         )",
-    )
-    .bind(&migrator_role)
-    .bind(OWNER_ROLE)
-    .fetch_one(&mut conn)
-    .await
-    .expect("check membership after autocommit");
-    assert!(
-        !has_member_after_autocommit,
-        "autocommit failure must never leave migrator as a member of {OWNER_ROLE}"
-    );
+    assert_no_elevated_owner_membership(&mut conn, &migrator_role, pg_version, "autocommit").await;
 
     // 2. A mid-transaction failure inside BEGIN/ROLLBACK must also leave zero elevated membership.
     {
@@ -960,29 +961,40 @@ async fn autocommit_and_failed_tx_never_leave_migrator_holding_auditstream_owner
         );
         tx.rollback().await.expect("rollback failed tx");
     }
+    assert_no_elevated_owner_membership(&mut conn, &migrator_role, pg_version, "rollback").await;
 
-    let has_member_after_rollback: bool = sqlx::query_scalar(
-        "SELECT EXISTS ( \
-           SELECT 1 FROM pg_catalog.pg_auth_members m \
-           JOIN pg_catalog.pg_roles r ON r.oid = m.roleid \
-           JOIN pg_catalog.pg_roles u ON u.oid = m.member \
-          WHERE r.rolname = $2 AND u.rolname = $1 \
-         )",
-    )
-    .bind(&migrator_role)
-    .bind(OWNER_ROLE)
-    .fetch_one(&mut conn)
-    .await
-    .expect("check membership after rollback");
-    assert!(
-        !has_member_after_rollback,
-        "rolled-back transaction must never leave migrator as a member of {OWNER_ROLE}"
-    );
-
-    // 3. A NOINHERIT migrator role must also succeed cleanly on DDL + triggers and revoke all grants.
+    // 3. A NOINHERIT migrator role must also reconcile pre-existing migrator-owned schema/tables/
+    //    functions cleanly on both PG 15 and PG 16+ and revoke all temporary grants.
     conn.execute("CREATE TABLE public.noinherit_item (id int PRIMARY KEY, note text)")
         .await
         .expect("create table owned by migrator");
+    conn.execute("CREATE SCHEMA auditstream")
+        .await
+        .expect("pre-create migrator-owned auditstream schema");
+    let create_changes = stmts
+        .iter()
+        .find(|s| s.starts_with("CREATE TABLE IF NOT EXISTS"))
+        .expect("ddl must include CREATE TABLE IF NOT EXISTS");
+    conn.execute(AssertSqlSafe(create_changes.clone()))
+        .await
+        .expect("pre-create migrator-owned changes table");
+    conn.execute(
+        "CREATE FUNCTION auditstream.log_event(action text, target jsonb DEFAULT NULL, data jsonb DEFAULT NULL) \
+         RETURNS uuid LANGUAGE sql AS 'SELECT gen_random_uuid()'",
+    )
+    .await
+    .expect("pre-create migrator-owned log_event");
+    conn.execute(
+        "CREATE FUNCTION auditstream.resolve_actor(OUT actor jsonb, OUT context jsonb, OUT actor_source text) \
+         LANGUAGE plpgsql AS $$ BEGIN END $$",
+    )
+    .await
+    .expect("pre-create migrator-owned resolve_actor");
+    conn.execute(
+        "CREATE FUNCTION auditstream.capture() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$",
+    )
+    .await
+    .expect("pre-create migrator-owned capture");
     {
         let mut admin = PgConnection::connect(&admin_url)
             .await
@@ -1000,7 +1012,7 @@ async fn autocommit_and_failed_tx_never_leave_migrator_holding_auditstream_owner
         let mut tx = conn.begin().await.expect("begin noinherit tx");
         run_statements(&mut tx, &stmts)
             .await
-            .expect("DDL must succeed as NOINHERIT migrator");
+            .expect("DDL must succeed as NOINHERIT migrator reconciling pre-existing objects");
         let trig_stmts =
             auditstream_pg::triggers::generate(&auditstream_pg::triggers::TriggerOptions::new(
                 DEFAULT_SCHEMA,
@@ -1011,37 +1023,64 @@ async fn autocommit_and_failed_tx_never_leave_migrator_holding_auditstream_owner
                     vec![],
                 )],
             ));
-        run_statements(&mut tx, &trig_stmts)
-            .await
-            .expect("triggers must succeed as NOINHERIT migrator");
+        run_statements(&mut tx, &trig_stmts).await.expect(
+            "triggers must succeed as NOINHERIT migrator reconciling pre-existing functions",
+        );
         tx.commit().await.expect("commit noinherit tx");
     }
-    let pg_version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
-        .fetch_one(&mut conn)
+    assert_no_elevated_owner_membership(&mut conn, &migrator_role, pg_version, "noinherit commit")
+        .await;
+
+    conn.close().await.expect("close conn");
+    drop(db);
+    let mut admin = PgConnection::connect(&admin_url)
         .await
-        .expect("read server_version_num");
-    let has_usage_after_noinherit: bool =
-        sqlx::query_scalar("SELECT pg_catalog.pg_has_role($1, $2, 'USAGE')")
-            .bind(&migrator_role)
+        .expect("admin cleanup");
+    let _ = admin
+        .execute(AssertSqlSafe(format!(
+            "DROP ROLE IF EXISTS {}",
+            quote_ident(OWNER_ROLE)
+        )))
+        .await;
+    let _ = admin.close().await;
+}
+
+async fn assert_no_elevated_owner_membership(
+    conn: &mut PgConnection,
+    migrator_role: &str,
+    pg_version: i32,
+    phase: &str,
+) {
+    let owner_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $1)")
             .bind(OWNER_ROLE)
-            .fetch_one(&mut conn)
+            .fetch_one(&mut *conn)
             .await
-            .expect("check USAGE after noinherit");
+            .expect("check owner role existence");
+    if !owner_exists {
+        return;
+    }
+
+    let has_usage: bool = sqlx::query_scalar("SELECT pg_catalog.pg_has_role($1, $2, 'USAGE')")
+        .bind(migrator_role)
+        .bind(OWNER_ROLE)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("check USAGE");
     assert!(
-        !has_usage_after_noinherit,
-        "NOINHERIT migrator must not retain USAGE on {OWNER_ROLE} after commit"
+        !has_usage,
+        "{phase}: migrator must not retain USAGE on {OWNER_ROLE}"
     );
     if pg_version >= 160_000 {
-        let has_set_after_noinherit: bool =
-            sqlx::query_scalar("SELECT pg_catalog.pg_has_role($1, $2, 'SET')")
-                .bind(&migrator_role)
-                .bind(OWNER_ROLE)
-                .fetch_one(&mut conn)
-                .await
-                .expect("check SET after noinherit");
+        let has_set: bool = sqlx::query_scalar("SELECT pg_catalog.pg_has_role($1, $2, 'SET')")
+            .bind(migrator_role)
+            .bind(OWNER_ROLE)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("check SET");
         assert!(
-            !has_set_after_noinherit,
-            "NOINHERIT migrator must not retain SET on {OWNER_ROLE} after commit"
+            !has_set,
+            "{phase}: migrator must not retain SET on {OWNER_ROLE}"
         );
         let has_self_zombie: bool = sqlx::query_scalar(
             "SELECT EXISTS ( \
@@ -1051,34 +1090,191 @@ async fn autocommit_and_failed_tx_never_leave_migrator_holding_auditstream_owner
               WHERE r.rolname = $2 AND u.rolname = $1 AND m.grantor = u.oid \
              )",
         )
-        .bind(&migrator_role)
+        .bind(migrator_role)
         .bind(OWNER_ROLE)
-        .fetch_one(&mut conn)
+        .fetch_one(&mut *conn)
         .await
         .expect("check self-granted zombie row");
         assert!(
             !has_self_zombie,
-            "PG 16+ cleanup must delete temporary self-granted row without leaving a zombie tuple"
+            "{phase}: PG 16+ cleanup must delete temporary self-granted row without leaving a zombie tuple"
         );
     } else {
-        let has_member_after_noinherit: bool =
+        let has_member: bool =
             sqlx::query_scalar("SELECT pg_catalog.pg_has_role($1, $2, 'MEMBER')")
-                .bind(&migrator_role)
+                .bind(migrator_role)
                 .bind(OWNER_ROLE)
-                .fetch_one(&mut conn)
+                .fetch_one(&mut *conn)
                 .await
-                .expect("check MEMBER after noinherit");
+                .expect("check MEMBER");
         assert!(
-            !has_member_after_noinherit,
-            "PG 15 NOINHERIT migrator must not retain MEMBER on {OWNER_ROLE} after commit"
+            !has_member,
+            "{phase}: PG 15 migrator must not retain MEMBER on {OWNER_ROLE}"
         );
     }
+}
 
-    conn.close().await.expect("close conn");
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn pg16_group_admin_and_createrole_self_grant_preserve_memberships() {
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+
+    let db = TestDb::non_superuser()
+        .await
+        .expect("create non-superuser TestDb");
+    let admin_url = db.admin_url().to_owned();
+    let migrator_role = db.role_name().expect("migrator role").to_owned();
+
+    let pg_version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+        .fetch_one(db.pool())
+        .await
+        .expect("read server_version_num");
+    if pg_version < 160_000 {
+        return;
+    }
+
+    // 1. Even with `createrole_self_grant = 'set, inherit'`, initial DDL setup must NOT persist
+    //    permanent INHERIT/SET on `auditstream_owner` (tested when role is newly created).
+    let ops_admin = format!("ops_admin_{}", db.database_name());
+    let group_mig = format!("grp_mig_{}", db.database_name());
+    let group_pw = Uuid::new_v4().simple().to_string();
+    {
+        let mut admin = PgConnection::connect(&admin_url)
+            .await
+            .expect("admin connect");
+        admin
+            .execute(AssertSqlSafe(format!(
+                "ALTER ROLE {} SET createrole_self_grant = 'set, inherit'",
+                quote_ident(&migrator_role)
+            )))
+            .await
+            .expect("set createrole_self_grant");
+        let _ = admin
+            .execute(AssertSqlSafe(format!(
+                "DO $$ BEGIN \
+                   DROP ROLE IF EXISTS {owner}; \
+                 EXCEPTION WHEN dependent_objects_still_exist THEN \
+                   EXECUTE 'GRANT {owner} TO {mig} WITH ADMIN OPTION, INHERIT FALSE, SET FALSE'; \
+                 END $$",
+                owner = quote_ident(OWNER_ROLE),
+                mig = quote_ident(&migrator_role),
+            )))
+            .await;
+        admin.close().await.expect("close admin");
+    }
+
+    let stmts = ddl::generate(&DdlOptions::default());
+    {
+        let mut conn = PgConnection::connect(db.url())
+            .await
+            .expect("migrator connect with createrole_self_grant");
+        run_statements_tx(&mut conn, &stmts)
+            .await
+            .expect("DDL setup succeeds with createrole_self_grant = 'set, inherit'");
+        assert_no_elevated_owner_membership(
+            &mut conn,
+            &migrator_role,
+            pg_version,
+            "createrole_self_grant",
+        )
+        .await;
+        conn.close().await.expect("close migrator");
+    }
+
+    // 2. Group-role delegated ADMIN OPTION (`ops_admin` -> `group_mig` with pre-existing
+    //    `INHERIT FALSE, SET TRUE`) must succeed without clobbering SET or deleting membership.
+    let db_name = db.database_name().to_owned();
+    {
+        let mut admin = PgConnection::connect(&admin_url)
+            .await
+            .expect("admin setup group admin");
+        admin
+            .execute(AssertSqlSafe(format!(
+                "CREATE ROLE {} NOLOGIN",
+                quote_ident(&ops_admin)
+            )))
+            .await
+            .expect("create ops_admin");
+        admin
+            .execute(AssertSqlSafe(format!(
+                "CREATE ROLE {} LOGIN PASSWORD '{group_pw}'",
+                quote_ident(&group_mig)
+            )))
+            .await
+            .expect("create group_mig");
+        admin
+            .execute(AssertSqlSafe(format!(
+                "GRANT {} TO {} WITH ADMIN OPTION, INHERIT FALSE, SET FALSE",
+                quote_ident(OWNER_ROLE),
+                quote_ident(&ops_admin),
+            )))
+            .await
+            .expect("grant owner ADMIN to ops_admin");
+        admin
+            .execute(AssertSqlSafe(format!(
+                "GRANT {} TO {} WITH INHERIT TRUE, SET FALSE",
+                quote_ident(&ops_admin),
+                quote_ident(&group_mig),
+            )))
+            .await
+            .expect("grant ops_admin to group_mig");
+        admin
+            .execute(AssertSqlSafe(format!(
+                "GRANT {} TO {} WITH INHERIT FALSE, SET TRUE GRANTED BY {}",
+                quote_ident(OWNER_ROLE),
+                quote_ident(&group_mig),
+                quote_ident(&ops_admin),
+            )))
+            .await
+            .expect("pre-grant INHERIT FALSE, SET TRUE by ops_admin");
+        admin
+            .execute(AssertSqlSafe(format!(
+                "GRANT CONNECT, CREATE ON DATABASE {} TO {}",
+                quote_ident(&db_name),
+                quote_ident(&group_mig),
+            )))
+            .await
+            .expect("grant db connect");
+        admin.close().await.expect("close admin");
+    }
+
+    let base = db.url();
+    let (scheme, rest) = base.split_once("://").expect("valid URL");
+    let (_, host_and_db) = rest.split_once('@').expect("URL credentials");
+    let group_url = format!("{scheme}://{group_mig}:{group_pw}@{host_and_db}");
+    let mut group_conn = PgConnection::connect(&group_url)
+        .await
+        .expect("connect as group_mig");
+    run_statements_tx(&mut group_conn, &stmts)
+        .await
+        .expect("DDL refresh must succeed via group-inherited ADMIN OPTION without clobbering SET");
+
+    let (has_usage, has_set): (bool, bool) = sqlx::query_as(
+        "SELECT pg_catalog.pg_has_role($1, $2, 'USAGE'), pg_catalog.pg_has_role($1, $2, 'SET')",
+    )
+    .bind(&group_mig)
+    .bind(OWNER_ROLE)
+    .fetch_one(&mut group_conn)
+    .await
+    .expect("check group_mig membership after DDL");
+    assert!(
+        !has_usage && has_set,
+        "group_mig must keep pre-existing (INHERIT FALSE, SET TRUE), got usage={has_usage}, set={has_set}"
+    );
+    group_conn.close().await.expect("close group_conn");
+
     drop(db);
     let mut admin = PgConnection::connect(&admin_url)
         .await
         .expect("admin cleanup");
+    for role in [&group_mig, &ops_admin] {
+        let _ = admin
+            .execute(AssertSqlSafe(format!(
+                "DROP ROLE IF EXISTS {}",
+                quote_ident(role)
+            )))
+            .await;
+    }
     let _ = admin
         .execute(AssertSqlSafe(format!(
             "DROP ROLE IF EXISTS {}",
