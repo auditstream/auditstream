@@ -285,6 +285,11 @@ pub(crate) struct GeneratedDdl {
 /// outlives a failed setup run. Autocommit execution is rejected before any role or schema DDL
 /// executes.
 ///
+/// When installing both the history schema (D2) and capture triggers (D3) together, prefer
+/// [`crate::migrations::install_statements`] (for statement-by-statement transactional drivers)
+/// or [`crate::migrations::render_install_sql`] (for `psql`) instead of manually stitching this
+/// output with [`crate::triggers::generate`].
+///
 /// The second-to-last statement creates the next three monthly partitions. Creating a
 /// partition locks `changes` until commit, so migrations run it after their trigger statements.
 pub fn generate(options: &DdlOptions) -> Vec<String> {

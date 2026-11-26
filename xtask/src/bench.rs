@@ -13,8 +13,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Instant;
 
-use auditstream_pg::ddl::{self, DEFAULT_SCHEMA, DdlOptions};
-use auditstream_pg::triggers::{self, TableTriggerSpec, TriggerOptions};
+use auditstream_pg::ddl::{DEFAULT_SCHEMA, DdlOptions};
+use auditstream_pg::migrations;
+use auditstream_pg::triggers::TableTriggerSpec;
 use serde::Serialize;
 
 const BULK_ROWS: u64 = 10_000;
@@ -388,6 +389,16 @@ fn run_index_variants(
     Ok(index_variants)
 }
 
+fn build_setup_schema_sql() -> Result<String, String> {
+    let tables = vec![
+        TableTriggerSpec::new("public", "bench_up_cap", vec!["id".to_owned()], vec![]),
+        TableTriggerSpec::new("public", "bench_ins_cap", vec!["id".to_owned()], vec![]),
+        TableTriggerSpec::new("public", "bench_bulk_cap", vec!["id".to_owned()], vec![]),
+    ];
+    migrations::render_install_sql(&DdlOptions::new(DEFAULT_SCHEMA, vec![]), &tables)
+        .map_err(|err| format!("failed to render benchmark schema SQL: {err}"))
+}
+
 fn setup_benchmark_schema(db_url: &str) -> Result<(), String> {
     // Seed tables BEFORE triggers exist so seeding is never audited.
     let seed_sql = "\
@@ -402,27 +413,8 @@ fn setup_benchmark_schema(db_url: &str) -> Result<(), String> {
         ANALYZE public.bench_up_plain, public.bench_up_cap;\n";
     psql_exec(db_url, seed_sql)?;
 
-    let mut ddl_stmts = ddl::generate(&DdlOptions::new(DEFAULT_SCHEMA, vec![]));
-    let role_cleanup = ddl_stmts.pop();
-
-    let tables = vec![
-        TableTriggerSpec::new("public", "bench_up_cap", vec!["id".to_owned()], vec![]),
-        TableTriggerSpec::new("public", "bench_ins_cap", vec!["id".to_owned()], vec![]),
-        TableTriggerSpec::new("public", "bench_bulk_cap", vec!["id".to_owned()], vec![]),
-    ];
-    let trigger_stmts = triggers::generate(&TriggerOptions::new(DEFAULT_SCHEMA, tables));
-
-    let mut combined = String::new();
-    for stmt in ddl_stmts
-        .into_iter()
-        .chain(trigger_stmts)
-        .chain(role_cleanup)
-    {
-        combined.push_str(&stmt);
-        combined.push_str(";\n");
-    }
-
-    psql_exec(db_url, &combined)
+    let install_sql = build_setup_schema_sql()?;
+    psql_exec(db_url, &install_sql)
 }
 
 fn apply_index_variant(db_url: &str, variant: IndexVariant) -> Result<(), String> {
@@ -928,6 +920,24 @@ tps = 6630.421800 (without initial connection time)
             )
             .expect("replace"),
             "postgres://postgres:pg@127.0.0.1:5432/auditstream_bench_1?sslmode=disable"
+        );
+    }
+
+    #[test]
+    fn build_setup_schema_sql_wraps_canonical_install_in_single_transaction() {
+        let sql = build_setup_schema_sql().expect("build benchmark setup SQL");
+        assert!(sql.starts_with("BEGIN;\n\n"), "missing BEGIN; framing");
+        assert!(sql.ends_with("\n\nCOMMIT;\n"), "missing COMMIT; framing");
+        assert!(sql.contains("auditstream._migration_tx"));
+        for table in ["bench_up_cap", "bench_ins_cap", "bench_bulk_cap"] {
+            assert!(
+                sql.contains(&format!("ON \"public\".\"{table}\"")),
+                "missing triggers for {table}"
+            );
+        }
+        assert!(
+            !sql.contains("auditstream._triggers_granted_self"),
+            "must use canonical composition without duplicate trigger role self-grant"
         );
     }
 }

@@ -1,21 +1,28 @@
 name: Nightly
 
 on:
+  pull_request:
+    paths:
+      - "crates/auditstream-pg/src/**"
+      - "xtask/**"
+      - "bench/capture/**"
+      - ".github/workflows/nightly.yml"
   schedule:
     - cron: "37 3 * * *"
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   bench:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
     services:
       postgres:
         image: postgres:19
@@ -48,13 +55,26 @@ jobs:
           sudo apt-get install -y -qq postgresql-client
           psql --version
           pgbench --version
+      - name: Run capture benchmark smoke check
+        if: github.event_name == 'pull_request'
+        run: |
+          cargo xtask bench \
+            --duration 1 \
+            --clients 2 \
+            --jobs 1 \
+            --bulk-runs 1 \
+            --markdown-out bench-report.md \
+            --json-out bench-report.json
+          cat bench-report.md >> "$GITHUB_STEP_SUMMARY"
       - name: Run capture benchmark suite
+        if: github.event_name != 'pull_request'
         run: |
           cargo xtask bench \
             --markdown-out bench-report.md \
             --json-out bench-report.json
           cat bench-report.md >> "$GITHUB_STEP_SUMMARY"
       - name: Upload benchmark report artifacts
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: capture-bench-report

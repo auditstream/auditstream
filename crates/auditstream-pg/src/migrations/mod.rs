@@ -195,8 +195,15 @@ pub enum PreviewOutcome {
     },
 }
 
-fn validate_options(options: &MigrationOptions) -> Result<(), MigrationError> {
-    for spec in &options.tables {
+fn validate_tables(tables: &[TableTriggerSpec]) -> Result<(), MigrationError> {
+    let mut seen: BTreeSet<(&str, &str)> = BTreeSet::new();
+    for spec in tables {
+        if !seen.insert((spec.schema.as_str(), spec.table.as_str())) {
+            return Err(MigrationError::InvalidMetadata(format!(
+                "duplicate table specification for `{}.{}`",
+                spec.schema, spec.table,
+            )));
+        }
         let pk_excluded = spec.excluded_primary_key_columns();
         if !pk_excluded.is_empty() {
             return Err(MigrationError::InvalidMetadata(format!(
@@ -210,13 +217,61 @@ fn validate_options(options: &MigrationOptions) -> Result<(), MigrationError> {
     Ok(())
 }
 
+fn validate_options(options: &MigrationOptions) -> Result<(), MigrationError> {
+    validate_tables(&options.tables)
+}
+
+/// Composes D2 history schema DDL and D3 capture triggers into one ordered, deterministic
+/// sequence of single SQL statements without touching the filesystem or requiring a timestamp.
+///
+/// The returned sequence matches the exact production composition emitted by [`write()`] and
+/// [`preview()`]: it sets the transaction guard and `lock_timeout` fallback, installs the history
+/// schema and functions, attaches capture triggers before creating future monthly partitions
+/// (avoiding lock-order deadlocks with concurrent writers), revokes any temporary
+/// `auditstream_owner` self-grant, and restores `lock_timeout`.
+///
+/// Callers MUST execute the returned statements sequentially inside a single transaction
+/// (for example via `sqlx::Transaction`, a transactional migrator, or [`render_install_sql()`]);
+/// autocommit execution is rejected before any role or schema DDL runs.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::InvalidMetadata`] if `tables` contains duplicate `(schema, table)`
+/// entries or any table specification excludes one of its own primary key columns.
+pub fn install_statements(
+    ddl: &DdlOptions,
+    tables: &[TableTriggerSpec],
+) -> Result<Vec<String>, MigrationError> {
+    validate_tables(tables)?;
+    Ok(compose_statements_inner(ddl, tables, &[]))
+}
+
+/// Renders a self-contained, transaction-wrapped plain SQL script (`BEGIN; ... COMMIT;`) that
+/// installs or idempotently reconciles the D2 history schema DDL and D3 capture triggers.
+///
+/// Output can be piped directly into `psql -v ON_ERROR_STOP=1` without manually stitching
+/// [`crate::ddl::generate()`] and [`crate::triggers::generate()`] or wrapping in a transaction.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::InvalidMetadata`] if `tables` contains duplicate `(schema, table)`
+/// entries or any table specification excludes one of its own primary key columns.
+pub fn render_install_sql(
+    ddl: &DdlOptions,
+    tables: &[TableTriggerSpec],
+) -> Result<String, MigrationError> {
+    let statements = install_statements(ddl, tables)?;
+    Ok(sql::format_transaction_script(&statements))
+}
+
 /// Renders the migration SQL that [`write()`] would generate without creating directories or
 /// writing any files on disk.
 ///
 /// # Errors
 ///
 /// Returns [`MigrationError::Io`] on filesystem read errors or [`MigrationError::InvalidMetadata`]
-/// if an existing Drizzle `meta/_journal.json`, Auditstream manifest, or table exclusion spec is invalid.
+/// if an existing Drizzle `meta/_journal.json`, Auditstream manifest, duplicate `(schema, table)`
+/// entry, or table exclusion spec is invalid.
 pub fn preview(options: &MigrationOptions) -> Result<PreviewOutcome, MigrationError> {
     validate_options(options)?;
     match options.format {
@@ -239,7 +294,8 @@ pub fn preview(options: &MigrationOptions) -> Result<PreviewOutcome, MigrationEr
 /// # Errors
 ///
 /// Returns [`MigrationError::Io`] on filesystem errors or [`MigrationError::InvalidMetadata`]
-/// if an existing Drizzle `meta/_journal.json` or table exclusion spec is invalid.
+/// if an existing Drizzle `meta/_journal.json`, duplicate `(schema, table)` entry, or table
+/// exclusion spec is invalid.
 pub fn write(options: &MigrationOptions) -> Result<WriteOutcome, MigrationError> {
     validate_options(options)?;
     match options.format {
@@ -364,16 +420,22 @@ pub(crate) fn compose_statements(
     options: &MigrationOptions,
     dropped_tables: &[(String, String)],
 ) -> Vec<String> {
+    compose_statements_inner(&options.ddl, &options.tables, dropped_tables)
+}
+
+fn compose_statements_inner(
+    ddl: &DdlOptions,
+    tables: &[TableTriggerSpec],
+    dropped_tables: &[(String, String)],
+) -> Vec<String> {
     // Keep D2's temporary `auditstream_owner` self-grant active while D3 creates/alters functions,
     // and run future monthly partition creation after triggers so holding a lock on `changes`
     // cannot deadlock with in-flight writers holding an audited table.
-    let ddl_parts = ddl::generate_parts(&options.ddl);
-    let tables_sorted = canonicalize_tables(&options.tables);
+    let ddl_parts = ddl::generate_parts(ddl);
+    let tables_sorted = canonicalize_tables(tables);
 
-    let trigger_stmts = triggers::generate_body(&TriggerOptions::new(
-        options.ddl.schema.clone(),
-        tables_sorted,
-    ));
+    let trigger_stmts =
+        triggers::generate_body(&TriggerOptions::new(ddl.schema.clone(), tables_sorted));
 
     let mut drop_stmts = Vec::with_capacity(dropped_tables.len() * AUDIT_TRIGGER_NAMES.len());
     for (schema, table) in dropped_tables {
@@ -539,5 +601,180 @@ pub(crate) fn next_unique_timestamp(
             return ts;
         }
         candidate += time::Duration::seconds(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::{Date, Month, PrimitiveDateTime, Time};
+
+    fn sample_tables() -> Vec<TableTriggerSpec> {
+        vec![
+            TableTriggerSpec::new(
+                "public",
+                "invoice",
+                vec!["id".to_owned()],
+                vec!["password_hash".to_owned()],
+            ),
+            TableTriggerSpec::new("public", "line_item", vec!["id".to_owned()], Vec::new()),
+        ]
+    }
+
+    #[test]
+    fn install_statements_matches_canonical_migration_composition_and_order() {
+        let ddl = DdlOptions::new(ddl::DEFAULT_SCHEMA, vec!["app_user".to_owned()]);
+        let tables = sample_tables();
+        let stmts = install_statements(&ddl, &tables).expect("compose install statements");
+
+        let fixed_now = PrimitiveDateTime::new(
+            Date::from_calendar_date(2026, Month::November, 26).expect("date"),
+            Time::from_hms(12, 0, 0).expect("time"),
+        )
+        .assume_utc();
+        let ddl_parts = ddl::generate_parts(&ddl);
+        let opts = MigrationOptions::new(
+            MigrationFormat::Sql,
+            PathBuf::from("unused"),
+            fixed_now,
+            ddl,
+            tables,
+        );
+        assert_eq!(stmts, compose_statements(&opts, &[]));
+
+        assert_eq!(stmts.first().map(String::as_str), Some(SET_LOCK_TIMEOUT));
+        assert_eq!(stmts.get(1).map(String::as_str), Some(REQUIRE_TRANSACTION));
+        assert_eq!(stmts.last().map(String::as_str), Some(RESTORE_LOCK_TIMEOUT));
+
+        // Role elevation runs once (no duplicate triggers::generate self-grant block).
+        assert_eq!(
+            stmts
+                .iter()
+                .filter(|s| s.contains("auditstream._granted_self"))
+                .count(),
+            2,
+            "expected exactly setup + cleanup for DDL role grant"
+        );
+        assert!(
+            !stmts
+                .iter()
+                .any(|s| s.contains("auditstream._triggers_granted_self")),
+            "canonical composition must not emit duplicate trigger role self-grant"
+        );
+
+        // Triggers must be installed before future monthly partitions and role cleanup.
+        let trigger_idx = stmts
+            .iter()
+            .position(|s| s.starts_with("CREATE OR REPLACE TRIGGER auditstream_insert"))
+            .expect("trigger statement");
+        let future_part_idx = stmts
+            .iter()
+            .position(|s| *s == ddl_parts.future_partitions)
+            .expect("future partitions statement");
+        let cleanup_idx = stmts
+            .iter()
+            .position(|s| *s == ddl_parts.role_cleanup)
+            .expect("role cleanup statement");
+        assert!(trigger_idx < future_part_idx);
+        assert!(future_part_idx < cleanup_idx);
+    }
+
+    #[test]
+    fn install_statements_and_render_install_sql_are_deterministic_and_validate_pk() {
+        let ddl = DdlOptions::default();
+        let ordered = vec![
+            TableTriggerSpec::new(
+                "public",
+                "alpha",
+                vec!["id".to_owned()],
+                vec!["a".to_owned(), "b".to_owned()],
+            ),
+            TableTriggerSpec::new("public", "beta", vec!["id".to_owned()], Vec::new()),
+        ];
+        let reordered = vec![
+            TableTriggerSpec::new("public", "beta", vec!["id".to_owned()], Vec::new()),
+            TableTriggerSpec::new(
+                "public",
+                "alpha",
+                vec!["id".to_owned()],
+                vec!["b".to_owned(), "a".to_owned(), "a".to_owned()],
+            ),
+        ];
+
+        assert_eq!(
+            install_statements(&ddl, &ordered).expect("ordered"),
+            install_statements(&ddl, &reordered).expect("reordered")
+        );
+
+        let sql = render_install_sql(&ddl, &ordered).expect("render install sql");
+        assert_eq!(
+            sql,
+            render_install_sql(&ddl, &reordered).expect("reordered sql")
+        );
+        assert!(sql.starts_with("BEGIN;\n\n"));
+        assert!(sql.ends_with("\n\nCOMMIT;\n"));
+        assert!(!sql.contains("-- auditstream:manifest"));
+
+        let bad = vec![TableTriggerSpec::new(
+            "public",
+            "invoice",
+            vec!["id".to_owned()],
+            vec!["id".to_owned()],
+        )];
+        let err1 = install_statements(&ddl, &bad).expect_err("reject excluded PK");
+        assert!(err1.to_string().contains("primary key"), "{err1}");
+        let err2 = render_install_sql(&ddl, &bad).expect_err("reject excluded PK");
+        assert!(err2.to_string().contains("primary key"), "{err2}");
+
+        let duplicate_conflicting = vec![
+            TableTriggerSpec::new(
+                "public",
+                "invoice",
+                vec!["id".to_owned()],
+                vec!["password_hash".to_owned()],
+            ),
+            TableTriggerSpec::new(
+                "public",
+                "invoice",
+                vec!["id".to_owned()],
+                vec!["ssn".to_owned()],
+            ),
+        ];
+        let dup_err1 = install_statements(&ddl, &duplicate_conflicting)
+            .expect_err("reject duplicate (schema, table) specs");
+        assert!(
+            dup_err1
+                .to_string()
+                .contains("duplicate table specification for `public.invoice`"),
+            "{dup_err1}"
+        );
+        let dup_err2 = render_install_sql(&ddl, &duplicate_conflicting)
+            .expect_err("render_install_sql must reject duplicate (schema, table) specs");
+        assert!(
+            dup_err2
+                .to_string()
+                .contains("duplicate table specification for `public.invoice`"),
+            "{dup_err2}"
+        );
+        let fixed_now = PrimitiveDateTime::new(
+            Date::from_calendar_date(2026, Month::November, 26).expect("date"),
+            Time::from_hms(12, 0, 0).expect("time"),
+        )
+        .assume_utc();
+        let dup_opts = MigrationOptions::new(
+            MigrationFormat::Sql,
+            PathBuf::from("unused"),
+            fixed_now,
+            ddl,
+            duplicate_conflicting,
+        );
+        let dup_err3 =
+            preview(&dup_opts).expect_err("preview must reject duplicate (schema, table) specs");
+        assert!(
+            dup_err3
+                .to_string()
+                .contains("duplicate table specification for `public.invoice`"),
+            "{dup_err3}"
+        );
     }
 }

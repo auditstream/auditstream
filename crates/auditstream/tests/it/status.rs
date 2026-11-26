@@ -2,8 +2,9 @@
 
 use std::fs;
 
-use auditstream_pg::ddl::{self, DEFAULT_SCHEMA, DdlOptions};
-use auditstream_pg::triggers::{self, TableTriggerSpec, TriggerOptions};
+use auditstream_pg::ddl::{DEFAULT_SCHEMA, DdlOptions};
+use auditstream_pg::migrations;
+use auditstream_pg::triggers::TableTriggerSpec;
 use auditstream_testkit::TestDb;
 use insta_cmd::assert_cmd_snapshot;
 use predicates::prelude::*;
@@ -13,14 +14,8 @@ use crate::support::{auditstream_cmd, auditstream_std_cmd};
 
 async fn install_capture(db: &TestDb, specs: &[TableTriggerSpec]) {
     let _lock = TestDb::cluster_lock().await.expect("cluster lock");
-    let mut ddl_stmts = ddl::generate(&DdlOptions::new(DEFAULT_SCHEMA, vec![]));
-    let cleanup = ddl_stmts.pop();
-    let trigger_stmts = triggers::generate(&TriggerOptions::new(DEFAULT_SCHEMA, specs.to_vec()));
-    let all: Vec<String> = ddl_stmts
-        .into_iter()
-        .chain(trigger_stmts)
-        .chain(cleanup)
-        .collect();
+    let all = migrations::install_statements(&DdlOptions::new(DEFAULT_SCHEMA, vec![]), specs)
+        .expect("compose D2+D3 install statements");
     db.execute_statements(&all).await.expect("install D2+D3");
 }
 

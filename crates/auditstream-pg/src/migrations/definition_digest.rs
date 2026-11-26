@@ -18,6 +18,7 @@ pub(super) fn from_statements(statements: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::install_statements;
     use super::*;
     use crate::{ddl, triggers};
 
@@ -34,11 +35,8 @@ mod tests {
     #[test]
     fn changing_any_generated_function_or_trigger_changes_the_digest() {
         let table = triggers::TableTriggerSpec::new("public", "invoice", vec!["id".into()], vec![]);
-        let mut statements = ddl::generate(&ddl::DdlOptions::default());
-        statements.extend(triggers::generate(&triggers::TriggerOptions::new(
-            ddl::DEFAULT_SCHEMA,
-            vec![table],
-        )));
+        let statements =
+            install_statements(&ddl::DdlOptions::default(), &[table]).expect("install statements");
         let original = from_statements(&statements);
 
         for function in ["resolve_actor", "capture", "log_event"] {

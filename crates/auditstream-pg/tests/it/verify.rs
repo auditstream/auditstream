@@ -1,6 +1,7 @@
 //! Live PostgreSQL integration tests for `auditstream_pg::verify` (D7).
 
-use auditstream_pg::ddl::{self, DEFAULT_SCHEMA, DdlOptions};
+use auditstream_pg::ddl::{DEFAULT_SCHEMA, DdlOptions};
+use auditstream_pg::migrations;
 use auditstream_pg::triggers::{self, TableTriggerSpec, TriggerOptions};
 use auditstream_pg::verify::{self, FindingKind, Severity};
 use auditstream_testkit::TestDb;
@@ -11,17 +12,38 @@ async fn install_fixture(db: &TestDb, tables: &[TableTriggerSpec]) {
         .await
         .expect("acquire cluster lock for role setup");
 
-    let mut ddl_stmts = ddl::generate(&DdlOptions::new(DEFAULT_SCHEMA, vec![]));
-    let cleanup = ddl_stmts.pop();
-    let trigger_stmts = triggers::generate(&TriggerOptions::new(DEFAULT_SCHEMA, tables.to_vec()));
+    let statements =
+        migrations::install_statements(&DdlOptions::new(DEFAULT_SCHEMA, vec![]), tables)
+            .expect("compose D2+D3 install statements");
 
     let mut tx = db.pool().begin().await.expect("begin fixture tx");
-    for stmt in ddl_stmts.into_iter().chain(trigger_stmts).chain(cleanup) {
+    for stmt in statements {
         tx.execute(AssertSqlSafe(stmt))
             .await
             .expect("install capture DDL/triggers");
     }
     tx.commit().await.expect("commit fixture tx");
+}
+
+/// Installs the D2 history schema via [`migrations::install_statements`] and then attaches
+/// unvalidated/raw triggers via [`triggers::generate`] inside a single transaction so `verify`
+/// tests can simulate misconfigured or non-canonical live triggers.
+async fn install_raw_triggers_fixture(db: &TestDb, tables: &[TableTriggerSpec]) {
+    let _guard = TestDb::cluster_lock()
+        .await
+        .expect("acquire cluster lock for role setup");
+
+    let ddl_stmts = migrations::install_statements(&DdlOptions::new(DEFAULT_SCHEMA, vec![]), &[])
+        .expect("compose D2 schema statements");
+    let trigger_stmts = triggers::generate(&TriggerOptions::new(DEFAULT_SCHEMA, tables.to_vec()));
+
+    let mut tx = db.pool().begin().await.expect("begin raw fixture tx");
+    for stmt in ddl_stmts.into_iter().chain(trigger_stmts) {
+        tx.execute(AssertSqlSafe(stmt))
+            .await
+            .expect("install raw capture DDL/triggers");
+    }
+    tx.commit().await.expect("commit raw fixture tx");
 }
 
 async fn create_invoice_table(db: &TestDb) {
@@ -456,7 +478,7 @@ async fn reports_error_when_primary_key_column_is_excluded() {
     let db = TestDb::new().await.expect("create TestDb");
     create_invoice_table(&db).await;
     let bad_specs = vec![invoice_spec(vec!["id"])];
-    install_fixture(&db, &bad_specs).await;
+    install_raw_triggers_fixture(&db, &bad_specs).await;
 
     // 1. Config-side exclusion of a PK column reports InvalidExclusion.
     let report = verify::check(db.pool(), &bad_specs)
@@ -504,7 +526,7 @@ async fn reports_unsafe_privileges_and_invalid_ownership_across_history_objects(
     // Also exercise unsorted excluded_columns in triggers::generate + verify::check parity.
     let specs = vec![invoice_spec(vec!["password_hash", "status"])];
     let unsorted_specs = vec![invoice_spec(vec!["status", "password_hash"])];
-    install_fixture(&db, &unsorted_specs).await;
+    install_raw_triggers_fixture(&db, &unsorted_specs).await;
 
     // 1. Legitimate least-privilege app_role (USAGE + parent SELECT + EXECUTE log_event, zero
     //    child grants) must produce zero findings AND run `verify::check` itself cleanly!
