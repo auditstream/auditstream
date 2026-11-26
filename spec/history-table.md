@@ -70,7 +70,7 @@ Generated triggers on audited tables MUST use `auditstream.capture()` (and `audi
 
 Additional capture rules:
 
-- **Excluded columns:** configured excluded columns MUST NEVER appear in `before`, `after`, or `changed`.
+- **Excluded columns:** configured excluded columns MUST NEVER appear in `before`, `after`, or `changed`. Primary key columns MUST NOT be configured in excluded columns, so `record_id` is never silently nullified.
 - **`record_id`:** MUST be a JSON object mapping each primary key column name to its value (taken from `after` on `INSERT`/`UPDATE` and from `before` on `DELETE`, supporting single and composite primary keys), and MUST be `NULL` for tables without a primary key and for `TRUNCATE`.
 - **Partitioned user tables:** statement-level triggers (`auditstream_insert`, `auditstream_delete`, `auditstream_truncate`) attach to the parent partitioned table. A SQL statement that targets a child partition directly does not fire statement triggers attached to the parent, so `auditstream verify` MUST report audited partitioned tables and warn about direct partition writes.
 - **Error behavior:** malformed actor payloads MUST NEVER abort the write (per [spec/transport.md](transport.md#malformed-inputs-and-validation-parity)). Any other trigger error aborts the user's transaction so audit gaps are not silently ignored.
@@ -97,9 +97,10 @@ Requirements:
 ## Security model
 
 - **Owner role:** a `NOLOGIN` role named `auditstream_owner` MUST own the `auditstream` schema, `auditstream.changes` (and its partitions), and all functions in the schema.
+- **Partition creation under owner role (`ALTER DEFAULT PRIVILEGES` immunity):** `auditstream.changes`, `changes_default`, and every `changes_YYYY_MM` partition MUST be created under `auditstream_owner` (via `SET LOCAL ROLE auditstream_owner`) and child partitions MUST NOT grant write privileges (`INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`, `TRIGGER`, or `MAINTAIN`) to `PUBLIC` or non-owner roles, even when the migration role has `ALTER DEFAULT PRIVILEGES ... GRANT ALL ON TABLES TO <app_role>`.
 - **`SECURITY DEFINER` and `search_path`:** `auditstream.capture()`, `auditstream.log_event()`, and any helper invoked by them MUST be `SECURITY DEFINER`, owned by `auditstream_owner`, declared with `SET search_path = pg_catalog, pg_temp`, and MUST reference all objects by schema-qualified names.
-- **Application role grants:** application roles MUST receive `USAGE` on `auditstream`, `SELECT` on `auditstream.changes`, and `EXECUTE` on `auditstream.log_event(text, jsonb, jsonb)`. Application roles MUST NOT receive `INSERT`, `UPDATE`, `DELETE`, or `TRUNCATE` on `auditstream.changes`; their writes to audited tables are still captured through the `SECURITY DEFINER` trigger.
-- **Managed PostgreSQL self-grant rule (PostgreSQL 16+):** on managed PostgreSQL (such as Neon and Supabase), migrations run as a `CREATEROLE` non-superuser role. Starting in PostgreSQL 16 (`createrole_self_grant = ''`), creating a role grants only `ADMIN`, not `USAGE`. Setup MUST check `pg_has_role(current_user, 'auditstream_owner', 'USAGE')` and execute `GRANT auditstream_owner TO <current_user>` when false before creating objects owned by `auditstream_owner`, and SHOULD revoke that temporary grant at the end of setup when it added it.
+- **Application role grants:** application roles MUST receive `USAGE` on `auditstream`, `SELECT` on `auditstream.changes`, and `EXECUTE` on `auditstream.log_event(text, jsonb, jsonb)`. Application roles MUST NOT receive `INSERT`, `UPDATE`, `DELETE`, or `TRUNCATE` on `auditstream.changes` or any child partition; their writes to audited tables are still captured through the `SECURITY DEFINER` trigger.
+- **Managed PostgreSQL self-grant rule (PostgreSQL 16+):** on managed PostgreSQL (such as Neon and Supabase), migrations run as a `CREATEROLE` non-superuser role. Starting in PostgreSQL 16 (`createrole_self_grant = ''`), creating a role grants only `ADMIN`, not `USAGE` or `SET`. Setup MUST run inside a single transaction, check `pg_has_role(current_user, 'auditstream_owner', 'USAGE')` (and `'SET'` on PostgreSQL 16+), execute `GRANT auditstream_owner TO <current_user>` when false using a transaction-local flag (`set_config(..., true)`), and revoke that temporary grant before commit so failed or interrupted migrations never persist elevated role membership.
 - **Role reuse rule:** setup MUST reuse existing roles (`auditstream_owner` and application roles) and MUST NEVER drop and recreate them. Connection poolers retain sessions authenticated as the original role OID, causing subsequent queries to fail with `permission denied` if the role is dropped.
 
 ## Export cursor contract
@@ -125,9 +126,12 @@ ORDER BY xact_id ASC, id ASC
 The reference DDL below establishes the roles, schema, partitioned history table, monthly partitions (3-month horizon), `DEFAULT` partition, `BRIN` index, `resolve_actor()`, `log_event()`, and grants. It is verified on PostgreSQL 15 through 19 as both a `CREATEROLE` non-superuser and a superuser.
 
 ```sql
+BEGIN;
+
 DO $$
 DECLARE
   granted_self boolean := false;
+  needs_grant boolean := false;
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'auditstream_owner') THEN
     EXECUTE 'CREATE ROLE auditstream_owner NOLOGIN';
@@ -137,7 +141,12 @@ BEGIN
     EXECUTE 'CREATE ROLE auditstream_app NOLOGIN';
   END IF;
 
-  IF NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'USAGE') THEN
+  needs_grant := NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'USAGE');
+  IF NOT needs_grant AND pg_catalog.current_setting('server_version_num')::int >= 160000 THEN
+    needs_grant := NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'SET');
+  END IF;
+
+  IF needs_grant THEN
     EXECUTE pg_catalog.format('GRANT auditstream_owner TO %I', current_user);
     granted_self := true;
   END IF;
@@ -145,12 +154,14 @@ BEGIN
   PERFORM pg_catalog.set_config(
     'auditstream._granted_self',
     CASE WHEN granted_self THEN '1' ELSE '0' END,
-    false
+    true
   );
 END
 $$;
 
 CREATE SCHEMA IF NOT EXISTS auditstream AUTHORIZATION auditstream_owner;
+
+SET LOCAL ROLE auditstream_owner;
 
 CREATE TABLE IF NOT EXISTS auditstream.changes (
   id bigint GENERATED ALWAYS AS IDENTITY,
@@ -179,31 +190,26 @@ CREATE TABLE IF NOT EXISTS auditstream.changes (
   CONSTRAINT changes_schema_version_check CHECK (schema_version >= 1)
 ) PARTITION BY RANGE (occurred_at);
 
-ALTER TABLE auditstream.changes OWNER TO auditstream_owner;
-
 CREATE TABLE IF NOT EXISTS auditstream.changes_2026_11
   PARTITION OF auditstream.changes
   FOR VALUES FROM ('2026-11-01 00:00:00+00') TO ('2026-12-01 00:00:00+00');
-ALTER TABLE auditstream.changes_2026_11 OWNER TO auditstream_owner;
 
 CREATE TABLE IF NOT EXISTS auditstream.changes_2026_12
   PARTITION OF auditstream.changes
   FOR VALUES FROM ('2026-12-01 00:00:00+00') TO ('2027-01-01 00:00:00+00');
-ALTER TABLE auditstream.changes_2026_12 OWNER TO auditstream_owner;
 
 CREATE TABLE IF NOT EXISTS auditstream.changes_2027_01
   PARTITION OF auditstream.changes
   FOR VALUES FROM ('2027-01-01 00:00:00+00') TO ('2027-02-01 00:00:00+00');
-ALTER TABLE auditstream.changes_2027_01 OWNER TO auditstream_owner;
 
 CREATE TABLE IF NOT EXISTS auditstream.changes_2027_02
   PARTITION OF auditstream.changes
   FOR VALUES FROM ('2027-02-01 00:00:00+00') TO ('2027-03-01 00:00:00+00');
-ALTER TABLE auditstream.changes_2027_02 OWNER TO auditstream_owner;
 
 CREATE TABLE IF NOT EXISTS auditstream.changes_default
   PARTITION OF auditstream.changes DEFAULT;
-ALTER TABLE auditstream.changes_default OWNER TO auditstream_owner;
+
+SET LOCAL ROLE NONE;
 
 CREATE INDEX IF NOT EXISTS changes_occurred_at_brin_idx
   ON auditstream.changes USING brin (occurred_at);
@@ -487,8 +493,10 @@ DO $$
 BEGIN
   IF pg_catalog.current_setting('auditstream._granted_self', true) = '1' THEN
     EXECUTE pg_catalog.format('REVOKE auditstream_owner FROM %I', current_user);
-    PERFORM pg_catalog.set_config('auditstream._granted_self', '', false);
+    PERFORM pg_catalog.set_config('auditstream._granted_self', '', true);
   END IF;
 END
 $$;
+
+COMMIT;
 ```

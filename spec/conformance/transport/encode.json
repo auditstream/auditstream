@@ -229,6 +229,66 @@
       "expected": {
         "error": "invalid_context"
       }
+    },
+    {
+      "name": "reject-nul-in-actor-id",
+      "description": "NUL character (U+0000) in actor.id MUST fail.",
+      "input": {
+        "actor": {
+          "type": "user",
+          "id": "usr\u00001"
+        }
+      },
+      "expected": {
+        "error": "invalid_actor"
+      }
+    },
+    {
+      "name": "reject-nul-in-tenant",
+      "description": "NUL character (U+0000) in actor.tenant MUST fail.",
+      "input": {
+        "actor": {
+          "type": "user",
+          "id": "usr_1",
+          "tenant": "org\u0000acme"
+        }
+      },
+      "expected": {
+        "error": "invalid_actor"
+      }
+    },
+    {
+      "name": "reject-nul-in-on-behalf-of",
+      "description": "NUL character (U+0000) in onBehalfOf.id MUST fail.",
+      "input": {
+        "actor": {
+          "type": "ai_agent",
+          "id": "agent_1",
+          "onBehalfOf": {
+            "type": "user",
+            "id": "usr\u00001"
+          }
+        }
+      },
+      "expected": {
+        "error": "invalid_actor"
+      }
+    },
+    {
+      "name": "reject-nul-in-context",
+      "description": "NUL character (U+0000) in context.requestId MUST fail.",
+      "input": {
+        "actor": {
+          "type": "user",
+          "id": "usr_1",
+          "context": {
+            "requestId": "req\u00001"
+          }
+        }
+      },
+      "expected": {
+        "error": "invalid_context"
+      }
     }
   ]
 }

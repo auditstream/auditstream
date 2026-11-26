@@ -69,11 +69,13 @@
             },
             "id": {
               "type": "string",
-              "minLength": 1
+              "minLength": 1,
+              "pattern": "^[^\\u0000]+$"
             },
             "tenant": {
               "type": "string",
-              "minLength": 1
+              "minLength": 1,
+              "pattern": "^[^\\u0000]+$"
             },
             "onBehalfOf": {
               "type": "object",
@@ -86,11 +88,13 @@
                 },
                 "id": {
                   "type": "string",
-                  "minLength": 1
+                  "minLength": 1,
+                  "pattern": "^[^\\u0000]+$"
                 },
                 "tenant": {
                   "type": "string",
-                  "minLength": 1
+                  "minLength": 1,
+                  "pattern": "^[^\\u0000]+$"
                 },
                 "onBehalfOf": false
               }
@@ -105,19 +109,23 @@
       "properties": {
         "requestId": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^[^\\u0000]+$"
         },
         "source": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^[^\\u0000]+$"
         },
         "ip": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^[^\\u0000]+$"
         },
         "userAgent": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^[^\\u0000]+$"
         }
       }
     },

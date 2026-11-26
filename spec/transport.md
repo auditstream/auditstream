@@ -134,6 +134,7 @@ To avoid scanning arbitrarily large SQL statements and to work within PostgreSQL
 A malformed actor payload MUST NEVER abort the application's SQL write. Any of the following inputs count as malformed and MUST yield `actor = NULL`, `context = NULL`, and `actor_source = 'invalid'`:
 
 - Invalid JSON syntax in `auditstream.actor`, decoded comment payload, or `request.jwt.claims`.
+- Any NUL character (`U+0000`, whether a raw `0x00` byte or a JSON `\u0000` escape) anywhere in `auditstream.actor`, decoded comment payload, or `request.jwt.claims`.
 - Non-object JSON (for example a JSON string, number, array, boolean, or `null`) in `auditstream.actor`, decoded comment payload, or `request.jwt.claims`.
 - Missing, non-string, or invalid `type` (not one of `user`, `api_key`, `ai_agent`, `service`, `system`), or missing/non-string/empty `id`.
 - Present `tenant` that is not a non-empty string.
