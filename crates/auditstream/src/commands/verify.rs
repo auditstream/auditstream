@@ -2,7 +2,8 @@
 //!
 //! Runs D7's read-only drift detection and partition coverage checks (`>= 2` months covered ahead),
 //! formats findings as one line per finding (text) or structured JSON, optionally creates 3 months
-//! of future partitions via `--fix` (D8 `ensure_ahead`), and exits `1` when any finding is present.
+//! of future partitions via `--fix` (D8 `ensure_ahead`), and exits `1` when findings meet or exceed
+//! the configured `--fail-on` severity threshold (default: `error`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -18,7 +19,7 @@ use serde::Serialize;
 use crate::commands::common::{
     build_configured_verify_specs, build_installed_verify_specs, connect_database,
     group_excludes_by_table, parse_exclude_refs, parse_table_refs, require_database_url,
-    run_async as run_command_async, sanitize_terminal,
+    run_async as run_command_async, sanitize_terminal, unmatched_configured_excludes,
 };
 use crate::config::Config;
 use crate::exit::{Exit, ExitCodeExt, write_stdout};
@@ -37,6 +38,16 @@ pub(crate) enum OutputFormat {
     Json,
 }
 
+/// Minimum finding severity that causes `auditstream verify` to fail with exit code `1`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub(crate) enum FailOn {
+    /// Fail only when at least one `error` finding is present (warnings exit `0`).
+    #[default]
+    Error,
+    /// Fail when any `error` or `warning` finding is present.
+    Warning,
+}
+
 /// Arguments for `auditstream verify`.
 #[derive(Debug, ClapArgs)]
 pub(crate) struct Args {
@@ -47,6 +58,10 @@ pub(crate) struct Args {
     /// Create missing monthly partitions 3 months ahead before verifying.
     #[arg(long)]
     pub(crate) fix: bool,
+
+    /// Minimum finding severity that causes verification to fail (`error` or `warning`).
+    #[arg(long, value_enum, default_value_t = FailOn::Error)]
+    pub(crate) fail_on: FailOn,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -195,6 +210,7 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
         build_configured_verify_specs(&configured_set, &excludes_by_table, &introspected_map)
     };
 
+    let unmatched_excludes = unmatched_configured_excludes(&excludes_by_table, &specs);
     let d7_report = verify::check_with_options(&pool, &VerifyOptions::new(&config.schema, specs))
         .await
         .map_err(|err| anyhow!("failed to run auditstream verification: {err}"))
@@ -207,23 +223,16 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
     pool.close().await;
 
     let mut findings: Vec<VerifyFinding> = d7_report.findings.iter().map(convert_finding).collect();
+    append_cli_findings(
+        &mut findings,
+        &config.schema,
+        history_stats.exists,
+        history_stats.months_covered_ahead,
+        &unmatched_excludes,
+    );
 
-    if history_stats.exists && history_stats.months_covered_ahead < MIN_MONTHS_COVERED_AHEAD {
-        findings.push(VerifyFinding {
-            severity: "error",
-            kind: "insufficient_partitions",
-            table: None,
-            object: format!("{}.changes", config.schema),
-            detail: format!(
-                "only {} month(s) covered ahead (minimum required: {MIN_MONTHS_COVERED_AHEAD})",
-                history_stats.months_covered_ahead
-            ),
-            hint: "Run `auditstream verify --fix` to create 3 months of future partitions."
-                .to_owned(),
-        });
-    }
-
-    let ok = findings.is_empty();
+    let failing_count = failing_findings_count(&findings, args.fail_on);
+    let ok = failing_count == 0;
     let json_report = VerifyJsonReport {
         ok,
         schema: config.schema.clone(),
@@ -248,13 +257,91 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
 
     if !ok {
         return Err(anyhow!(
-            "verification failed with {} finding(s)",
-            json_report.findings.len()
+            "verification failed with {failing_count} finding(s)"
         ))
         .exit_code(Exit::CheckFailed);
     }
 
     Ok(())
+}
+
+fn append_cli_findings(
+    findings: &mut Vec<VerifyFinding>,
+    schema: &str,
+    history_exists: bool,
+    months_covered_ahead: u32,
+    unmatched_excludes: &[(String, String, Vec<String>)],
+) {
+    for (tbl_schema, tbl_name, cols) in unmatched_excludes {
+        let fq_table = format!("{tbl_schema}.{tbl_name}");
+        findings.push(VerifyFinding {
+            severity: "error",
+            kind: "invalid_exclusion",
+            table: Some(fq_table.clone()),
+            object: fq_table.clone(),
+            detail: format!(
+                "excluded column(s) {} in capture.exclude target table `{fq_table}`, which is not in the verified table set",
+                cols.join(", ")
+            ),
+            hint: "Update capture.exclude to remove primary key, non-existent, or unverified table columns and re-run `auditstream init`."
+                .to_owned(),
+        });
+    }
+
+    if history_exists && months_covered_ahead < MIN_MONTHS_COVERED_AHEAD {
+        findings.push(VerifyFinding {
+            severity: "error",
+            kind: "insufficient_partitions",
+            table: None,
+            object: format!("{schema}.changes"),
+            detail: format!(
+                "only {months_covered_ahead} month(s) covered ahead (minimum required: {MIN_MONTHS_COVERED_AHEAD})"
+            ),
+            hint: "Run `auditstream verify --fix` to create 3 months of future partitions."
+                .to_owned(),
+        });
+    }
+
+    findings.sort_by(|a, b| {
+        severity_rank(a.severity)
+            .cmp(&severity_rank(b.severity))
+            .then_with(|| a.table.cmp(&b.table))
+            .then_with(|| a.object.cmp(&b.object))
+            .then_with(|| kind_rank(a.kind).cmp(&kind_rank(b.kind)))
+            .then_with(|| a.kind.cmp(b.kind))
+            .then_with(|| a.detail.cmp(&b.detail))
+    });
+}
+
+fn severity_rank(severity: &str) -> u8 {
+    match severity {
+        "error" => 0,
+        "warning" => 1,
+        _ => 2,
+    }
+}
+
+fn kind_rank(kind: &str) -> u8 {
+    match kind {
+        "missing" => 0,
+        "disabled" => 1,
+        "outdated" => 2,
+        "partitioned_table" => 3,
+        "default_partition_rows" => 4,
+        "invalid_exclusion" => 5,
+        "unsafe_privileges" => 6,
+        "invalid_ownership" => 7,
+        "tampered_history" => 8,
+        "insufficient_partitions" => 9,
+        _ => 10,
+    }
+}
+
+fn failing_findings_count(findings: &[VerifyFinding], fail_on: FailOn) -> usize {
+    match fail_on {
+        FailOn::Error => findings.iter().filter(|f| f.severity == "error").count(),
+        FailOn::Warning => findings.len(),
+    }
 }
 
 fn convert_finding(finding: &Finding) -> VerifyFinding {
@@ -290,18 +377,28 @@ fn convert_finding(finding: &Finding) -> VerifyFinding {
         ),
         FindingKind::InvalidExclusion => (
             "invalid_exclusion",
-            "Remove primary key column(s) from capture.exclude and re-run `auditstream init`."
+            "Update capture.exclude to remove primary key or non-existent columns and re-run `auditstream init`."
                 .to_owned(),
         ),
         FindingKind::UnsafePrivileges => (
             "unsafe_privileges",
-            "Re-run `auditstream init` and apply the generated migration (or revoke the extra privileges as `auditstream_owner`)."
+            "Re-run `auditstream init` and apply the generated migration (or revoke the extra privileges, role attributes/memberships, or parameter grants)."
                 .to_owned(),
         ),
         FindingKind::InvalidOwnership => (
             "invalid_ownership",
             "Re-run `auditstream init` and apply the generated migration so `auditstream_owner` owns all Auditstream objects."
                 .to_owned(),
+        ),
+        FindingKind::TamperedHistory => (
+            "tampered_history",
+            if finding.table.is_none() {
+                "Inspect and drop unexpected helper function overloads from the audit schema."
+                    .to_owned()
+            } else {
+                "Inspect and remove unexpected triggers, rewrite rules, or Row-Level Security from the history table and its partitions."
+                    .to_owned()
+            },
         ),
         _ => (
             "unknown",
@@ -341,7 +438,123 @@ fn render_text(report: &VerifyJsonReport) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{VerifyFinding, VerifyJsonReport, render_text};
+    use auditstream_pg::verify::{Finding, FindingKind, Severity};
+
+    use super::{
+        FailOn, VerifyFinding, VerifyJsonReport, append_cli_findings, convert_finding,
+        failing_findings_count, render_text,
+    };
+
+    #[test]
+    fn append_cli_findings_adds_unmatched_excludes_and_sorts_errors_before_warnings() {
+        let mut findings = vec![
+            VerifyFinding {
+                severity: "warning",
+                kind: "partitioned_table",
+                table: Some("public.orders".to_owned()),
+                object: "public.orders".to_owned(),
+                detail: "partitioned".to_owned(),
+                hint: "route through parent".to_owned(),
+            },
+            VerifyFinding {
+                severity: "error",
+                kind: "invalid_ownership",
+                table: Some("auditstream.changes".to_owned()),
+                object: "auditstream.changes".to_owned(),
+                detail: "wrong owner".to_owned(),
+                hint: "fix owner".to_owned(),
+            },
+            VerifyFinding {
+                severity: "error",
+                kind: "unsafe_privileges",
+                table: Some("auditstream.changes".to_owned()),
+                object: "auditstream.changes".to_owned(),
+                detail: "extra grant".to_owned(),
+                hint: "revoke".to_owned(),
+            },
+        ];
+        let unmatched = vec![(
+            "public".to_owned(),
+            "typo_table".to_owned(),
+            vec!["secret".to_owned()],
+        )];
+        append_cli_findings(&mut findings, "auditstream", true, 1, &unmatched);
+        assert_eq!(findings.len(), 5);
+        assert_eq!(findings[0].severity, "error");
+        assert_eq!(findings[0].kind, "insufficient_partitions");
+        // Preserves `FindingKind` declaration order: `unsafe_privileges` before `invalid_ownership`.
+        assert_eq!(findings[1].kind, "unsafe_privileges");
+        assert_eq!(findings[2].kind, "invalid_ownership");
+        assert_eq!(findings[3].kind, "invalid_exclusion");
+        assert_eq!(findings[3].object, "public.typo_table");
+        assert_eq!(findings[4].severity, "warning");
+        assert_eq!(findings[4].kind, "partitioned_table");
+    }
+
+    #[test]
+    fn failing_findings_count_respects_fail_on_threshold() {
+        let warning = VerifyFinding {
+            severity: "warning",
+            kind: "partitioned_table",
+            table: Some("public.orders".to_owned()),
+            object: "public.orders".to_owned(),
+            detail: "partitioned".to_owned(),
+            hint: "route through parent".to_owned(),
+        };
+        let error = VerifyFinding {
+            severity: "error",
+            kind: "disabled",
+            table: Some("public.invoice".to_owned()),
+            object: "public.invoice.auditstream_update".to_owned(),
+            detail: "disabled".to_owned(),
+            hint: "re-enable".to_owned(),
+        };
+
+        assert_eq!(failing_findings_count(&[], FailOn::Error), 0);
+        assert_eq!(failing_findings_count(&[], FailOn::Warning), 0);
+
+        let warn_only = [warning.clone()];
+        assert_eq!(failing_findings_count(&warn_only, FailOn::Error), 0);
+        assert_eq!(failing_findings_count(&warn_only, FailOn::Warning), 1);
+
+        let mixed = [error, warning];
+        assert_eq!(failing_findings_count(&mixed, FailOn::Error), 1);
+        assert_eq!(failing_findings_count(&mixed, FailOn::Warning), 2);
+    }
+
+    #[test]
+    fn convert_finding_maps_tampered_history_and_invalid_exclusion() {
+        let tampered = convert_finding(&Finding {
+            kind: FindingKind::TamperedHistory,
+            severity: Severity::Error,
+            table: Some("auditstream.changes".to_owned()),
+            object: "auditstream.changes.evil_trig".to_owned(),
+            detail: "unexpected trigger".to_owned(),
+        });
+        assert_eq!(tampered.kind, "tampered_history");
+        assert_eq!(tampered.severity, "error");
+        assert!(tampered.hint.contains("Row-Level Security"));
+
+        let overload = convert_finding(&Finding {
+            kind: FindingKind::TamperedHistory,
+            severity: Severity::Error,
+            table: None,
+            object: "auditstream.log_event(action text, target text, data text)".to_owned(),
+            detail: "unexpected function overload".to_owned(),
+        });
+        assert_eq!(overload.kind, "tampered_history");
+        assert!(overload.hint.contains("overload"));
+
+        let invalid_ex = convert_finding(&Finding {
+            kind: FindingKind::InvalidExclusion,
+            severity: Severity::Error,
+            table: Some("public.invoice".to_owned()),
+            object: "public.invoice".to_owned(),
+            detail: "missing column".to_owned(),
+        });
+        assert_eq!(invalid_ex.kind, "invalid_exclusion");
+        assert!(invalid_ex.hint.contains("non-existent"));
+    }
 
     #[test]
     fn render_text_sanitizes_control_ansi_and_bidi_sequences() {

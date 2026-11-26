@@ -18,7 +18,7 @@ use serde::Serialize;
 use crate::commands::common::{
     build_configured_verify_specs, build_installed_verify_specs, connect_database,
     group_excludes_by_table, parse_exclude_refs, parse_table_refs, require_database_url,
-    run_async as run_command_async, sanitize_terminal,
+    run_async as run_command_async, sanitize_terminal, unmatched_configured_excludes,
 };
 use crate::config::Config;
 use crate::exit::{Exit, ExitCodeExt, write_stdout};
@@ -166,6 +166,8 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
             &introspected_map,
         )
     };
+    let unmatched_excludes_count =
+        unmatched_configured_excludes(&configured_excludes_by_table, &verify_specs).len();
     let verify_report =
         verify::check_with_options(&pool, &VerifyOptions::new(&config.schema, verify_specs))
             .await
@@ -176,7 +178,8 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
     let partition_gap_problem = usize::from(
         history_stats.exists && history_stats.months_covered_ahead < MIN_MONTHS_COVERED_AHEAD,
     );
-    let problems_found = verify_report.findings.len() + partition_gap_problem;
+    let problems_found =
+        verify_report.errors().count() + unmatched_excludes_count + partition_gap_problem;
 
     // Union of introspected tables in scope, configured tables, and tables with installed triggers.
     let mut all_tables: BTreeSet<(String, String)> = BTreeSet::new();

@@ -291,6 +291,31 @@ pub(crate) fn build_installed_verify_specs(
         .collect()
 }
 
+/// Returns configured `capture.exclude` entries whose `(schema, table)` does not match any
+/// table in `verified_specs`, sorted deterministically by `(schema, table)`.
+pub(crate) fn unmatched_configured_excludes(
+    configured_excludes: &BTreeMap<(String, String), BTreeSet<String>>,
+    verified_specs: &[TableTriggerSpec],
+) -> Vec<(String, String, Vec<String>)> {
+    let verified_tables: BTreeSet<(&str, &str)> = verified_specs
+        .iter()
+        .map(|spec| (spec.schema.as_str(), spec.table.as_str()))
+        .collect();
+    configured_excludes
+        .iter()
+        .filter(|((schema, table), _)| {
+            !verified_tables.contains(&(schema.as_str(), table.as_str()))
+        })
+        .map(|((schema, table), cols)| {
+            (
+                schema.clone(),
+                table.clone(),
+                cols.iter().cloned().collect(),
+            )
+        })
+        .collect()
+}
+
 /// Builds expected [`TableTriggerSpec`]s for configured tables using live catalog metadata.
 pub(crate) fn build_configured_verify_specs(
     configured_set: &BTreeSet<(String, String)>,
@@ -399,5 +424,35 @@ mod tests {
                 "bad_excl={bad_excl:?}"
             );
         }
+    }
+
+    #[test]
+    fn unmatched_configured_excludes_finds_only_unverified_tables() {
+        let excludes = super::group_excludes_by_table(&[
+            (
+                "public".to_owned(),
+                "invoice".to_owned(),
+                "password_hash".to_owned(),
+            ),
+            (
+                "public".to_owned(),
+                "invoce".to_owned(),
+                "secret".to_owned(),
+            ),
+        ]);
+        let specs = vec![auditstream_pg::triggers::TableTriggerSpec::new(
+            "public",
+            "invoice",
+            vec!["id".to_owned()],
+            vec!["password_hash".to_owned()],
+        )];
+        assert_eq!(
+            super::unmatched_configured_excludes(&excludes, &specs),
+            vec![(
+                "public".to_owned(),
+                "invoce".to_owned(),
+                vec!["secret".to_owned()],
+            )]
+        );
     }
 }

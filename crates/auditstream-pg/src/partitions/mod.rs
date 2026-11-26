@@ -521,18 +521,32 @@ pub struct HistoryTableStats {
     pub monthly_partitions: Vec<YearMonth>,
     /// Count of contiguous monthly partitions present strictly after `current_month`.
     pub months_covered_ahead: u32,
-    /// Whether `{schema}.changes_default` exists and holds at least one row.
+    /// Whether an attached `DEFAULT` partition of `{schema}.changes` holds at least one row
+    /// (`false` when no `DEFAULT` partition is attached or when probing is skipped because any
+    /// foreign partition or unexpected Row-Level Security exists on the history partition tree).
     pub default_has_rows: bool,
-    /// Catalog row estimate summed across all child partitions (`GREATEST(reltuples, 0)`).
+    /// Catalog row estimate summed across all regular descendant partitions (`GREATEST(reltuples, 0)`).
     pub estimated_rows: i64,
-    /// Total relation size (heap + indexes + TOAST) in bytes summed across all child partitions.
+    /// Total relation size (heap + indexes + TOAST) in bytes summed across all regular descendant
+    /// partitions.
     pub total_size_bytes: i64,
+}
+
+#[derive(Debug, FromRow)]
+struct HistoryParentStatRow {
+    has_rls: bool,
 }
 
 #[derive(Debug, FromRow)]
 struct HistoryChildStatRow {
     oid: i64,
+    depth: i32,
+    under_default: bool,
+    relispartition: bool,
+    schema_name: String,
     relname: String,
+    relkind: String,
+    has_rls: bool,
     est_rows: i64,
     total_bytes: i64,
 }
@@ -552,19 +566,24 @@ pub async fn history_stats(
         .execute(&mut *tx)
         .await?;
 
-    let parent_oid: Option<i64> = sqlx::query_scalar(
-        "SELECT c.oid::bigint \
-           FROM pg_catalog.pg_class c \
-           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-          WHERE n.nspname = $1 \
-            AND c.relname = 'changes' \
-            AND c.relkind IN ('r', 'p')",
+    let parent: Option<HistoryParentStatRow> = sqlx::query_as(
+        "SELECT \
+           ( \
+             c.relrowsecurity \
+             OR c.relforcerowsecurity \
+             OR EXISTS (SELECT 1 FROM pg_catalog.pg_policy pol WHERE pol.polrelid = c.oid) \
+           ) AS has_rls \
+         FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+        WHERE n.nspname = $1 \
+          AND c.relname = 'changes' \
+          AND c.relkind IN ('r', 'p')",
     )
     .bind(schema)
     .fetch_optional(&mut *tx)
     .await?;
 
-    if parent_oid.is_none() {
+    let Some(parent) = parent else {
         tx.commit().await?;
         return Ok(HistoryTableStats {
             exists: false,
@@ -575,43 +594,40 @@ pub async fn history_stats(
             estimated_rows: 0,
             total_size_bytes: 0,
         });
-    }
+    };
 
     let current_month = fetch_db_utc_month(&mut tx).await?;
-    let children: Vec<HistoryChildStatRow> = sqlx::query_as(
-        "SELECT \
-           child.oid::bigint AS oid, \
-           child.relname, \
-           GREATEST(child.reltuples::bigint, 0) AS est_rows, \
-           pg_catalog.pg_total_relation_size(child.oid)::bigint AS total_bytes \
-         FROM pg_catalog.pg_inherits i \
-         JOIN pg_catalog.pg_class parent ON parent.oid = i.inhparent \
-         JOIN pg_catalog.pg_namespace pn ON pn.oid = parent.relnamespace \
-         JOIN pg_catalog.pg_class child ON child.oid = i.inhrelid \
-        WHERE pn.nspname = $1 \
-          AND parent.relname = 'changes' \
-        ORDER BY child.relname ASC",
-    )
-    .bind(schema)
-    .fetch_all(&mut *tx)
-    .await?;
+    let children = fetch_history_child_stats(&mut tx, schema).await?;
 
     let mut monthly_partitions = Vec::new();
-    let mut default_oid: Option<i64> = None;
+    let mut default_leaf_oids: Vec<i64> = Vec::new();
+    let mut any_child_has_rls = false;
+    let mut any_child_is_foreign = false;
     let mut estimated_rows: i64 = 0;
     let mut total_size_bytes: i64 = 0;
 
     for child in &children {
+        any_child_has_rls |= child.has_rls;
+        any_child_is_foreign |= child.relkind == "f";
         estimated_rows = estimated_rows.saturating_add(child.est_rows);
         total_size_bytes = total_size_bytes.saturating_add(child.total_bytes);
-        if child.relname == "changes_default" {
-            default_oid = Some(child.oid);
-        } else if let Some(ym) = YearMonth::parse_partition_name(&child.relname) {
+        if child.under_default {
+            if child.relkind == "r" {
+                default_leaf_oids.push(child.oid);
+            }
+        } else if child.depth == 1
+            && child.relispartition
+            && child.schema_name == schema
+            && child.relkind == "r"
+            && let Some(ym) = YearMonth::parse_partition_name(&child.relname)
+        {
             monthly_partitions.push(ym);
         }
     }
     monthly_partitions.sort();
     monthly_partitions.dedup();
+    default_leaf_oids.sort_unstable();
+    default_leaf_oids.dedup();
 
     let present_set: HashSet<YearMonth> = monthly_partitions.iter().copied().collect();
     let mut months_covered_ahead: u32 = 0;
@@ -621,17 +637,12 @@ pub async fn history_stats(
         probe = probe.next();
     }
 
-    // Query through parent `{schema}.changes` filtered by the literal `changes_default` OID:
-    // PostgreSQL checks SELECT only on the parent table (child partitions remain zero-grant)
-    // and constant-folds `tableoid = <oid>` so monthly partitions are never scanned.
-    let default_has_rows = if let Some(oid) = default_oid {
-        let schema_q = quote_ident(schema);
-        let sql = format!(
-            "SELECT EXISTS (SELECT 1 FROM {schema_q}.changes WHERE tableoid = {oid}::pg_catalog.oid LIMIT 1)"
-        );
-        sqlx::query_scalar(AssertSqlSafe(sql))
-            .fetch_one(&mut *tx)
-            .await?
+    // Query through parent `{schema}.changes` filtered by constant DEFAULT leaf OID(s) so
+    // PostgreSQL checks SELECT only on the parent table while child partitions stay zero-grant.
+    // Skip when any foreign partition or unexpected RLS exists anywhere on the history partition
+    // tree so untrusted FDW hooks or RLS policies are never invoked.
+    let default_has_rows = if !parent.has_rls && !any_child_has_rls && !any_child_is_foreign {
+        probe_default_has_rows(&mut tx, schema, &default_leaf_oids).await?
     } else {
         false
     };
@@ -647,6 +658,88 @@ pub async fn history_stats(
         estimated_rows,
         total_size_bytes,
     })
+}
+
+async fn probe_default_has_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    schema: &str,
+    default_leaf_oids: &[i64],
+) -> Result<bool, sqlx::Error> {
+    if default_leaf_oids.is_empty() {
+        return Ok(false);
+    }
+    let schema_q = quote_ident(schema);
+    let oid_list = default_leaf_oids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM {schema_q}.changes WHERE tableoid = ANY(ARRAY[{oid_list}]::pg_catalog.oid[]) LIMIT 1)"
+    );
+    sqlx::query_scalar(AssertSqlSafe(sql))
+        .fetch_one(&mut **tx)
+        .await
+}
+
+async fn fetch_history_child_stats(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    schema: &str,
+) -> Result<Vec<HistoryChildStatRow>, sqlx::Error> {
+    sqlx::query_as(
+        "WITH RECURSIVE tree(relid, depth, under_default) AS ( \
+           SELECT \
+             child.oid, \
+             1::int, \
+             (child.relispartition AND pg_catalog.pg_get_expr(child.relpartbound, child.oid) = 'DEFAULT') \
+           FROM pg_catalog.pg_inherits i \
+           JOIN pg_catalog.pg_class parent ON parent.oid = i.inhparent \
+           JOIN pg_catalog.pg_namespace pn ON pn.oid = parent.relnamespace \
+           JOIN pg_catalog.pg_class child ON child.oid = i.inhrelid \
+          WHERE pn.nspname = $1 \
+            AND parent.relname = 'changes' \
+           UNION \
+           SELECT i.inhrelid, tree.depth + 1, tree.under_default \
+             FROM tree \
+             JOIN pg_catalog.pg_inherits i ON i.inhparent = tree.relid \
+         ), \
+         deduped AS ( \
+           SELECT \
+             tree.relid, \
+             pg_catalog.min(tree.depth)::int AS depth, \
+             pg_catalog.bool_or(tree.under_default) AS under_default \
+           FROM tree \
+          GROUP BY tree.relid \
+         ) \
+         SELECT \
+           c.oid::bigint AS oid, \
+           deduped.depth, \
+           deduped.under_default, \
+           c.relispartition, \
+           cn.nspname::text AS schema_name, \
+           c.relname::text AS relname, \
+           c.relkind::text AS relkind, \
+           ( \
+             c.relrowsecurity \
+             OR c.relforcerowsecurity \
+             OR EXISTS (SELECT 1 FROM pg_catalog.pg_policy pol WHERE pol.polrelid = c.oid) \
+           ) AS has_rls, \
+           CASE \
+             WHEN c.relkind = 'r' THEN GREATEST(c.reltuples::bigint, 0) \
+             ELSE 0::bigint \
+           END AS est_rows, \
+           CASE \
+             WHEN c.relkind = 'r' THEN pg_catalog.pg_total_relation_size(c.oid)::bigint \
+             ELSE 0::bigint \
+           END AS total_bytes \
+         FROM deduped \
+         JOIN pg_catalog.pg_class c ON c.oid = deduped.relid \
+         JOIN pg_catalog.pg_namespace cn ON cn.oid = c.relnamespace \
+        ORDER BY deduped.depth ASC, cn.nspname ASC, c.relname ASC",
+    )
+    .bind(schema)
+    .fetch_all(&mut **tx)
+    .await
 }
 
 async fn count_default_rows_in_range(

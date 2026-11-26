@@ -36,6 +36,15 @@ Options:
       --fix
           Create missing monthly partitions 3 months ahead before verifying
 
+      --fail-on <FAIL_ON>
+          Minimum finding severity that causes verification to fail (`error` or `warning`)
+
+          Possible values:
+          - error:   Fail only when at least one `error` finding is present (warnings exit `0`)
+          - warning: Fail when any `error` or `warning` finding is present
+          
+          [default: error]
+
       --schema <SCHEMA>
           Audit schema name (defaults to `auditstream`)
           

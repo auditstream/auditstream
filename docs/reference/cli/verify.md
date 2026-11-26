@@ -2,14 +2,14 @@
 
 > **Public contract:** Flags, finding kinds, JSON output shape, and exit codes are part of the engine public contract governed by [Releases: Version policy](../../handbook/releases.md#version-policy).
 
-`auditstream verify` checks live PostgreSQL capture objects against `capture.tables` in `auditstream.toml` and exits non-zero on any finding.
+`auditstream verify` checks live PostgreSQL capture objects against `capture.tables` in `auditstream.toml` and exits non-zero when findings meet or exceed the `--fail-on` severity threshold (default: `error`).
 All catalog checks run inside a `READ ONLY` transaction.
 Use `verify` as a CI gate and scheduled health check.
 
 ## Synopsis
 
 ```sh
-auditstream [GLOBAL OPTIONS] verify [--format text|json] [--fix]
+auditstream [GLOBAL OPTIONS] verify [--format text|json] [--fix] [--fail-on error|warning]
 ```
 
 ## Options
@@ -18,22 +18,25 @@ auditstream [GLOBAL OPTIONS] verify [--format text|json] [--fix]
 | --- | --- | --- | --- |
 | `--format` | `text`, `json` | `text` | Output format written to stdout |
 | `--fix` | — | off | Create missing monthly partitions 3 months ahead before verifying |
+| `--fail-on` | `error`, `warning` | `error` | Minimum finding severity that causes exit code `1` (`warning` fails on advisory warnings too) |
 
 When `capture.tables` is absent or empty, `verify` checks installed triggers, configured `capture.exclude` entries, and audit schema/history security, and prints a notice on stderr.
+The connecting PostgreSQL role needs read access to system catalogs plus `USAGE` on the audit schema and `SELECT` on `<schema>.changes` (for example any configured application role or a superuser).
 
 ## Checks and finding kinds
 
 | Kind | Severity | Meaning |
 | --- | --- | --- |
-| `missing` | `error` | History table, capture function, audited table, or trigger does not exist |
+| `missing` | `error` | Owner role (`auditstream_owner`), history table, attached `changes_default` partition, history primary key (`changes_pkey`), required history index, helper function, audited table, or trigger does not exist |
 | `disabled` | `error` | A trigger (or partition child clone) is disabled (`D`) or replica-only (`R`) |
-| `outdated` | `error` | Function body, security settings, or trigger definition/exclusions drifted |
+| `outdated` | `error` | Function body/security (`SECURITY DEFINER`, `STRICT`, parallel/leakproof/support)/signature/defaults/volatility/`proconfig` (`SET search_path`), history primary key (`changes_pkey`) or index definition/validity/options/opclass, history child partition `relkind` or `DEFAULT` partition name, or trigger definition/exclusions drifted |
 | `partitioned_table` | `warning` | Audited table is partitioned; direct child-partition writes bypass statement triggers |
 | `default_partition_rows` | `error` | `changes_default` holds rows, blocking monthly partition attachment |
-| `invalid_exclusion` | `error` | A primary key column is listed in `capture.exclude` or on an installed trigger, nullifying `record_id` |
+| `invalid_exclusion` | `error` | A primary key column, non-existent (renamed/dropped) column, or unverified table is listed in `capture.exclude` or on an installed trigger |
 | `insufficient_partitions` | `error` | Fewer than 2 contiguous monthly partitions exist ahead of the current UTC month |
-| `unsafe_privileges` | `error` | Unexpected `PUBLIC` or non-owner privileges exist on the audit schema, `changes`, child partitions, `changes_id_seq`, or helper functions |
+| `unsafe_privileges` | `error` | Unexpected `PUBLIC` or non-owner privileges exist on the audit schema, `changes`, child partitions, `changes_id_seq`, or helper functions; `auditstream_owner` has unsafe attributes, direct or recursive PG 16+ indirect `ADMIN` memberships, or roles granted to it; or `session_replication_role` is overridden to `replica` or granted to `PUBLIC`/non-superusers |
 | `invalid_ownership` | `error` | Audit schema, `changes`, a child partition, `changes_id_seq`, or a helper function is not owned by `auditstream_owner` |
+| `tampered_history` | `error` | Unexpected trigger (including internal RI triggers), rewrite rule, Row-Level Security setting/policy on `changes` or its partitions, or unexpected helper function overload in the audit schema |
 
 ## Output
 
@@ -57,7 +60,7 @@ With `--fix`, partition creation results are reported on stderr.
       "kind": "disabled",
       "table": "public.invoice",
       "object": "public.invoice.auditstream_update",
-      "detail": "trigger is not enabled for origin writes (tgenabled = 'D', expected 'O' or 'A')",
+      "detail": "trigger `auditstream_update` on `public.invoice` is disabled (`tgenabled = 'D'`)",
       "hint": "Re-enable `public.invoice.auditstream_update` or re-apply the Auditstream migration."
     }
   ]
@@ -66,8 +69,8 @@ With `--fix`, partition creation results are reported on stderr.
 
 ## Exit codes
 
-- `0`: Verification passed with zero findings.
-- `1`: One or more findings were detected.
+- `0`: Verification passed with zero findings meeting `--fail-on` (warnings still print and exit `0` under the default `--fail-on error`).
+- `1`: One or more findings met or exceeded the `--fail-on` threshold.
 - `2`: Invalid CLI flags or configuration file.
 - `3`: Database unreachable, query failed, or `--fix` partition maintenance failed.
 - `4`: Writing output failed.
