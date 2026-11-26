@@ -11,7 +11,7 @@ use crate::commands;
 #[command(
     name = "auditstream",
     version,
-    about = "Open-source Postgres audit trail engine and CLI"
+    about = "Open-source database audit trail engine and CLI"
 )]
 pub(crate) struct Cli {
     /// Path to the configuration file (defaults to ./auditstream.toml if present).
