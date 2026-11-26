@@ -34,23 +34,27 @@ pub struct Context {
 }
 
 impl Context {
-    /// Validates that every present context field is a non-empty string.
+    /// Validates that every present context field is a non-empty string without NUL characters.
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::EmptyContextField`] if any present field is empty.
+    /// Returns [`CoreError::EmptyContextField`] if any present field is empty or
+    /// [`CoreError::NullByteInField`] if any present field contains `U+0000`.
     pub fn validate(&self) -> Result<(), CoreError> {
-        if self.request_id.as_deref().is_some_and(str::is_empty) {
-            return Err(CoreError::EmptyContextField { field: "requestId" });
-        }
-        if self.source.as_deref().is_some_and(str::is_empty) {
-            return Err(CoreError::EmptyContextField { field: "source" });
-        }
-        if self.ip.as_deref().is_some_and(str::is_empty) {
-            return Err(CoreError::EmptyContextField { field: "ip" });
-        }
-        if self.user_agent.as_deref().is_some_and(str::is_empty) {
-            return Err(CoreError::EmptyContextField { field: "userAgent" });
+        for (value, field, path) in [
+            (self.request_id.as_deref(), "requestId", "context.requestId"),
+            (self.source.as_deref(), "source", "context.source"),
+            (self.ip.as_deref(), "ip", "context.ip"),
+            (self.user_agent.as_deref(), "userAgent", "context.userAgent"),
+        ] {
+            if let Some(val) = value {
+                if val.is_empty() {
+                    return Err(CoreError::EmptyContextField { field });
+                }
+                if val.contains('\0') {
+                    return Err(CoreError::NullByteInField { field: path });
+                }
+            }
         }
         Ok(())
     }
@@ -88,12 +92,22 @@ impl<'de> Deserialize<'de> for Context {
                 let mut user_agent: Option<String> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
+                    if key.contains('\0') {
+                        return Err(de::Error::custom(
+                            "context object keys must not contain NUL characters",
+                        ));
+                    }
                     match key.as_str() {
                         "requestId" => {
                             let value: String = map.next_value()?;
                             if value.is_empty() {
                                 return Err(de::Error::custom(
                                     "context.requestId must not be empty",
+                                ));
+                            }
+                            if value.contains('\0') {
+                                return Err(de::Error::custom(
+                                    "context.requestId must not contain NUL characters",
                                 ));
                             }
                             request_id = Some(value);
@@ -103,12 +117,22 @@ impl<'de> Deserialize<'de> for Context {
                             if value.is_empty() {
                                 return Err(de::Error::custom("context.source must not be empty"));
                             }
+                            if value.contains('\0') {
+                                return Err(de::Error::custom(
+                                    "context.source must not contain NUL characters",
+                                ));
+                            }
                             source = Some(value);
                         }
                         "ip" => {
                             let value: String = map.next_value()?;
                             if value.is_empty() {
                                 return Err(de::Error::custom("context.ip must not be empty"));
+                            }
+                            if value.contains('\0') {
+                                return Err(de::Error::custom(
+                                    "context.ip must not contain NUL characters",
+                                ));
                             }
                             ip = Some(value);
                         }
@@ -117,6 +141,11 @@ impl<'de> Deserialize<'de> for Context {
                             if value.is_empty() {
                                 return Err(de::Error::custom(
                                     "context.userAgent must not be empty",
+                                ));
+                            }
+                            if value.contains('\0') {
+                                return Err(de::Error::custom(
+                                    "context.userAgent must not contain NUL characters",
                                 ));
                             }
                             user_agent = Some(value);

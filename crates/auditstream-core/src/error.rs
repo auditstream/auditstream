@@ -29,6 +29,13 @@ pub enum CoreError {
         field: &'static str,
     },
 
+    /// A string field contained a NUL character (`U+0000`), which PostgreSQL `jsonb` rejects.
+    #[error("{field} must not contain NUL characters")]
+    NullByteInField {
+        /// The offending field path (for example `"actor.id"` or `"context.requestId"`).
+        field: &'static str,
+    },
+
     /// Serialized actor plus context JSON exceeded the 512-byte UTF-8 limit.
     #[error("serialized actor payload is {size} UTF-8 bytes, exceeding the {limit}-byte limit")]
     PayloadTooLarge {

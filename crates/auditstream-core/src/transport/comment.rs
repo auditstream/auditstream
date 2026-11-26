@@ -182,15 +182,44 @@ fn is_valid_context_object(value: &Value) -> bool {
         .all(|key| is_valid_optional_non_empty_string(ctx, key))
 }
 
+/// Returns `true` if `root` contains a NUL (`U+0000`) character in any JSON string value
+/// or object key. Iterative to avoid stack overflow on deeply nested untrusted payloads.
+pub(crate) fn json_contains_nul(root: &Value) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match node {
+            Value::String(s) if s.contains('\0') => return true,
+            Value::Array(items) => stack.extend(items),
+            Value::Object(map) => {
+                for (key, value) in map {
+                    if key.contains('\0') {
+                        return true;
+                    }
+                    stack.push(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Validates and splits a JSON string using the full `spec/actor.md` and `spec/transport.md` rules:
 /// JSON object with valid enum `type`, non-empty string `id`, optional valid `tenant` and
-/// single-level `onBehalfOf`, and optional `context` object with non-empty known fields.
+/// single-level `onBehalfOf`, optional `context` object with non-empty known fields, and no
+/// NUL characters (`U+0000`) anywhere in the payload.
 pub(crate) fn parse_trigger_actor_json(raw_json: &str) -> DecodedActor {
-    if raw_json.len() > MAX_PAYLOAD_BYTES {
+    if raw_json.len() > MAX_PAYLOAD_BYTES || raw_json.contains('\0') {
         return DecodedActor::Invalid;
     }
 
-    let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(raw_json) else {
+    let Ok(val) = serde_json::from_str::<Value>(raw_json) else {
+        return DecodedActor::Invalid;
+    };
+    if !val.is_object() || json_contains_nul(&val) {
+        return DecodedActor::Invalid;
+    }
+    let Value::Object(mut map) = val else {
         return DecodedActor::Invalid;
     };
 

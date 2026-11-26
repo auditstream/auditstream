@@ -138,6 +138,99 @@ fn payload_size_limit_enforces_exact_512_and_513_utf8_bytes() {
 }
 
 #[test]
+fn actor_and_context_reject_nul_characters_across_all_fields() {
+    let bad_id = Actor::new(ActorType::User, "usr\0_1");
+    assert!(matches!(
+        bad_id.validate(),
+        Err(CoreError::NullByteInField { field: "actor.id" })
+    ));
+
+    let mut bad_tenant = Actor::new(ActorType::User, "usr_1");
+    bad_tenant.tenant = Some("org\0acme".to_owned());
+    assert!(matches!(
+        bad_tenant.validate(),
+        Err(CoreError::NullByteInField {
+            field: "actor.tenant"
+        })
+    ));
+
+    let mut bad_obo_id = Actor::new(ActorType::AiAgent, "agent_1");
+    bad_obo_id.on_behalf_of = Some(NestedActor::new(ActorType::User, "usr\0_2"));
+    assert!(matches!(
+        bad_obo_id.validate(),
+        Err(CoreError::NullByteInField {
+            field: "onBehalfOf.id"
+        })
+    ));
+
+    let mut bad_obo_tenant_nested = NestedActor::new(ActorType::User, "usr_2");
+    bad_obo_tenant_nested.tenant = Some("t\u{0000}1".to_owned());
+    let mut bad_obo_tenant = Actor::new(ActorType::AiAgent, "agent_1");
+    bad_obo_tenant.on_behalf_of = Some(bad_obo_tenant_nested);
+    assert!(matches!(
+        bad_obo_tenant.validate(),
+        Err(CoreError::NullByteInField {
+            field: "onBehalfOf.tenant"
+        })
+    ));
+
+    let valid_actor = Actor::new(ActorType::User, "usr_1");
+    for (ctx, expected_field) in [
+        (
+            Context {
+                request_id: Some("req\0_1".to_owned()),
+                ..Context::default()
+            },
+            "context.requestId",
+        ),
+        (
+            Context {
+                source: Some("api\0".to_owned()),
+                ..Context::default()
+            },
+            "context.source",
+        ),
+        (
+            Context {
+                ip: Some("127.0.0.1\0".to_owned()),
+                ..Context::default()
+            },
+            "context.ip",
+        ),
+        (
+            Context {
+                user_agent: Some("ua\0/1".to_owned()),
+                ..Context::default()
+            },
+            "context.userAgent",
+        ),
+    ] {
+        let err = validate_actor_payload(&valid_actor, Some(&ctx)).expect_err("NUL must fail");
+        assert!(
+            matches!(err, CoreError::NullByteInField { field } if field == expected_field),
+            "expected NullByteInField({expected_field}), got {err:?}"
+        );
+    }
+
+    // Deserialization must also reject NUL characters in keys or string fields.
+    assert!(serde_json::from_str::<Actor>(r#"{"type":"user","id":"u\u00001"}"#).is_err());
+    assert!(
+        serde_json::from_str::<Actor>(r#"{"type":"user","id":"u1","bad\u0000key":1}"#).is_err()
+    );
+    assert!(serde_json::from_str::<Context>(r#"{"requestId":"r\u00001"}"#).is_err());
+    assert!(serde_json::from_str::<Context>(r#"{"bad\u0000key":"v"}"#).is_err());
+
+    // JSON schemas also reject NUL characters.
+    let actor_validator = load_schema("schemas/actor.schema.json");
+    assert!(!actor_validator.is_valid(&serde_json::json!({"type": "user", "id": "u\u{0000}1"})));
+    assert!(!actor_validator.is_valid(&serde_json::json!({
+        "type": "user",
+        "id": "u1",
+        "context": {"requestId": "r\u{0000}1"}
+    })));
+}
+
+#[test]
 fn op_maps_dml_variants_and_app_actions_in_both_directions() {
     for (wire, expected) in [
         ("INSERT", Op::Insert),

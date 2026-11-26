@@ -275,6 +275,37 @@ fn set_config_uses_bound_parameter_and_rejects_oversized_payload() {
         set_config(&oversized),
         Err(CoreError::PayloadTooLarge { .. })
     ));
+
+    let nul_actor = Actor::new(ActorType::User, "usr\0_42");
+    assert!(matches!(
+        encode(&nul_actor),
+        Err(CoreError::NullByteInField { field: "actor.id" })
+    ));
+    assert!(matches!(
+        set_config(&nul_actor),
+        Err(CoreError::NullByteInField { field: "actor.id" })
+    ));
+    assert!(matches!(
+        tag("SELECT 1", &nul_actor),
+        Err(CoreError::NullByteInField { field: "actor.id" })
+    ));
+
+    // Precedence rejects NUL in both set_config and jwt_claims (raw byte or JSON \u0000 escape).
+    let res_raw_sc = resolve_precedence(
+        "SELECT 1",
+        Some("{\"type\":\"user\",\"id\":\"u\u{0000}1\"}"),
+        None,
+    );
+    assert_eq!(res_raw_sc.actor_source, Some(ActorSource::Invalid));
+    assert_eq!(res_raw_sc.actor, None);
+
+    let res_jwt_extra = resolve_precedence(
+        "SELECT 1",
+        None,
+        Some(r#"{"sub":"u1","extra":"bad\u0000val"}"#),
+    );
+    assert_eq!(res_jwt_extra.actor_source, Some(ActorSource::Invalid));
+    assert_eq!(res_jwt_extra.actor, None);
 }
 
 fn arb_actor_type() -> impl Strategy<Value = ActorType> {

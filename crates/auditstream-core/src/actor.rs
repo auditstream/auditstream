@@ -59,13 +59,26 @@ impl NestedActor {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::EmptyActorId`] or [`CoreError::EmptyTenant`] if invalid.
+    /// Returns [`CoreError::EmptyActorId`], [`CoreError::EmptyTenant`], or
+    /// [`CoreError::NullByteInField`] if invalid.
     pub fn validate(&self) -> Result<(), CoreError> {
         if self.id.is_empty() {
             return Err(CoreError::EmptyActorId);
         }
-        if self.tenant.as_deref().is_some_and(str::is_empty) {
-            return Err(CoreError::EmptyTenant);
+        if self.id.contains('\0') {
+            return Err(CoreError::NullByteInField {
+                field: "onBehalfOf.id",
+            });
+        }
+        if let Some(tenant) = self.tenant.as_deref() {
+            if tenant.is_empty() {
+                return Err(CoreError::EmptyTenant);
+            }
+            if tenant.contains('\0') {
+                return Err(CoreError::NullByteInField {
+                    field: "onBehalfOf.tenant",
+                });
+            }
         }
         Ok(())
     }
@@ -106,6 +119,7 @@ fn parse_non_empty_field<'de, A>(
     slot: &mut Option<String>,
     field: &'static str,
     empty_error: &'static str,
+    nul_error: &'static str,
     map: &mut A,
 ) -> Result<(), A::Error>
 where
@@ -118,6 +132,9 @@ where
     if value.is_empty() {
         return Err(de::Error::custom(empty_error));
     }
+    if value.contains('\0') {
+        return Err(de::Error::custom(nul_error));
+    }
     *slot = Some(value);
     Ok(())
 }
@@ -126,14 +143,18 @@ fn parse_actor_map<'de, A>(mut map: A, kind: ActorMapKind) -> Result<ParsedActor
 where
     A: MapAccess<'de>,
 {
-    let (empty_id_msg, empty_tenant_msg) = match kind {
+    let (empty_id_msg, nul_id_msg, empty_tenant_msg, nul_tenant_msg) = match kind {
         ActorMapKind::Nested => (
             "onBehalfOf.id must not be empty",
+            "onBehalfOf.id must not contain NUL characters",
             "onBehalfOf.tenant must not be empty",
+            "onBehalfOf.tenant must not contain NUL characters",
         ),
         ActorMapKind::Primary | ActorMapKind::Payload => (
             "actor.id must not be empty",
+            "actor.id must not contain NUL characters",
             "actor.tenant must not be empty",
+            "actor.tenant must not contain NUL characters",
         ),
     };
 
@@ -144,10 +165,21 @@ where
     let mut context: Option<Context> = None;
 
     while let Some(key) = map.next_key::<String>()? {
+        if key.contains('\0') {
+            return Err(de::Error::custom(
+                "actor object keys must not contain NUL characters",
+            ));
+        }
         match key.as_str() {
             "type" => parse_unique_field(&mut actor_type, "type", &mut map)?,
-            "id" => parse_non_empty_field(&mut id, "id", empty_id_msg, &mut map)?,
-            "tenant" => parse_non_empty_field(&mut tenant, "tenant", empty_tenant_msg, &mut map)?,
+            "id" => parse_non_empty_field(&mut id, "id", empty_id_msg, nul_id_msg, &mut map)?,
+            "tenant" => parse_non_empty_field(
+                &mut tenant,
+                "tenant",
+                empty_tenant_msg,
+                nul_tenant_msg,
+                &mut map,
+            )?,
             "onBehalfOf" if kind == ActorMapKind::Nested => {
                 let _: IgnoredAny = map.next_value()?;
                 return Err(de::Error::custom(
@@ -254,13 +286,24 @@ impl Actor {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError`] if `id` is empty, `tenant` is empty, or `on_behalf_of` is invalid.
+    /// Returns [`CoreError`] if `id` or `tenant` is empty or contains a NUL character, or
+    /// `on_behalf_of` is invalid.
     pub fn validate(&self) -> Result<(), CoreError> {
         if self.id.is_empty() {
             return Err(CoreError::EmptyActorId);
         }
-        if self.tenant.as_deref().is_some_and(str::is_empty) {
-            return Err(CoreError::EmptyTenant);
+        if self.id.contains('\0') {
+            return Err(CoreError::NullByteInField { field: "actor.id" });
+        }
+        if let Some(tenant) = self.tenant.as_deref() {
+            if tenant.is_empty() {
+                return Err(CoreError::EmptyTenant);
+            }
+            if tenant.contains('\0') {
+                return Err(CoreError::NullByteInField {
+                    field: "actor.tenant",
+                });
+            }
         }
         if let Some(nested) = &self.on_behalf_of {
             nested.validate()?;
