@@ -76,19 +76,105 @@ fn is_secret_pg_param(key: &str) -> bool {
     key.eq_ignore_ascii_case("password") || key.eq_ignore_ascii_case("sslpassword")
 }
 
+fn is_valid_uri_scheme(prefix: &str) -> bool {
+    let mut bytes = prefix.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic()
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode_form_key(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                decoded.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                    decoded.push((hi << 4) | lo);
+                    i += 3;
+                } else {
+                    decoded.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            byte => {
+                decoded.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
 fn redact_url_password(raw: &str) -> String {
-    if let Some(scheme_end) = raw.find("://") {
+    if let Some(scheme_end) = raw.find("://")
+        && is_valid_uri_scheme(&raw[..scheme_end])
+    {
         redact_uri_password(raw, scheme_end)
     } else {
         redact_libpq_kv_password(raw)
     }
 }
 
+fn is_host_port_authority(authority: &str) -> bool {
+    authority.split(',').all(|segment| {
+        if let Some(rest) = segment.strip_prefix('[') {
+            match rest.split_once(']') {
+                Some((_, "")) => true,
+                Some((_, port_part)) => port_part
+                    .strip_prefix(':')
+                    .is_some_and(|p| p.is_empty() || p.parse::<u16>().is_ok()),
+                None => false,
+            }
+        } else {
+            match segment.split_once(':') {
+                None => true,
+                Some((_, port)) => port.is_empty() || port.parse::<u16>().is_ok(),
+            }
+        }
+    })
+}
+
 fn redact_uri_password(raw: &str, scheme_end: usize) -> String {
     let rest = &raw[scheme_end + 3..];
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    let tail = &rest[authority_end..];
+    let mut authority = &rest[..authority_end];
+    let mut tail = &rest[authority_end..];
+
+    // If an unencoded `/`, `?`, or `#` appeared inside an authority password (for example
+    // `postgresql://app:abc/def@host/db`), `authority` lacks `@` and has a non-port `:...`
+    // segment, while `@` appears later in `rest`. Re-slice at the real authority boundary
+    // (or fail closed) so raw credentials are never echoed.
+    if !authority.contains('@') && !is_host_port_authority(authority) {
+        if let Some(later_at) = rest.find('@') {
+            let after_at = &rest[later_at + 1..];
+            let host_end = after_at.find(['/', '?', '#']).unwrap_or(after_at.len());
+            let new_end = later_at + 1 + host_end;
+            authority = &rest[..new_end];
+            tail = &rest[new_end..];
+        } else {
+            return format!(
+                "{}<redacted malformed database URL>",
+                &raw[..scheme_end + 3]
+            );
+        }
+    }
 
     let mut out = String::with_capacity(raw.len());
     out.push_str(&raw[..scheme_end + 3]);
@@ -121,7 +207,8 @@ fn redact_uri_password(raw: &str, scheme_end: usize) -> String {
         }
         if let Some(eq_pos) = pair.find('=') {
             let key = &pair[..eq_pos];
-            if is_secret_pg_param(key) {
+            let decoded_key = percent_decode_form_key(key);
+            if is_secret_pg_param(&decoded_key) {
                 out.push_str(key);
                 out.push_str("=***");
                 continue;
@@ -140,6 +227,12 @@ fn advance_escaped(raw: &str, backslash_idx: usize) -> usize {
         .chars()
         .next()
         .map_or(raw.len(), |ch| after_slash + ch.len_utf8())
+}
+
+fn token_starts_secret_kv(token: &str) -> bool {
+    token
+        .split_once('=')
+        .is_some_and(|(k, _)| is_secret_pg_param(k))
 }
 
 fn redact_libpq_kv_password(raw: &str) -> String {
@@ -174,23 +267,36 @@ fn redact_libpq_kv_password(raw: &str) -> String {
             continue;
         }
         i += 1; // consume '='
+        let after_eq = i;
         while i < len && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
+        let had_ws_after_eq = i > after_eq;
         out.push_str(&raw[pre_eq..i]);
 
         let val_start = i;
         if i < len && bytes[i] == b'\'' {
             i += 1;
+            let mut closed = false;
             while i < len {
                 if bytes[i] == b'\\' {
                     i = advance_escaped(raw, i);
                 } else if bytes[i] == b'\'' {
                     i += 1;
+                    closed = true;
                     break;
                 } else {
                     i += 1;
                 }
+            }
+            if is_secret_pg_param(key) {
+                out.push_str("***");
+            } else if closed {
+                out.push_str(&raw[val_start..i]);
+            } else {
+                // Unclosed quote in a non-secret value must not swallow a following `password=...`.
+                out.push('\'');
+                out.push_str(&redact_libpq_kv_password(&raw[val_start + 1..i]));
             }
         } else {
             while i < len && !bytes[i].is_ascii_whitespace() {
@@ -200,12 +306,16 @@ fn redact_libpq_kv_password(raw: &str) -> String {
                     i += 1;
                 }
             }
-        }
-
-        if is_secret_pg_param(key) {
-            out.push_str("***");
-        } else {
-            out.push_str(&raw[val_start..i]);
+            let val = &raw[val_start..i];
+            if is_secret_pg_param(key) {
+                out.push_str("***");
+            } else if had_ws_after_eq && token_starts_secret_kv(val) {
+                // Previous non-secret key had an empty unquoted value (e.g. `sslrootcert= password=SECRET`);
+                // rewind so the secret key-value pair is parsed and masked on the next iteration.
+                i = val_start;
+            } else {
+                out.push_str(val);
+            }
         }
     }
 
@@ -430,7 +540,11 @@ fn load_file_config(explicit_path: Option<&Path>, cwd: &Path) -> anyhow::Result<
         .exit_code(Exit::Usage)?;
 
     toml::from_str::<FileConfig>(&raw)
-        .map_err(|err| anyhow!("invalid config in {}: {err}", path.display()))
+        .map_err(|mut err| {
+            // Never echo raw config source lines that may contain `database_url` credentials.
+            err.set_input(None);
+            anyhow!("invalid config in {}: {err}", path.display())
+        })
         .exit_code(Exit::Usage)
 }
 
@@ -733,10 +847,78 @@ batch_size = 250
         let red_utf8 = RedactedUrl::new(kv_utf8).redacted();
         assert!(!red_utf8.contains(pw1), "{red_utf8}");
         assert_eq!(red_utf8, "application_name='a\\é' password=*** dbname=prod");
+    }
 
-        // 7. Non-secret libpq parameters and URIs remain untouched.
+    #[test]
+    fn redacted_url_handles_adversarial_bypasses_and_toml_parse_errors_hide_secrets() {
+        let pw1 = "s3cr3t_alpha";
+        let pw2 = "s3cr3t_beta";
+
+        // Percent-encoded URI query keys (`%70assword` decoded by sqlx) are masked.
+        let uri_pct = format!(
+            "postgresql://app@db.example.com:5432/prod?%70assword={pw1}&%73slpassword={pw2}"
+        );
+        let red_pct = RedactedUrl::new(uri_pct).redacted();
+        assert!(
+            !red_pct.contains(pw1) && !red_pct.contains(pw2),
+            "{red_pct}"
+        );
+
+        // 8. Libpq KV strings containing `://` in values or passwords are NOT misclassified as URIs.
+        let kv_with_url = format!(
+            "host=db.example.com application_name=https://svc.internal password={pw1} dbname=prod"
+        );
+        let red_kv_url = RedactedUrl::new(kv_with_url).redacted();
+        assert!(!red_kv_url.contains(pw1), "{red_kv_url}");
+        assert!(red_kv_url.contains("password=***"), "{red_kv_url}");
+
+        let kv_pw_url = format!("host=db.example.com password=foo://{pw1} dbname=prod");
+        let red_kv_pw_url = RedactedUrl::new(kv_pw_url).redacted();
+        assert!(!red_kv_pw_url.contains(pw1), "{red_kv_pw_url}");
+        assert_eq!(
+            red_kv_pw_url,
+            "host=db.example.com password=*** dbname=prod"
+        );
+
+        // 9. Unencoded `/`, `?`, or `#` inside URI authority passwords never leak credentials.
+        for bad_uri in [
+            format!("postgresql://app:abc/{pw1}@db.example.com:5432/prod"),
+            format!("postgresql://app:abc?{pw1}@db.example.com:5432/prod"),
+            format!("postgresql://app:abc#{pw1}@db.example.com:5432/prod"),
+            format!("postgresql://app:{pw1}/no-at-sign"),
+        ] {
+            let red = RedactedUrl::new(bad_uri).redacted();
+            assert!(!red.contains(pw1) && !red.contains("abc"), "leaked: {red}");
+        }
+
+        // 10. Libpq KV empty unquoted value or unclosed single quote before `password=` never leaks.
+        let kv_empty_prev = format!("host=db.example.com sslrootcert= password={pw1} dbname=prod");
+        let red_empty_prev = RedactedUrl::new(kv_empty_prev).redacted();
+        assert!(!red_empty_prev.contains(pw1), "{red_empty_prev}");
+        assert!(red_empty_prev.contains("password=***"), "{red_empty_prev}");
+
+        let kv_unclosed_prev = format!("application_name='broken password={pw1} dbname=prod");
+        let red_unclosed_prev = RedactedUrl::new(kv_unclosed_prev).redacted();
+        assert!(!red_unclosed_prev.contains(pw1), "{red_unclosed_prev}");
+
+        // 11. Non-secret libpq parameters and URIs remain untouched.
         let safe_kv = "host=localhost port=5432 user=postgres dbname=app sslmode=verify-full";
         assert_eq!(RedactedUrl::new(safe_kv.to_owned()).redacted(), safe_kv);
+
+        // 12. TOML syntax/unknown-field errors never echo `database_url` credentials.
+        let dir = tempdir().unwrap();
+        let toml_secret = "TOML_CONFIG_SECRET_999";
+        fs::write(
+            dir.path().join("auditstream.toml"),
+            format!("databse_url = \"postgresql://app:{toml_secret}@db.example.com/prod\"\n"),
+        )
+        .unwrap();
+        let cli = Cli::try_parse_from(["auditstream", "status"]).unwrap();
+        let err = Config::load_with_fallback_env(&cli, dir.path(), None).unwrap_err();
+        assert!(
+            !err.to_string().contains(toml_secret),
+            "TOML parse error leaked secret: {err}"
+        );
     }
 
     #[test]

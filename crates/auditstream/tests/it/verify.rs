@@ -403,6 +403,54 @@ async fn verify_reports_invalid_exclusion_when_config_excludes_primary_key() {
             .any(|f| f["kind"] == "invalid_exclusion" && f["severity"] == "error"),
         "expected invalid_exclusion error finding, got: {parsed}"
     );
+
+    // Also caught when `capture.tables` is omitted and `capture.exclude` targets an installed table's PK.
+    fs::write(
+        dir.path().join("auditstream.toml"),
+        "[capture]\nexclude = [\"public.invoice.id\"]\n",
+    )
+    .expect("write exclude-only auditstream.toml");
+    let out_installed = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["verify", "--format", "json"])
+        .output()
+        .expect("run verify json without capture.tables");
+    assert_eq!(out_installed.status.code(), Some(1));
+    let parsed_installed: serde_json::Value =
+        serde_json::from_slice(&out_installed.stdout).expect("parse verify json");
+    assert!(
+        parsed_installed["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .any(|f| f["kind"] == "invalid_exclusion" && f["severity"] == "error"),
+        "expected invalid_exclusion without capture.tables, got: {parsed_installed}"
+    );
+
+    // Leaked child-partition privileges and PUBLIC execute on capture() report `unsafe_privileges`.
+    fs::remove_file(dir.path().join("auditstream.toml")).expect("remove config");
+    db.execute("GRANT DELETE ON TABLE auditstream.changes_default TO PUBLIC")
+        .await
+        .expect("inject unsafe partition grant");
+    let out_acl = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["verify", "--format", "json"])
+        .output()
+        .expect("run verify json on unsafe ACL");
+    assert_eq!(out_acl.status.code(), Some(1));
+    let parsed_acl: serde_json::Value =
+        serde_json::from_slice(&out_acl.stdout).expect("parse verify acl json");
+    assert!(
+        parsed_acl["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .any(|f| f["kind"] == "unsafe_privileges"
+                && f["object"] == "auditstream.changes_default"),
+        "expected unsafe_privileges finding on changes_default, got: {parsed_acl}"
+    );
 }
 
 #[test]

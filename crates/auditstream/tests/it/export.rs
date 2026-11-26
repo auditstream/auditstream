@@ -1061,3 +1061,56 @@ async fn export_tenant_filter_matches_direct_delegated_advances_cursor_and_check
         .stderr(predicate::str::contains("--tenant"))
         .stderr(predicate::str::contains("--from-start"));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn export_refuses_symlinks_and_creates_0600_output_files() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let db = export_db().await;
+    seed_events(&db).await;
+    let dir = tempdir().expect("tempdir");
+
+    let victim = dir.path().join("victim.txt");
+    fs::write(&victim, "DO_NOT_TOUCH\n").expect("write victim");
+
+    // 1. Stateless `--output` pointing to a symlink must fail with Exit::Io (4).
+    let out_link = dir.path().join("out-link.jsonl");
+    symlink(&victim, &out_link).expect("symlink output");
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["export", "--output", "out-link.jsonl"])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("symlink"));
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "DO_NOT_TOUCH\n");
+
+    // 2. Stateful `--cursor-file` pointing to a symlink must fail with Exit::Io (4).
+    let cursor_link = dir.path().join("cursor-link.json");
+    symlink(&victim, &cursor_link).expect("symlink cursor");
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args([
+            "export",
+            "--cursor-file",
+            "cursor-link.json",
+            "--output",
+            "events.jsonl",
+        ])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("symlink"));
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "DO_NOT_TOUCH\n");
+
+    // 3. Normal export creates output file with mode 0600.
+    let args = ["--cursor-file", "cursor.json", "--output", "events.jsonl"];
+    export_file_until(&db, dir.path(), &args, 3).await;
+    let out_mode = fs::metadata(dir.path().join("events.jsonl"))
+        .expect("stat output")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(out_mode, 0o600, "events.jsonl must have mode 0600");
+}

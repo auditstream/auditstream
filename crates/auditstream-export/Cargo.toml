@@ -17,6 +17,9 @@ thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["fs", "io-std", "io-util"] }
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 jsonschema.workspace = true
 proptest.workspace = true

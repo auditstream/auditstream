@@ -24,6 +24,7 @@ hex = "0.4"
 insta = "1"
 insta-cmd = "0.6"
 jsonschema = { version = "0.45", default-features = false }
+libc = "0.2"
 predicates = "3"
 proptest = "1"
 serde = { version = "1", features = ["derive"] }

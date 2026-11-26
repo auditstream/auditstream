@@ -14,6 +14,7 @@ use clap::{Args as ClapArgs, ValueEnum};
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
+use uuid::Uuid;
 
 use crate::commands::common::{connect_database, require_database_url, run_async};
 use crate::config::Config;
@@ -143,17 +144,43 @@ fn sink_path(sink: &SinkConfig) -> Option<&Path> {
 }
 
 fn resolve_path(path: &Path) -> io::Result<PathBuf> {
-    match path.canonicalize() {
-        Err(err) if err.kind() == io::ErrorKind::NotFound && !path.is_symlink() => {
-            let name = path.file_name().ok_or(err)?;
-            let parent = path
-                .parent()
-                .filter(|dir| !dir.as_os_str().is_empty())
-                .unwrap_or(Path::new("."));
-            Ok(parent.canonicalize()?.join(name))
-        }
-        other => other,
+    if !matches!(
+        path.components().next_back(),
+        Some(std::path::Component::Normal(_))
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path must name a file: {}", path.display()),
+        ));
     }
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path must name a file: {}", path.display()),
+        )
+    })?;
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing to follow symlink at {}", path.display()),
+            ));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    let parent = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    Ok(parent.canonicalize()?.join(name))
+}
+
+fn open_nofollow(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(options, libc::O_NOFOLLOW);
+    options.open(path)
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
@@ -161,7 +188,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
         return true;
     }
     #[cfg(unix)]
-    if let (Ok(a), Ok(b)) = (a.metadata(), b.metadata()) {
+    if let (Ok(a), Ok(b)) = (fs::symlink_metadata(a), fs::symlink_metadata(b)) {
         use std::os::unix::fs::MetadataExt;
         return a.dev() == b.dev() && a.ino() == b.ino();
     }
@@ -170,7 +197,11 @@ fn same_file(a: &Path, b: &Path) -> bool {
 
 #[cfg(unix)]
 fn sync_parent(path: &Path) -> io::Result<()> {
-    File::open(path.parent().unwrap_or(Path::new(".")))?.sync_all()
+    let parent = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    File::open(parent)?.sync_all()
 }
 
 impl Checkpoint {
@@ -212,7 +243,13 @@ impl Checkpoint {
 
     fn measure_output(&mut self) -> io::Result<()> {
         self.output_len = match sink_path(&self.sink) {
-            Some(path) => match path.metadata() {
+            Some(path) => match fs::symlink_metadata(path) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("refusing to follow symlink at {}", path.display()),
+                    ));
+                }
                 Ok(meta) => meta.is_file().then_some(meta.len()),
                 Err(err) if err.kind() == io::ErrorKind::NotFound => Some(0),
                 Err(err) => return Err(err),
@@ -226,7 +263,9 @@ impl Checkpoint {
         let (Some(path), Some(length)) = (sink_path(&self.sink), self.output_len) else {
             return Ok(());
         };
-        let file = match File::options().write(true).open(path) {
+        let mut opts = OpenOptions::new();
+        opts.write(true);
+        let file = match open_nofollow(&mut opts, path) {
             Err(err) if err.kind() == io::ErrorKind::NotFound && (length == 0 || from_start) => {
                 return Ok(());
             }
@@ -268,15 +307,39 @@ impl CursorFile {
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let lock = options.open(&lock_path)?;
+        let lock = open_nofollow(&mut options, &lock_path)?;
+        let meta = lock.metadata()?;
+        if !meta.file_type().is_file() {
+            return Err(anyhow!(
+                "cursor lock {} is not a regular file",
+                lock_path.display()
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            if meta.mode() & 0o077 != 0 {
+                lock.set_permissions(fs::Permissions::from_mode(0o600))?;
+            }
+        }
         lock.try_lock()
             .with_context(|| format!("cannot lock cursor {}", path.display()))?;
         Ok(Self { path, _lock: lock })
     }
 
     fn read(&self) -> io::Result<Option<Checkpoint>> {
-        match File::open(&self.path) {
-            Ok(file) => Ok(Some(serde_json::from_reader(file)?)),
+        let mut options = OpenOptions::new();
+        options.read(true);
+        match open_nofollow(&mut options, &self.path) {
+            Ok(file) => {
+                if !file.metadata()?.file_type().is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("cursor {} is not a regular file", self.path.display()),
+                    ));
+                }
+                Ok(Some(serde_json::from_reader(file)?))
+            }
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err),
         }
@@ -284,18 +347,21 @@ impl CursorFile {
 
     fn save(&self, checkpoint: &Checkpoint) -> io::Result<()> {
         let bytes = serde_json::to_vec(checkpoint)?;
-        // Exclusive creation prevents following symlinks or overwriting files left by another process.
+        // Exclusive creation with random entropy prevents following symlinks, predictable-path
+        // collisions, or overwriting files left by another process.
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let mut attempt = 0_u64;
+        let mut attempt = 0_u32;
         let (temp, mut file) = loop {
             let temp = self
                 .path
-                .with_added_extension(format!("tmp.{}.{attempt}", std::process::id()));
+                .with_added_extension(format!("tmp.{}", Uuid::new_v4().simple()));
             match options.open(&temp) {
-                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => attempt += 1,
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists && attempt < 64 => {
+                    attempt += 1;
+                }
                 result => break (temp, result?),
             }
         };
@@ -371,7 +437,7 @@ impl LazySink {
             #[cfg(unix)]
             if *sync_dir
                 && let Some(path) = sink_path(config)
-                && path.is_file()
+                && fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
             {
                 sync_parent(path)?;
             }
@@ -443,6 +509,13 @@ fn open_checkpoint(
         output_len: None,
         redaction: config.export.redaction.clone(),
     };
+    let (SinkConfig::Jsonl { path: output } | SinkConfig::Csv { path: output }) =
+        &mut requested.sink;
+    if let Some(output) = output {
+        *output = resolve_path(output)
+            .context("resolving export output")
+            .exit_code(Exit::Io)?;
+    }
     let Some(path) = &config.export.cursor_file else {
         return Ok(OpenedCheckpoint {
             file: None,
@@ -453,20 +526,14 @@ fn open_checkpoint(
     let file = CursorFile::lock(path)
         .with_context(|| format!("opening cursor {}", path.display()))
         .exit_code(Exit::Io)?;
-    let (SinkConfig::Jsonl { path: output } | SinkConfig::Csv { path: output }) =
-        &mut requested.sink;
-    if let Some(output) = output {
-        *output = resolve_path(output)
-            .context("resolving export output")
-            .exit_code(Exit::Io)?;
-        if same_file(output, &file.path)
-            || same_file(output, &file.path.with_added_extension("lock"))
-        {
-            return Err(anyhow!(
-                "--output must differ from the cursor and its lock file"
-            ))
-            .exit_code(Exit::Usage);
-        }
+    if let Some(output) = sink_path(&requested.sink)
+        && (same_file(output, &file.path)
+            || same_file(output, &file.path.with_added_extension("lock")))
+    {
+        return Err(anyhow!(
+            "--output must differ from the cursor and its lock file"
+        ))
+        .exit_code(Exit::Usage);
     }
     if args.from_start {
         // Replay starts at the beginning, but a partial batch in this destination still needs repair.
@@ -559,7 +626,7 @@ async fn export_with_pool(
         .context("recovering export output")
         .exit_code(Exit::Io)?;
     if let Some(path) = sink_path(&opened.checkpoint.sink)
-        && path.is_dir()
+        && fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
     {
         return Err(anyhow!(
             "opening export output: {} is a directory",
@@ -1015,5 +1082,50 @@ mod tests {
             .err()
             .expect("symlink lock must be rejected");
         assert!(err.to_string().contains("symlink"), "{err}");
+
+        // Pre-existing permissive `.lock` file is tightened to 0600.
+        let loose_cursor = dir.path().join("loose.cursor");
+        let loose_lock = dir.path().join("loose.cursor.lock");
+        fs::write(&loose_lock, b"").expect("create loose lock");
+        fs::set_permissions(&loose_lock, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
+        let locked = CursorFile::lock(&loose_cursor).expect("lock loose cursor");
+        let tightened = fs::metadata(&loose_lock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(tightened, 0o600, "loose lock must be tightened to 0600");
+        drop(locked);
+
+        // resolve_path rejects live & dangling symlinks on final component, preserves symlinked parent dir.
+        let live_link = dir.path().join("live-link.json");
+        symlink(&victim, &live_link).expect("create live symlink");
+        assert!(super::resolve_path(&live_link).is_err());
+
+        let dangling_link = dir.path().join("dangling-link.json");
+        symlink(dir.path().join("missing.json"), &dangling_link).expect("create dangling symlink");
+        assert!(super::resolve_path(&dangling_link).is_err());
+
+        let real_subdir = dir.path().join("real_sub");
+        fs::create_dir(&real_subdir).expect("create real_sub");
+        let parent_link = dir.path().join("sym_sub");
+        symlink(&real_subdir, &parent_link).expect("create parent symlink");
+        let resolved_child = super::resolve_path(&parent_link.join("events.jsonl"))
+            .expect("symlinked parent dir allowed");
+        assert_eq!(
+            resolved_child,
+            real_subdir.canonicalize().unwrap().join("events.jsonl")
+        );
+
+        // restore_output refuses to truncate a symlink target via O_NOFOLLOW.
+        let big_victim = dir.path().join("big_victim.jsonl");
+        fs::write(&big_victim, b"0123456789abcdef").expect("write big_victim");
+        let out_link = dir.path().join("out_link.jsonl");
+        symlink(&big_victim, &out_link).expect("create out symlink");
+        let cp = sample_checkpoint(
+            SinkConfig::Jsonl {
+                path: Some(out_link),
+            },
+            Cursor::new(1, 1),
+            Some(4),
+        );
+        assert!(cp.restore_output(false).is_err());
+        assert_eq!(fs::read(&big_victim).unwrap(), b"0123456789abcdef");
     }
 }

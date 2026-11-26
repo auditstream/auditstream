@@ -165,4 +165,24 @@ fn database_password_never_appears_in_help_logs_or_errors() {
         .stderr(predicate::str::contains(
             "postgresql://app_user:***@db.internal:5432/auditdb",
         ));
+
+    // Unrecognized secret query params (`sslpassword`, uppercase `PASSWORD`) and libpq KV
+    // strings must never leak to stderr at default verbosity or `-vv` when connecting fails.
+    for variant in [
+        format!("postgresql://app_user@127.0.0.1:1/auditdb?sslpassword={secret}"),
+        format!("postgresql://app_user@127.0.0.1:1/auditdb?PASSWORD={secret}"),
+        format!("postgresql://app_user@127.0.0.1:1/auditdb?%70assword={secret}"),
+        format!("host=127.0.0.1 port=1 password={secret} dbname=auditdb"),
+    ] {
+        for args in [&["status"][..], &["-vv", "status"][..]] {
+            auditstream_cmd()
+                .current_dir(dir.path())
+                .env("AUDITSTREAM_DATABASE_URL", &variant)
+                .args(args)
+                .assert()
+                .code(3)
+                .stdout(predicate::str::is_empty())
+                .stderr(predicate::str::contains(secret).not());
+        }
+    }
 }

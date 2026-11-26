@@ -17,8 +17,27 @@ pub(crate) fn open_append_file(path: &Path) -> io::Result<std::fs::File> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    options.open(path)
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let file_type = file.metadata()?.file_type();
+        if file_type.is_dir() || file_type.is_fifo() || file_type.is_socket() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to write export to non-file target {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(file)
 }
 
 macro_rules! impl_opened_sink {
@@ -214,5 +233,21 @@ mod tests {
                 "export file {filename} must be created with mode 0600, got {mode:o}"
             );
         }
+
+        // Symlinked output path must be rejected via O_NOFOLLOW without modifying the target.
+        let victim = dir.path().join("victim.jsonl");
+        std::fs::write(&victim, "KEEP\n").expect("write victim");
+        let link = dir.path().join("link.jsonl");
+        std::os::unix::fs::symlink(&victim, &link).expect("create symlink");
+        let err = super::open_append_file(&link).expect_err("symlink output must be rejected");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "expected ELOOP from O_NOFOLLOW, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read victim"),
+            "KEEP\n"
+        );
     }
 }

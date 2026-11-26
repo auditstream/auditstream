@@ -190,6 +190,7 @@ dependencies = [
  "insta",
  "insta-cmd",
  "jsonschema",
+ "libc",
  "predicates",
  "serde",
  "serde_json",
@@ -200,6 +201,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -222,6 +224,7 @@ dependencies = [
  "auditstream-core",
  "csv",
  "jsonschema",
+ "libc",
  "proptest",
  "serde",
  "serde_json",
