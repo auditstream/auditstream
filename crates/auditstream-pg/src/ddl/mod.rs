@@ -89,9 +89,10 @@ $$"
 /// Rejects autocommit callers via [`TX_GUARD_SETTING`], creates `auditstream_owner` when
 /// `create_role` is `true` (clearing `createrole_self_grant` on PG 16+ so creation never persists
 /// implicit `INHERIT`/`SET` membership), resolves the deterministic `ADMIN` grantor role for
-/// explicit `GRANTED BY`, and records the exact temporary grant mode (`none`, `self_row`,
-/// `inherit`, `set`, or `both`) in transaction-local GUCs so cleanup revokes only what this
-/// transaction granted without disturbing pre-existing memberships or failing on `NOINHERIT` roles.
+/// explicit `GRANTED BY`, acquires only `SET` (never `INHERIT`) on PG 16+, and records the exact
+/// temporary grant mode (`none`, `self_row`, or `set`) in transaction-local GUCs so cleanup
+/// revokes only what this transaction granted without disturbing pre-existing memberships or
+/// breaking `SET`-only / `NOINHERIT` migrator roles.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn role_grant_setup_sql(
     owner_q: &str,
@@ -130,8 +131,6 @@ DECLARE\n  \
   grant_mode text := 'none';\n  \
   grantor_role text := '';\n  \
   grantor_oid oid;\n  \
-  need_inherit boolean := false;\n  \
-  need_set boolean := false;\n  \
   has_grantor_row boolean := false;\n\
 {prev_self_grant_decl}\
 BEGIN\n  \
@@ -141,9 +140,7 @@ BEGIN\n  \
   END IF;\n\
 {create_clause}  \
   IF pg_catalog.current_setting('server_version_num')::int >= 160000 THEN\n    \
-    need_inherit := NOT pg_catalog.pg_has_role(current_user, {owner_lit}, 'USAGE');\n    \
-    need_set := NOT pg_catalog.pg_has_role(current_user, {owner_lit}, 'SET');\n    \
-    IF need_inherit OR need_set THEN\n      \
+    IF NOT pg_catalog.pg_has_role(current_user, {owner_lit}, 'SET') THEN\n      \
       SELECT m.member\n        \
         INTO grantor_oid\n        \
         FROM pg_catalog.pg_auth_members m\n        \
@@ -156,10 +153,8 @@ BEGIN\n  \
        LIMIT 1;\n      \
       IF grantor_oid IS NULL THEN\n        \
         EXECUTE pg_catalog.format(\n          \
-          'GRANT {owner_q} TO %I WITH INHERIT %s, SET %s',\n          \
-          current_user,\n          \
-          CASE WHEN need_inherit THEN 'TRUE' ELSE 'FALSE' END,\n          \
-          CASE WHEN need_set THEN 'TRUE' ELSE 'FALSE' END\n        \
+          'GRANT {owner_q} TO %I WITH INHERIT FALSE, SET TRUE',\n          \
+          current_user\n        \
         );\n        \
         grant_mode := 'self_row';\n      \
       ELSE\n        \
@@ -175,27 +170,11 @@ BEGIN\n  \
         ) INTO has_grantor_row;\n        \
         IF NOT has_grantor_row THEN\n          \
           EXECUTE pg_catalog.format(\n            \
-            'GRANT {owner_q} TO %I WITH INHERIT %s, SET %s GRANTED BY %I',\n            \
+            'GRANT {owner_q} TO %I WITH INHERIT FALSE, SET TRUE GRANTED BY %I',\n            \
             current_user,\n            \
-            CASE WHEN need_inherit THEN 'TRUE' ELSE 'FALSE' END,\n            \
-            CASE WHEN need_set THEN 'TRUE' ELSE 'FALSE' END,\n            \
             grantor_role\n          \
           );\n          \
           grant_mode := 'self_row';\n        \
-        ELSIF need_inherit AND need_set THEN\n          \
-          EXECUTE pg_catalog.format(\n            \
-            'GRANT {owner_q} TO %I WITH INHERIT TRUE, SET TRUE GRANTED BY %I',\n            \
-            current_user,\n            \
-            grantor_role\n          \
-          );\n          \
-          grant_mode := 'both';\n        \
-        ELSIF need_inherit THEN\n          \
-          EXECUTE pg_catalog.format(\n            \
-            'GRANT {owner_q} TO %I WITH INHERIT TRUE GRANTED BY %I',\n            \
-            current_user,\n            \
-            grantor_role\n          \
-          );\n          \
-          grant_mode := 'inherit';\n        \
         ELSE\n          \
           EXECUTE pg_catalog.format(\n            \
             'GRANT {owner_q} TO %I WITH SET TRUE GRANTED BY %I',\n            \
@@ -232,11 +211,6 @@ BEGIN\n  \
   END IF;\n  \
   IF grant_mode = 'self_row' THEN\n    \
     EXECUTE pg_catalog.format('REVOKE {owner_q} FROM %I', current_user) || granted_by;\n  \
-  ELSIF grant_mode = 'both' THEN\n    \
-    EXECUTE pg_catalog.format('REVOKE INHERIT OPTION FOR {owner_q} FROM %I', current_user) || granted_by;\n    \
-    EXECUTE pg_catalog.format('REVOKE SET OPTION FOR {owner_q} FROM %I', current_user) || granted_by;\n  \
-  ELSIF grant_mode = 'inherit' THEN\n    \
-    EXECUTE pg_catalog.format('REVOKE INHERIT OPTION FOR {owner_q} FROM %I', current_user) || granted_by;\n  \
   ELSIF grant_mode = 'set' THEN\n    \
     EXECUTE pg_catalog.format('REVOKE SET OPTION FOR {owner_q} FROM %I', current_user) || granted_by;\n  \
   END IF;\n  \

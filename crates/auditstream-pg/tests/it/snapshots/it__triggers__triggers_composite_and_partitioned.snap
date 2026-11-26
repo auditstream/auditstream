@@ -13,8 +13,6 @@ DECLARE
   grant_mode text := 'none';
   grantor_role text := '';
   grantor_oid oid;
-  need_inherit boolean := false;
-  need_set boolean := false;
   has_grantor_row boolean := false;
 BEGIN
   IF pg_catalog.current_setting('auditstream._migration_tx', true) IS DISTINCT FROM 'on' THEN
@@ -22,9 +20,7 @@ BEGIN
       USING HINT = 'Wrap the generated statements in BEGIN; ... COMMIT; or use a transactional migrator.';
   END IF;
   IF pg_catalog.current_setting('server_version_num')::int >= 160000 THEN
-    need_inherit := NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'USAGE');
-    need_set := NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'SET');
-    IF need_inherit OR need_set THEN
+    IF NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'SET') THEN
       SELECT m.member
         INTO grantor_oid
         FROM pg_catalog.pg_auth_members m
@@ -37,10 +33,8 @@ BEGIN
        LIMIT 1;
       IF grantor_oid IS NULL THEN
         EXECUTE pg_catalog.format(
-          'GRANT "auditstream_owner" TO %I WITH INHERIT %s, SET %s',
-          current_user,
-          CASE WHEN need_inherit THEN 'TRUE' ELSE 'FALSE' END,
-          CASE WHEN need_set THEN 'TRUE' ELSE 'FALSE' END
+          'GRANT "auditstream_owner" TO %I WITH INHERIT FALSE, SET TRUE',
+          current_user
         );
         grant_mode := 'self_row';
       ELSE
@@ -56,27 +50,11 @@ BEGIN
         ) INTO has_grantor_row;
         IF NOT has_grantor_row THEN
           EXECUTE pg_catalog.format(
-            'GRANT "auditstream_owner" TO %I WITH INHERIT %s, SET %s GRANTED BY %I',
+            'GRANT "auditstream_owner" TO %I WITH INHERIT FALSE, SET TRUE GRANTED BY %I',
             current_user,
-            CASE WHEN need_inherit THEN 'TRUE' ELSE 'FALSE' END,
-            CASE WHEN need_set THEN 'TRUE' ELSE 'FALSE' END,
             grantor_role
           );
           grant_mode := 'self_row';
-        ELSIF need_inherit AND need_set THEN
-          EXECUTE pg_catalog.format(
-            'GRANT "auditstream_owner" TO %I WITH INHERIT TRUE, SET TRUE GRANTED BY %I',
-            current_user,
-            grantor_role
-          );
-          grant_mode := 'both';
-        ELSIF need_inherit THEN
-          EXECUTE pg_catalog.format(
-            'GRANT "auditstream_owner" TO %I WITH INHERIT TRUE GRANTED BY %I',
-            current_user,
-            grantor_role
-          );
-          grant_mode := 'inherit';
         ELSE
           EXECUTE pg_catalog.format(
             'GRANT "auditstream_owner" TO %I WITH SET TRUE GRANTED BY %I',
@@ -392,7 +370,12 @@ BEGIN
   IF TG_NARGS >= 4 THEN
     v_schema := TG_ARGV[2];
     v_table := TG_ARGV[3];
-    v_relid := pg_catalog.to_regclass(pg_catalog.format('%I.%I', v_schema, v_table));
+    SELECT c.oid
+      INTO v_relid
+      FROM pg_catalog.pg_class c
+      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = v_schema
+       AND c.relname = v_table;
     IF v_relid IS NULL OR (
       v_relid <> TG_RELID
       AND NOT EXISTS (
@@ -786,11 +769,6 @@ BEGIN
   END IF;
   IF grant_mode = 'self_row' THEN
     EXECUTE pg_catalog.format('REVOKE "auditstream_owner" FROM %I', current_user) || granted_by;
-  ELSIF grant_mode = 'both' THEN
-    EXECUTE pg_catalog.format('REVOKE INHERIT OPTION FOR "auditstream_owner" FROM %I', current_user) || granted_by;
-    EXECUTE pg_catalog.format('REVOKE SET OPTION FOR "auditstream_owner" FROM %I', current_user) || granted_by;
-  ELSIF grant_mode = 'inherit' THEN
-    EXECUTE pg_catalog.format('REVOKE INHERIT OPTION FOR "auditstream_owner" FROM %I', current_user) || granted_by;
   ELSIF grant_mode = 'set' THEN
     EXECUTE pg_catalog.format('REVOKE SET OPTION FOR "auditstream_owner" FROM %I', current_user) || granted_by;
   END IF;

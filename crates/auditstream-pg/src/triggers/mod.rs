@@ -374,10 +374,11 @@ END"
     ))
 }
 
-/// On PostgreSQL 15 with a `NOINHERIT` migrator role (where `GRANT ... WITH INHERIT TRUE` does
-/// not exist), temporarily grants `USAGE` on the audit schema and `EXECUTE` on `capture()` to
-/// `current_user` for the duration of `CREATE OR REPLACE TRIGGER` and revokes both immediately
-/// afterward inside the same transaction. No-op for superusers, `INHERIT` roles, and PG 16+.
+/// On PostgreSQL 15 with a `NOINHERIT` migrator role and PostgreSQL 16+ with a `SET`-only
+/// (`INHERIT FALSE, SET TRUE`) migrator role, temporarily grants `USAGE` on the audit schema and
+/// `EXECUTE` on `capture()` to `current_user` for the duration of `CREATE OR REPLACE TRIGGER` and
+/// revokes both immediately afterward inside the same transaction. No-op when `current_user`
+/// already has `USAGE` on `auditstream_owner` (superusers and `INHERIT` members).
 fn grant_temp_trigger_exec_if_noinherit_sql(schema_lit: &str, owner_lit: &str) -> String {
     do_block(&format!(
         "DECLARE
@@ -674,7 +675,12 @@ BEGIN\n  \
   IF TG_NARGS >= 4 THEN\n    \
     v_schema := TG_ARGV[2];\n    \
     v_table := TG_ARGV[3];\n    \
-    v_relid := pg_catalog.to_regclass(pg_catalog.format('%I.%I', v_schema, v_table));\n    \
+    SELECT c.oid\n      \
+      INTO v_relid\n      \
+      FROM pg_catalog.pg_class c\n      \
+      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n     \
+     WHERE n.nspname = v_schema\n       \
+       AND c.relname = v_table;\n    \
     IF v_relid IS NULL OR (\n      \
       v_relid <> TG_RELID\n      \
       AND NOT EXISTS (\n        \

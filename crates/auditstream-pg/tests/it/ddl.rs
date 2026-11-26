@@ -1134,10 +1134,12 @@ async fn pg16_group_admin_and_createrole_self_grant_preserve_memberships() {
     }
 
     // 1. Even with `createrole_self_grant = 'set, inherit'`, initial DDL setup must NOT persist
-    //    permanent INHERIT/SET on `auditstream_owner` (tested when role is newly created).
+    //    permanent INHERIT/SET on `auditstream_owner`.
     let ops_admin = format!("ops_admin_{}", db.database_name());
     let group_mig = format!("grp_mig_{}", db.database_name());
+    let set_only_mig = format!("set_mig_{}", db.database_name());
     let group_pw = Uuid::new_v4().simple().to_string();
+    let owner_was_dropped: bool;
     {
         let mut admin = PgConnection::connect(&admin_url)
             .await
@@ -1149,7 +1151,7 @@ async fn pg16_group_admin_and_createrole_self_grant_preserve_memberships() {
             )))
             .await
             .expect("set createrole_self_grant");
-        let _ = admin
+        admin
             .execute(AssertSqlSafe(format!(
                 "DO $$ BEGIN \
                    DROP ROLE IF EXISTS {owner}; \
@@ -1159,9 +1161,21 @@ async fn pg16_group_admin_and_createrole_self_grant_preserve_memberships() {
                 owner = quote_ident(OWNER_ROLE),
                 mig = quote_ident(&migrator_role),
             )))
-            .await;
+            .await
+            .expect("reset or delegate owner role");
+        owner_was_dropped = !sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $1)",
+        )
+        .bind(OWNER_ROLE)
+        .fetch_one(&mut admin)
+        .await
+        .expect("check owner role dropped");
         admin.close().await.expect("close admin");
     }
+    assert!(
+        owner_was_dropped,
+        "{OWNER_ROLE} must be absent before testing createrole_self_grant initial CREATE ROLE"
+    );
 
     let stmts = ddl::generate(&DdlOptions::default());
     {
@@ -1182,7 +1196,10 @@ async fn pg16_group_admin_and_createrole_self_grant_preserve_memberships() {
     }
 
     // 2. Group-role delegated ADMIN OPTION (`ops_admin` -> `group_mig` with pre-existing
-    //    `INHERIT FALSE, SET TRUE`) must succeed without clobbering SET or deleting membership.
+    //    `INHERIT TRUE, SET FALSE`) must succeed via `GRANTED BY ops_admin` and preserve
+    //    `(INHERIT TRUE, SET FALSE)` without deleting the pre-existing membership.
+    // 3. A DBA-provisioned non-admin `NOINHERIT` / `SET`-only migrator (no `ADMIN OPTION`, no
+    //    `CREATEROLE`, `INHERIT FALSE, SET TRUE`) must also succeed on both DDL and triggers.
     let db_name = db.database_name().to_owned();
     {
         let mut admin = PgConnection::connect(&admin_url)
@@ -1204,6 +1221,13 @@ async fn pg16_group_admin_and_createrole_self_grant_preserve_memberships() {
             .expect("create group_mig");
         admin
             .execute(AssertSqlSafe(format!(
+                "CREATE ROLE {} LOGIN NOINHERIT PASSWORD '{group_pw}'",
+                quote_ident(&set_only_mig)
+            )))
+            .await
+            .expect("create set_only_mig");
+        admin
+            .execute(AssertSqlSafe(format!(
                 "GRANT {} TO {} WITH ADMIN OPTION, INHERIT FALSE, SET FALSE",
                 quote_ident(OWNER_ROLE),
                 quote_ident(&ops_admin),
@@ -1220,21 +1244,31 @@ async fn pg16_group_admin_and_createrole_self_grant_preserve_memberships() {
             .expect("grant ops_admin to group_mig");
         admin
             .execute(AssertSqlSafe(format!(
-                "GRANT {} TO {} WITH INHERIT FALSE, SET TRUE GRANTED BY {}",
+                "GRANT {} TO {} WITH INHERIT TRUE, SET FALSE GRANTED BY {}",
                 quote_ident(OWNER_ROLE),
                 quote_ident(&group_mig),
                 quote_ident(&ops_admin),
             )))
             .await
-            .expect("pre-grant INHERIT FALSE, SET TRUE by ops_admin");
+            .expect("pre-grant INHERIT TRUE, SET FALSE by ops_admin");
         admin
             .execute(AssertSqlSafe(format!(
-                "GRANT CONNECT, CREATE ON DATABASE {} TO {}",
-                quote_ident(&db_name),
-                quote_ident(&group_mig),
+                "GRANT {} TO {} WITH INHERIT FALSE, SET TRUE",
+                quote_ident(OWNER_ROLE),
+                quote_ident(&set_only_mig),
             )))
             .await
-            .expect("grant db connect");
+            .expect("grant SET-only non-admin membership to set_only_mig");
+        for role in [&group_mig, &set_only_mig] {
+            admin
+                .execute(AssertSqlSafe(format!(
+                    "GRANT CONNECT, CREATE ON DATABASE {} TO {}",
+                    quote_ident(&db_name),
+                    quote_ident(role),
+                )))
+                .await
+                .expect("grant db connect");
+        }
         admin.close().await.expect("close admin");
     }
 
@@ -1247,7 +1281,7 @@ async fn pg16_group_admin_and_createrole_self_grant_preserve_memberships() {
         .expect("connect as group_mig");
     run_statements_tx(&mut group_conn, &stmts)
         .await
-        .expect("DDL refresh must succeed via group-inherited ADMIN OPTION without clobbering SET");
+        .expect("DDL refresh must succeed via group-inherited ADMIN OPTION");
 
     let (has_usage, has_set): (bool, bool) = sqlx::query_as(
         "SELECT pg_catalog.pg_has_role($1, $2, 'USAGE'), pg_catalog.pg_has_role($1, $2, 'SET')",
@@ -1258,16 +1292,53 @@ async fn pg16_group_admin_and_createrole_self_grant_preserve_memberships() {
     .await
     .expect("check group_mig membership after DDL");
     assert!(
-        !has_usage && has_set,
-        "group_mig must keep pre-existing (INHERIT FALSE, SET TRUE), got usage={has_usage}, set={has_set}"
+        has_usage && !has_set,
+        "group_mig must keep pre-existing (INHERIT TRUE, SET FALSE), got usage={has_usage}, set={has_set}"
     );
     group_conn.close().await.expect("close group_conn");
+
+    let set_only_url = format!("{scheme}://{set_only_mig}:{group_pw}@{host_and_db}");
+    db.pool()
+        .execute(AssertSqlSafe(format!(
+            "GRANT CREATE ON SCHEMA public TO {}",
+            quote_ident(&set_only_mig)
+        )))
+        .await
+        .expect("grant CREATE on public schema to set_only_mig");
+    let mut set_conn = PgConnection::connect(&set_only_url)
+        .await
+        .expect("connect as set_only_mig");
+    set_conn
+        .execute("CREATE TABLE public.set_only_item (id int PRIMARY KEY, note text)")
+        .await
+        .expect("create table as set_only_mig");
+    let trig_stmts =
+        auditstream_pg::triggers::generate(&auditstream_pg::triggers::TriggerOptions::new(
+            DEFAULT_SCHEMA,
+            vec![auditstream_pg::triggers::TableTriggerSpec::new(
+                "public",
+                "set_only_item",
+                vec!["id".to_owned()],
+                vec![],
+            )],
+        ));
+    {
+        let mut tx = set_conn.begin().await.expect("begin set_only tx");
+        run_statements(&mut tx, &stmts)
+            .await
+            .expect("DDL must succeed for SET-only non-admin migrator on PG 16+");
+        run_statements(&mut tx, &trig_stmts)
+            .await
+            .expect("triggers must succeed for SET-only non-admin migrator on PG 16+");
+        tx.commit().await.expect("commit set_only tx");
+    }
+    set_conn.close().await.expect("close set_conn");
 
     drop(db);
     let mut admin = PgConnection::connect(&admin_url)
         .await
         .expect("admin cleanup");
-    for role in [&group_mig, &ops_admin] {
+    for role in [&set_only_mig, &group_mig, &ops_admin] {
         let _ = admin
             .execute(AssertSqlSafe(format!(
                 "DROP ROLE IF EXISTS {}",

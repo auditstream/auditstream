@@ -996,6 +996,67 @@ async fn partitioned_table_captures_parent_writes_and_pins_direct_partition_inse
 }
 
 #[tokio::test]
+async fn partitioned_table_in_private_schema_captures_dml_without_public_usage() {
+    let schema_sql = [
+        "CREATE SCHEMA billing",
+        "REVOKE ALL ON SCHEMA billing FROM PUBLIC",
+        "CREATE TABLE billing.ledger ( \
+           id int NOT NULL, \
+           bucket int NOT NULL, \
+           amount numeric NOT NULL, \
+           PRIMARY KEY (id, bucket) \
+         ) PARTITION BY LIST (bucket)",
+        "CREATE TABLE billing.ledger_0 PARTITION OF billing.ledger FOR VALUES IN (0)",
+    ];
+    let spec = TableTriggerSpec::new(
+        "billing",
+        "ledger",
+        vec!["id".to_owned(), "bucket".to_owned()],
+        vec![],
+    )
+    .partitioned();
+    let mut fx = CaptureFixture::with_schema(
+        &schema_sql,
+        vec![spec.clone()],
+        &["GRANT USAGE ON SCHEMA billing TO {app_role}"],
+    )
+    .await;
+
+    // Writes by both app_role and superuser must succeed even though auditstream_owner has NO
+    // USAGE privilege on schema `billing`.
+    fx.exec_app(&format!(
+        "INSERT INTO billing.ledger VALUES (1, 0, 100) {COMMENT_USER_42}"
+    ))
+    .await;
+    fx.exec_app(&format!(
+        "UPDATE billing.ledger SET amount = 250 WHERE id = 1 AND bucket = 0 {COMMENT_API_KEY_9}"
+    ))
+    .await;
+    fx.db
+        .execute("DELETE FROM billing.ledger WHERE id = 1 AND bucket = 0")
+        .await
+        .expect("superuser DELETE on private-schema partitioned table succeeds");
+    fx.exec_app(&format!("TRUNCATE billing.ledger {COMMENT_AI_AGENT}"))
+        .await;
+
+    let ops: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT schema_name, table_name, op FROM auditstream.changes ORDER BY id ASC",
+    )
+    .fetch_all(&mut fx.app_conn)
+    .await
+    .expect("read private-schema partitioned changes");
+    assert_eq!(
+        ops,
+        vec![
+            ("billing".into(), "ledger".into(), "INSERT".into()),
+            ("billing".into(), "ledger".into(), "UPDATE".into()),
+            ("billing".into(), "ledger".into(), "DELETE".into()),
+            ("billing".into(), "ledger".into(), "TRUNCATE".into()),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn upsert_records_inserted_as_insert_and_changed_conflict_as_update_never_both() {
     let mut fx = CaptureFixture::kit_default().await;
     let start_id = fx.seed_invoices_for_update_tests().await;
