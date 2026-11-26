@@ -9,8 +9,8 @@ auditstream verify
 ```
 
 `verify` inspects live PostgreSQL catalogs inside a `READ ONLY` transaction and compares them against `capture.tables` and `capture.exclude` in `auditstream.toml`.
-It exits `0` when clean.
-It exits `1` on missing, disabled, or outdated triggers, primary-key exclusions (`invalid_exclusion`), unsafe privileges (`unsafe_privileges`), invalid ownership (`invalid_ownership`), rows in `changes_default`, or fewer than two future monthly partitions.
+It exits `0` when no findings meet the `--fail-on` threshold (by default `--fail-on error`, so advisory warnings such as `partitioned_table` print without failing CI; pass `--fail-on warning` to fail on warnings too).
+It exits `1` on missing `auditstream_owner`, missing, disabled, or outdated triggers or functions (`resolve_actor`, `capture`, `log_event`), primary-key, renamed/dropped column, or unverified table exclusions (`invalid_exclusion`), unsafe privileges, `auditstream_owner` role attributes/memberships, or `session_replication_role` parameter grants/`replica` overrides (`unsafe_privileges`), invalid ownership (`invalid_ownership`), history tampering such as triggers, rewrite rules, Row-Level Security, or sibling function overloads (`tampered_history`), missing or detached `changes_default`, non-regular history child partitions, missing/outdated `changes_pkey` or required history indexes, rows in `changes_default`, or fewer than two future monthly partitions.
 
 Pass `--format json` for structured output:
 

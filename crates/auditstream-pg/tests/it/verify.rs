@@ -579,6 +579,7 @@ async fn reports_unsafe_privileges_and_invalid_ownership_across_history_objects(
         format!(
             "GRANT EXECUTE ON FUNCTION auditstream.log_event(text, jsonb, jsonb) TO {app_q} WITH GRANT OPTION"
         ),
+        "GRANT EXECUTE ON FUNCTION auditstream.log_event(text, jsonb, jsonb) TO PUBLIC".to_owned(),
         "ALTER SCHEMA auditstream OWNER TO CURRENT_USER".to_owned(),
         "ALTER TABLE auditstream.changes OWNER TO CURRENT_USER".to_owned(),
         "ALTER TABLE auditstream.changes_default OWNER TO CURRENT_USER".to_owned(),
@@ -666,5 +667,798 @@ async fn reports_unsafe_privileges_and_invalid_ownership_across_history_objects(
     let _ = admin
         .execute(AssertSqlSafe(format!("DROP ROLE IF EXISTS {app_q}")))
         .await;
+    let _ = admin.close().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn log_event_tampering_overloads_and_extra_proconfig_guc_are_reported() {
+    let db = TestDb::new().await.expect("create TestDb");
+    create_invoice_table(&db).await;
+    let specs = vec![invoice_spec(vec!["password_hash"])];
+    install_fixture(&db, &specs).await;
+
+    // 1. Drop and recreate log_event() without DEFAULT NULL, without SECURITY DEFINER, with STRICT,
+    //    and with a tampered body (PG rejects removing defaults via CREATE OR REPLACE).
+    db.execute_batch(
+        "DROP FUNCTION auditstream.log_event(text, jsonb, jsonb); \
+         CREATE FUNCTION auditstream.log_event( \
+           action text, \
+           target jsonb, \
+           data jsonb \
+         ) \
+         RETURNS uuid \
+         LANGUAGE plpgsql \
+         STRICT \
+         SET search_path = pg_catalog, pg_temp \
+         AS $$ BEGIN RETURN gen_random_uuid(); END $$; \
+         ALTER FUNCTION auditstream.log_event(text, jsonb, jsonb) OWNER TO auditstream_owner; \
+         REVOKE ALL ON FUNCTION auditstream.log_event(text, jsonb, jsonb) FROM PUBLIC;",
+    )
+    .await
+    .expect("tamper log_event()");
+
+    // 2. Attach unexpected extra GUCs via ALTER FUNCTION ... SET alongside search_path on all 3,
+    //    weaken resolve_actor() volatility to IMMUTABLE, install a shadowing sibling overload,
+    //    and narrow auditstream_update to UPDATE OF id (tgattr bypass).
+    db.execute_batch(
+        "ALTER FUNCTION auditstream.resolve_actor() IMMUTABLE \
+           SET auditstream.actor = '{\"type\":\"user\",\"id\":\"spoof\"}'; \
+         ALTER FUNCTION auditstream.capture() SET work_mem = '8MB'; \
+         ALTER FUNCTION auditstream.log_event(text, jsonb, jsonb) SET work_mem = '8MB'; \
+         CREATE FUNCTION auditstream.log_event(action text, target text, data text) \
+           RETURNS uuid LANGUAGE sql AS $$ SELECT gen_random_uuid() $$; \
+         CREATE OR REPLACE TRIGGER auditstream_update \
+           AFTER UPDATE OF id ON public.invoice \
+           FOR EACH ROW \
+           EXECUTE FUNCTION auditstream.capture('[\"id\"]', '[\"password_hash\"]');",
+    )
+    .await
+    .expect("apply function, overload, and tgattr tampering");
+
+    let report = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify tampered functions");
+    assert!(report.has_errors());
+
+    let log_event_outdated = report
+        .findings
+        .iter()
+        .find(|f| {
+            f.kind == FindingKind::Outdated
+                && f.object == "auditstream.log_event(text, jsonb, jsonb)"
+        })
+        .expect("expected Outdated finding for tampered log_event()");
+    for needle in [
+        "function body",
+        "SECURITY DEFINER",
+        "STRICT",
+        "default argument count",
+        "work_mem=",
+    ] {
+        assert!(
+            log_event_outdated.detail.contains(needle),
+            "missing {needle:?} in detail: {}",
+            log_event_outdated.detail
+        );
+    }
+
+    assert!(
+        report.findings.iter().any(|f| {
+            f.kind == FindingKind::Outdated
+                && f.object == "auditstream.resolve_actor()"
+                && f.detail.contains("auditstream.actor=")
+                && f.detail.contains("volatility")
+        }),
+        "expected Outdated finding for extra GUC + volatility on resolve_actor(), got: {:?}",
+        report.findings
+    );
+    assert!(
+        report.findings.iter().any(|f| {
+            f.kind == FindingKind::Outdated
+                && f.object == "auditstream.capture()"
+                && f.detail.contains("work_mem=")
+        }),
+        "expected Outdated finding for extra GUC on capture(), got: {:?}",
+        report.findings
+    );
+    assert!(
+        report.findings.iter().any(|f| {
+            f.kind == FindingKind::TamperedHistory
+                && f.object == "auditstream.log_event(action text, target text, data text)"
+        }),
+        "expected TamperedHistory finding for shadowing log_event overload, got: {:?}",
+        report.findings
+    );
+    assert!(
+        report.findings.iter().any(|f| {
+            f.kind == FindingKind::Outdated
+                && f.object == "public.invoice.auditstream_update"
+                && f.detail.contains("UPDATE OF column filter")
+        }),
+        "expected Outdated finding for UPDATE OF tgattr filter, got: {:?}",
+        report.findings
+    );
+
+    // 3. Remove the rogue overload and re-apply DDL + triggers -> completely clean.
+    db.execute("DROP FUNCTION auditstream.log_event(text, text, text)")
+        .await
+        .expect("drop rogue overload");
+    install_fixture(&db, &specs).await;
+    let healed = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify healed functions");
+    assert!(
+        healed.is_clean(),
+        "expected clean report after healing functions, got: {:?}",
+        healed.findings
+    );
+}
+
+#[tokio::test]
+async fn excluded_column_rename_or_drop_is_reported_as_invalid_exclusion() {
+    let db = TestDb::new().await.expect("create TestDb");
+    create_invoice_table(&db).await;
+    let specs = vec![invoice_spec(vec!["password_hash"])];
+    install_fixture(&db, &specs).await;
+
+    // 1. Rename excluded column on the live table without updating config or triggers.
+    db.execute("ALTER TABLE public.invoice RENAME COLUMN password_hash TO secret_hash")
+        .await
+        .expect("rename password_hash");
+
+    let stale_report = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify renamed excluded column");
+    assert!(stale_report.has_errors());
+    assert!(
+        stale_report.findings.iter().any(|f| {
+            f.kind == FindingKind::InvalidExclusion
+                && f.object == "public.invoice"
+                && f.detail.contains("password_hash")
+                && f.detail.contains("do not exist")
+        }),
+        "expected config-level InvalidExclusion for renamed column, got: {:?}",
+        stale_report.findings
+    );
+    assert!(
+        stale_report.findings.iter().any(|f| {
+            f.kind == FindingKind::InvalidExclusion
+                && f.object == "public.invoice.auditstream_update"
+                && f.detail.contains("password_hash")
+                && f.detail.contains("non-existent")
+        }),
+        "expected live-trigger InvalidExclusion for renamed column, got: {:?}",
+        stale_report.findings
+    );
+
+    // 2. Even after updating config to `secret_hash`, stale live triggers still fail InvalidExclusion.
+    let updated_specs = vec![invoice_spec(vec!["secret_hash"])];
+    let live_only_report = verify::check(db.pool(), &updated_specs)
+        .await
+        .expect("verify live trigger drift after config update");
+    assert!(live_only_report.has_errors());
+    assert!(
+        !live_only_report
+            .findings
+            .iter()
+            .any(|f| f.kind == FindingKind::InvalidExclusion && f.object == "public.invoice"),
+        "valid updated config must not report table-level InvalidExclusion: {:?}",
+        live_only_report.findings
+    );
+    assert!(
+        live_only_report.findings.iter().any(|f| {
+            f.kind == FindingKind::InvalidExclusion
+                && f.object == "public.invoice.auditstream_insert"
+                && f.detail.contains("password_hash")
+        }),
+        "expected live-trigger InvalidExclusion for stale trigger exclusion, got: {:?}",
+        live_only_report.findings
+    );
+
+    // 3. Re-installing triggers heals rename drift; dropping an excluded column fails again.
+    install_fixture(&db, &updated_specs).await;
+    let clean = verify::check(db.pool(), &updated_specs)
+        .await
+        .expect("verify healed rename");
+    assert!(clean.is_clean(), "got: {:?}", clean.findings);
+
+    db.execute("ALTER TABLE public.invoice DROP COLUMN secret_hash")
+        .await
+        .expect("drop secret_hash");
+    let dropped_report = verify::check(db.pool(), &updated_specs)
+        .await
+        .expect("verify dropped excluded column");
+    assert!(
+        dropped_report.findings.iter().any(|f| {
+            f.kind == FindingKind::InvalidExclusion
+                && f.object == "public.invoice"
+                && f.detail.contains("secret_hash")
+        }),
+        "expected InvalidExclusion for dropped column, got: {:?}",
+        dropped_report.findings
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn detached_or_missing_default_partition_and_broken_history_indexes_are_reported() {
+    let db = TestDb::new().await.expect("create TestDb");
+    create_invoice_table(&db).await;
+    let specs = vec![invoice_spec(vec!["password_hash"])];
+    install_fixture(&db, &specs).await;
+
+    // 1. Detach changes_default (leaves a standalone table named `changes_default`).
+    db.execute("ALTER TABLE auditstream.changes DETACH PARTITION auditstream.changes_default")
+        .await
+        .expect("detach changes_default");
+    let detached = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify detached default partition");
+    assert!(detached.has_errors());
+    assert!(detached.default_partition.is_none());
+    assert!(
+        detached.findings.iter().any(|f| {
+            f.kind == FindingKind::Missing
+                && f.object == "auditstream.changes_default"
+                && f.detail.contains("unattached")
+        }),
+        "expected Missing finding for detached changes_default, got: {:?}",
+        detached.findings
+    );
+
+    // 2. Drop standalone changes_default completely -> Missing.
+    db.execute("DROP TABLE auditstream.changes_default")
+        .await
+        .expect("drop standalone changes_default");
+    let dropped = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify dropped default partition");
+    assert!(
+        dropped.findings.iter().any(|f| {
+            f.kind == FindingKind::Missing
+                && f.object == "auditstream.changes_default"
+                && f.detail.contains("missing")
+        }),
+        "expected Missing finding for dropped changes_default, got: {:?}",
+        dropped.findings
+    );
+
+    // 3. Attach a DEFAULT partition with a non-canonical name -> Outdated + still inspects rows.
+    db.execute_batch(
+        "CREATE TABLE auditstream.changes_fallback PARTITION OF auditstream.changes DEFAULT; \
+         ALTER TABLE auditstream.changes_fallback OWNER TO auditstream_owner; \
+         INSERT INTO auditstream.changes (occurred_at, source, op, db_user, schema_version) \
+         VALUES ('2020-01-15T10:00:00.000000Z'::timestamptz, 'app', 'fallback.row', 'postgres', 1);",
+    )
+    .await
+    .expect("create renamed default partition with row");
+    let renamed = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify renamed default partition");
+    assert!(
+        renamed.findings.iter().any(|f| {
+            f.kind == FindingKind::Outdated
+                && f.object == "auditstream.changes_default"
+                && f.detail.contains("changes_fallback")
+        }),
+        "expected Outdated finding for renamed DEFAULT partition, got: {:?}",
+        renamed.findings
+    );
+    assert!(
+        renamed.findings.iter().any(|f| {
+            f.kind == FindingKind::DefaultPartitionRows
+                && f.object == "auditstream.changes_fallback"
+        }),
+        "expected DefaultPartitionRows on renamed DEFAULT partition, got: {:?}",
+        renamed.findings
+    );
+    assert_eq!(
+        renamed.default_partition.as_ref().map(|d| d.row_count),
+        Some(1)
+    );
+    db.execute("DROP TABLE auditstream.changes_fallback")
+        .await
+        .expect("drop renamed default partition");
+
+    // 3b. Sub-partitioned changes_default (`relkind = 'p'`) reports Outdated relkind AND counts
+    //     rows via constant leaf OIDs.
+    db.execute_batch(
+        "CREATE TABLE auditstream.changes_default PARTITION OF auditstream.changes DEFAULT \
+           PARTITION BY RANGE (occurred_at); \
+         CREATE TABLE auditstream.changes_default_leaf PARTITION OF auditstream.changes_default \
+           DEFAULT; \
+         ALTER TABLE auditstream.changes_default OWNER TO auditstream_owner; \
+         ALTER TABLE auditstream.changes_default_leaf OWNER TO auditstream_owner; \
+         INSERT INTO auditstream.changes (occurred_at, source, op, db_user, schema_version) \
+         VALUES ('2020-03-10T12:00:00.000000Z'::timestamptz, 'app', 'sub.row', 'postgres', 1);",
+    )
+    .await
+    .expect("create sub-partitioned changes_default");
+    let sub_part = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify sub-partitioned changes_default");
+    assert!(
+        sub_part.findings.iter().any(|f| {
+            f.kind == FindingKind::Outdated
+                && f.object == "auditstream.changes_default"
+                && f.detail.contains("relkind 'p'")
+        }),
+        "expected Outdated relkind finding for sub-partitioned changes_default, got: {:?}",
+        sub_part.findings
+    );
+    assert_eq!(
+        sub_part.default_partition.as_ref().map(|d| d.row_count),
+        Some(1)
+    );
+    assert!(
+        sub_part.findings.iter().any(|f| {
+            f.kind == FindingKind::DefaultPartitionRows && f.object == "auditstream.changes_default"
+        }),
+        "expected DefaultPartitionRows for sub-partitioned changes_default, got: {:?}",
+        sub_part.findings
+    );
+    db.execute("DROP TABLE auditstream.changes_default CASCADE")
+        .await
+        .expect("drop sub-partitioned changes_default");
+
+    // 4. Break all three required history indexes:
+    //    - Drop changes_occurred_at_brin_idx -> Missing
+    //    - Recreate changes_xact_id_idx with DESC ordering + INCLUDE column -> Outdated
+    //    - Recreate changes_lookup_idx with wrong AM and missing predicate -> Outdated
+    db.execute("DROP INDEX auditstream.changes_occurred_at_brin_idx")
+        .await
+        .expect("drop brin idx");
+    db.execute_batch(
+        "DROP INDEX auditstream.changes_xact_id_idx; \
+         CREATE INDEX changes_xact_id_idx ON auditstream.changes (xact_id DESC, id) INCLUDE (op);",
+    )
+    .await
+    .expect("alter xact_id idx");
+    db.execute_batch(
+        "DROP INDEX auditstream.changes_lookup_idx; \
+         CREATE INDEX changes_lookup_idx ON auditstream.changes USING btree (record_id);",
+    )
+    .await
+    .expect("alter lookup idx");
+
+    let idx_report = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify broken indexes");
+    assert!(
+        idx_report.findings.iter().any(|f| {
+            f.kind == FindingKind::Missing && f.object == "auditstream.changes_occurred_at_brin_idx"
+        }),
+        "expected Missing brin index, got: {:?}",
+        idx_report.findings
+    );
+    assert!(
+        idx_report.findings.iter().any(|f| {
+            f.kind == FindingKind::Outdated
+                && f.object == "auditstream.changes_xact_id_idx"
+                && f.detail.contains("INCLUDE")
+                && f.detail.contains("sort/nulls")
+        }),
+        "expected Outdated xact_id index for INCLUDE + DESC, got: {:?}",
+        idx_report.findings
+    );
+    assert!(
+        idx_report.findings.iter().any(|f| {
+            f.kind == FindingKind::Outdated
+                && f.object == "auditstream.changes_lookup_idx"
+                && f.detail.contains("access method")
+                && f.detail.contains("predicate")
+        }),
+        "expected Outdated lookup index, got: {:?}",
+        idx_report.findings
+    );
+
+    // 5. Partitioned index created ON ONLY (indisvalid = false) -> Outdated, and dropping
+    //    `changes_pkey` -> Missing.
+    db.execute_batch(
+        "CREATE INDEX changes_occurred_at_brin_idx ON ONLY auditstream.changes USING brin (occurred_at); \
+         ALTER TABLE auditstream.changes DROP CONSTRAINT changes_pkey;",
+    )
+    .await
+    .expect("create invalid ON ONLY index and drop changes_pkey");
+    let invalid_idx_report = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify invalid ON ONLY index and missing PK");
+    assert!(
+        invalid_idx_report.findings.iter().any(|f| {
+            f.kind == FindingKind::Outdated
+                && f.object == "auditstream.changes_occurred_at_brin_idx"
+                && f.detail.contains("invalid")
+        }),
+        "expected Outdated invalid index finding, got: {:?}",
+        invalid_idx_report.findings
+    );
+    assert!(
+        invalid_idx_report
+            .findings
+            .iter()
+            .any(|f| { f.kind == FindingKind::Missing && f.object == "auditstream.changes_pkey" }),
+        "expected Missing changes_pkey finding, got: {:?}",
+        invalid_idx_report.findings
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn history_tampering_triggers_fk_rules_and_rls_on_parent_and_child_partitions_are_reported() {
+    let db = TestDb::new().await.expect("create TestDb");
+    create_invoice_table(&db).await;
+    let specs = vec![invoice_spec(vec!["password_hash"])];
+    install_fixture(&db, &specs).await;
+
+    // 1. Stealth BEFORE INSERT triggers on both parent `changes` and child `changes_default`,
+    //    plus an internal RI trigger via FOREIGN KEY ... ON DELETE CASCADE on `changes`.
+    db.execute_batch(
+        "CREATE FUNCTION public.drop_audit_rows() RETURNS trigger LANGUAGE plpgsql \
+         AS $$ BEGIN RETURN NULL; END $$; \
+         CREATE TRIGGER stealth_parent_drop BEFORE INSERT ON auditstream.changes \
+         FOR EACH ROW EXECUTE FUNCTION public.drop_audit_rows(); \
+         CREATE TRIGGER stealth_child_drop BEFORE INSERT ON auditstream.changes_default \
+         FOR EACH ROW EXECUTE FUNCTION public.drop_audit_rows(); \
+         CREATE TABLE public.kill_switch (op text PRIMARY KEY); \
+         ALTER TABLE auditstream.changes \
+           ADD CONSTRAINT fk_kill_switch FOREIGN KEY (op) REFERENCES public.kill_switch(op) ON DELETE CASCADE;",
+    )
+    .await
+    .expect("install stealth triggers and FK on history");
+
+    // 2. Stealth rewrite rules on both parent `changes` and child `changes_default`.
+    db.execute_batch(
+        "CREATE RULE stealth_parent_rule AS ON INSERT TO auditstream.changes DO INSTEAD NOTHING; \
+         CREATE RULE stealth_child_rule AS ON DELETE TO auditstream.changes_default DO INSTEAD NOTHING;",
+    )
+    .await
+    .expect("install stealth rewrite rules");
+
+    // 3. Unexpected RLS flags/policy on parent `changes` and child `changes_default`.
+    db.execute_batch(
+        "ALTER TABLE auditstream.changes ENABLE ROW LEVEL SECURITY; \
+         ALTER TABLE auditstream.changes FORCE ROW LEVEL SECURITY; \
+         CREATE POLICY stealth_child_pol ON auditstream.changes_default FOR ALL USING (false);",
+    )
+    .await
+    .expect("enable unexpected RLS on history");
+
+    let report = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify tampered history");
+    assert!(report.has_errors());
+    assert!(
+        report.default_partition.is_none(),
+        "default_partition row count must be skipped when unexpected RLS is active"
+    );
+
+    let parent_trig_matches = report
+        .findings
+        .iter()
+        .filter(|f| {
+            f.kind == FindingKind::TamperedHistory && f.detail.contains("stealth_parent_drop")
+        })
+        .count();
+    assert_eq!(
+        parent_trig_matches, 1,
+        "parent trigger must be reported once (not duplicated per child clone): {:?}",
+        report.findings
+    );
+    assert!(
+        report.findings.iter().any(|f| {
+            f.kind == FindingKind::TamperedHistory
+                && f.object
+                    .starts_with("auditstream.changes.RI_ConstraintTrigger_")
+        }),
+        "expected TamperedHistory finding for FK internal RI trigger, got: {:?}",
+        report.findings
+    );
+
+    for (object, needle) in [
+        (
+            "auditstream.changes.stealth_parent_drop",
+            "unexpected trigger",
+        ),
+        (
+            "auditstream.changes_default.stealth_child_drop",
+            "unexpected trigger",
+        ),
+        (
+            "auditstream.changes.stealth_parent_rule",
+            "unexpected rewrite rule",
+        ),
+        (
+            "auditstream.changes_default.stealth_child_rule",
+            "unexpected rewrite rule",
+        ),
+        ("auditstream.changes", "FORCE ROW LEVEL SECURITY"),
+        ("auditstream.changes_default", "1 RLS policy/policies"),
+    ] {
+        assert!(
+            report.findings.iter().any(|f| {
+                f.kind == FindingKind::TamperedHistory
+                    && f.severity == Severity::Error
+                    && f.object == object
+                    && f.detail.contains(needle)
+            }),
+            "expected TamperedHistory for {object} containing {needle:?}, got: {:?}",
+            report.findings
+        );
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn owner_role_and_session_replication_role_security_checks_detect_cluster_tampering() {
+    let _lock = TestDb::cluster_lock().await.expect("acquire cluster lock");
+    let db = TestDb::new().await.expect("create TestDb");
+    create_invoice_table(&db).await;
+    let specs = vec![invoice_spec(vec!["password_hash"])];
+    let statements =
+        migrations::install_statements(&DdlOptions::new(DEFAULT_SCHEMA, vec![]), &specs)
+            .expect("compose install statements");
+    db.execute_statements(&statements)
+        .await
+        .expect("install capture DDL/triggers");
+
+    // Apply cluster-wide mutations inside an uncommitted transaction using two distinct short
+    // role names (< 63 bytes to avoid NAMEDATALEN truncation and circular membership SQLSTATE 0LP01),
+    // verify inside the same transaction, and roll back atomically.
+    let member_role = format!("vt_mem_{}", db.database_name());
+    let parent_role = format!("vt_par_{}", db.database_name());
+    let member_q = auditstream_pg::ddl::quote_ident(&member_role);
+    let parent_q = auditstream_pg::ddl::quote_ident(&parent_role);
+    let mut tx = db.pool().begin().await.expect("begin tamper tx");
+    for stmt in [
+        format!("CREATE ROLE {member_q} NOLOGIN"),
+        format!("CREATE ROLE {parent_q} NOLOGIN"),
+        "ALTER ROLE auditstream_owner LOGIN SUPERUSER CREATEROLE CREATEDB REPLICATION BYPASSRLS"
+            .to_owned(),
+        format!("GRANT auditstream_owner TO {member_q}"),
+        format!("GRANT {parent_q} TO auditstream_owner"),
+        format!(
+            "GRANT SET, ALTER SYSTEM ON PARAMETER session_replication_role TO {member_q} WITH GRANT OPTION"
+        ),
+        "GRANT SET ON PARAMETER session_replication_role TO PUBLIC".to_owned(),
+        "SET LOCAL session_replication_role = 'replica'".to_owned(),
+        format!("ALTER ROLE {member_q} SET session_replication_role = 'replica'"),
+    ] {
+        tx.execute(AssertSqlSafe(stmt))
+            .await
+            .expect("apply uncommitted cluster tamper");
+    }
+
+    let report = verify::check_in_transaction(
+        &mut tx,
+        &verify::VerifyOptions::new(DEFAULT_SCHEMA, specs.clone()),
+    )
+    .await
+    .expect("verify inside uncommitted tamper tx");
+    tx.rollback().await.expect("rollback cluster tamper");
+
+    assert!(report.has_errors());
+    assert!(
+        report.findings.iter().any(|f| {
+            f.kind == FindingKind::UnsafePrivileges
+                && f.object == "auditstream_owner"
+                && f.detail.contains("LOGIN")
+                && f.detail.contains("SUPERUSER")
+                && f.detail.contains("CREATEROLE")
+                && f.detail.contains("BYPASSRLS")
+        }),
+        "expected unsafe role attribute finding, got: {:?}",
+        report.findings
+    );
+    assert!(
+        report.findings.iter().any(|f| {
+            f.kind == FindingKind::UnsafePrivileges
+                && f.object == "auditstream_owner"
+                && f.detail.contains("unsafe role membership")
+                && f.detail.contains(&member_role)
+        }),
+        "expected unsafe role membership finding, got: {:?}",
+        report.findings
+    );
+    assert!(
+        report.findings.iter().any(|f| {
+            f.kind == FindingKind::UnsafePrivileges
+                && f.object == "auditstream_owner"
+                && f.detail.contains("unexpectedly a member of role")
+                && f.detail.contains(&parent_role)
+        }),
+        "expected unexpected granted role finding, got: {:?}",
+        report.findings
+    );
+    assert!(
+        report.findings.iter().any(|f| {
+            f.kind == FindingKind::UnsafePrivileges
+                && f.object == "session_replication_role"
+                && f.detail.contains("PUBLIC (SET)")
+                && f.detail
+                    .contains(&format!("{member_role} (ALTER SYSTEM WITH GRANT OPTION)"))
+                && f.detail
+                    .contains(&format!("{member_role} (SET WITH GRANT OPTION)"))
+        }),
+        "expected session_replication_role parameter ACL finding, got: {:?}",
+        report.findings
+    );
+    assert!(
+        report.findings.iter().any(|f| {
+            f.kind == FindingKind::UnsafePrivileges
+                && f.object == "session_replication_role"
+                && f.detail
+                    .contains("active session `session_replication_role` is `replica`")
+        }),
+        "expected active session_replication_role finding, got: {:?}",
+        report.findings
+    );
+    assert!(
+        report.findings.iter().any(|f| {
+            f.kind == FindingKind::UnsafePrivileges
+                && f.object == "session_replication_role"
+                && f.detail.contains("database/role default setting")
+                && f.detail.contains(&member_role)
+        }),
+        "expected pg_db_role_setting session_replication_role finding, got: {:?}",
+        report.findings
+    );
+
+    // Confirm rollback left cluster clean.
+    let clean = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify clean after rollback");
+    assert!(
+        clean.is_clean(),
+        "expected clean after rollback, got: {:?}",
+        clean.findings
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn non_superuser_install_passes_verify() {
+    use auditstream_pg::ddl::quote_ident;
+    use sqlx::Connection;
+
+    let _lock = TestDb::cluster_lock().await.expect("acquire cluster lock");
+    let db = TestDb::non_superuser()
+        .await
+        .expect("create non-superuser TestDb");
+    let admin_url = db.admin_url().to_owned();
+    let app_role = format!("ns_app_{}", db.database_name());
+    let app_pw = uuid::Uuid::new_v4().simple().to_string();
+    let app_q = quote_ident(&app_role);
+
+    // 1. Drop pre-existing `auditstream_owner` and confirm missing owner role is reported before
+    //    install, while also preparing a least-privilege app role for post-install verification.
+    let (without_query, query) = match admin_url.split_once('?') {
+        Some((before, q)) => (before, Some(q)),
+        None => (admin_url.as_str(), None),
+    };
+    let (prefix, _) = without_query
+        .rsplit_once('/')
+        .expect("admin_url has db suffix");
+    let super_db_url = match query {
+        Some(q) => format!("{prefix}/{}?{q}", db.database_name()),
+        None => format!("{prefix}/{}", db.database_name()),
+    };
+    let super_pool = auditstream_pg::connect(&super_db_url)
+        .await
+        .expect("connect superuser to test db");
+    super_pool
+        .execute("DROP ROLE IF EXISTS auditstream_owner")
+        .await
+        .expect("drop pre-existing auditstream_owner");
+    super_pool
+        .execute(AssertSqlSafe(format!(
+            "CREATE ROLE {app_q} LOGIN PASSWORD '{app_pw}' NOSUPERUSER NOCREATEDB NOCREATEROLE"
+        )))
+        .await
+        .expect("create app_role");
+
+    let missing_report = verify::check(&super_pool, &[])
+        .await
+        .expect("verify missing auditstream_owner");
+    assert!(
+        missing_report.findings.iter().any(|f| {
+            f.kind == FindingKind::Missing
+                && f.severity == Severity::Error
+                && f.object == "auditstream_owner"
+        }),
+        "expected Missing finding for absent auditstream_owner, got: {:?}",
+        missing_report.findings
+    );
+
+    // 2. Non-superuser CREATEROLE migrator installs DDL + triggers (creating `auditstream_owner`
+    //    with its mandatory PG 16+ ADMIN-only row in `pg_auth_members`) and grants read access to
+    //    `app_role`.
+    create_invoice_table(&db).await;
+    let specs = vec![invoice_spec(vec!["password_hash"])];
+    let statements = migrations::install_statements(
+        &DdlOptions::new(DEFAULT_SCHEMA, vec![app_role.clone()]),
+        &specs,
+    )
+    .expect("compose install statements");
+    db.execute_statements(&statements)
+        .await
+        .expect("non-superuser install");
+
+    // 3. Both least-privilege `app_role` and superuser see a completely clean verify report on
+    //    PG 15-19.
+    let base = db.url();
+    let (scheme, rest) = base.split_once("://").expect("valid postgres URL");
+    let (_, host_and_db) = rest.split_once('@').expect("URL has credentials");
+    let app_url = format!("{scheme}://{app_role}:{app_pw}@{host_and_db}");
+    let app_pool = auditstream_pg::connect(&app_url)
+        .await
+        .expect("connect app_pool");
+    let app_report = verify::check(&app_pool, &specs)
+        .await
+        .expect("verify non-superuser install as app_role");
+    assert!(
+        app_report.is_clean(),
+        "expected clean verify as app_role on PG 15-19 non-superuser install, got: {:?}",
+        app_report.findings
+    );
+    app_pool.close().await;
+
+    let super_report = verify::check(&super_pool, &specs)
+        .await
+        .expect("verify non-superuser install as superuser");
+    assert!(
+        super_report.is_clean(),
+        "expected clean verify as superuser on PG 15-19 non-superuser install, got: {:?}",
+        super_report.findings
+    );
+
+    // 4. On PG 16+, verify that granting the CREATEROLE migrator to `app_role` via either
+    //    INHERIT or ADMIN-only (indirect ADMIN escalation to `auditstream_owner`) is caught inside
+    //    an uncommitted transaction.
+    let pg_version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+        .fetch_one(&super_pool)
+        .await
+        .expect("read server_version_num");
+    if pg_version >= 160_000 {
+        let migrator_q = quote_ident(db.role_name().expect("non-superuser role name"));
+        for grant_opts in [
+            "WITH INHERIT TRUE, SET FALSE",
+            "WITH ADMIN TRUE, INHERIT FALSE, SET FALSE",
+        ] {
+            let mut tx = super_pool.begin().await.expect("begin pg16 indirect tx");
+            tx.execute(AssertSqlSafe(format!(
+                "GRANT {migrator_q} TO {app_q} {grant_opts}"
+            )))
+            .await
+            .expect("grant migrator to app_role");
+            let indirect_report = verify::check_in_transaction(
+                &mut tx,
+                &verify::VerifyOptions::new(DEFAULT_SCHEMA, specs.clone()),
+            )
+            .await
+            .expect("verify indirect ADMIN escalation");
+            tx.rollback().await.expect("rollback indirect tx");
+            assert!(
+                indirect_report.findings.iter().any(|f| {
+                    f.kind == FindingKind::UnsafePrivileges
+                        && f.object == "auditstream_owner"
+                        && f.detail.contains("indirect ADMIN")
+                        && f.detail.contains(&app_role)
+                }),
+                "expected indirect ADMIN UnsafePrivileges finding for `{grant_opts}` on PG 16+, got: {:?}",
+                indirect_report.findings
+            );
+        }
+    }
+
+    super_pool.close().await;
+    drop(db);
+    let mut admin = sqlx::postgres::PgConnection::connect(&admin_url)
+        .await
+        .expect("admin cleanup");
+    let _ = admin
+        .execute(AssertSqlSafe(format!("DROP ROLE IF EXISTS {app_q}")))
+        .await;
+    let _ = admin.execute("DROP ROLE IF EXISTS auditstream_owner").await;
     let _ = admin.close().await;
 }

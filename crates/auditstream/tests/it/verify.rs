@@ -478,6 +478,323 @@ async fn verify_reports_invalid_exclusion_when_config_excludes_primary_key() {
     );
 }
 
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn partitioned_table_warning_exits_0_by_default_and_1_with_fail_on_warning() {
+    let db = TestDb::new().await.expect("create TestDb");
+    db.execute(
+        "CREATE TABLE public.orders ( \
+           id int NOT NULL, \
+           created_year int NOT NULL, \
+           total numeric NOT NULL, \
+           PRIMARY KEY (id, created_year) \
+         ) PARTITION BY RANGE (created_year)",
+    )
+    .await
+    .expect("create partitioned orders");
+    db.execute(
+        "CREATE TABLE public.orders_2026 PARTITION OF public.orders \
+         FOR VALUES FROM (2026) TO (2027)",
+    )
+    .await
+    .expect("create orders_2026");
+
+    install_capture(
+        &db,
+        &[TableTriggerSpec::new(
+            "public",
+            "orders",
+            vec!["id".to_owned(), "created_year".to_owned()],
+            vec![],
+        )
+        .partitioned()],
+    )
+    .await;
+
+    let dir = tempdir().expect("tempdir");
+    fs::write(
+        dir.path().join("auditstream.toml"),
+        "[capture]\ntables = [\"public.orders\"]\n",
+    )
+    .expect("write auditstream.toml");
+
+    // 1. Default `--fail-on error` prints the warning and exits 0.
+    let text_ok = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["verify"])
+        .output()
+        .expect("run verify default on partitioned table");
+    assert!(
+        text_ok.status.success(),
+        "warning-only verify must exit 0 by default; stderr: {}",
+        String::from_utf8_lossy(&text_ok.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&text_ok.stderr), "");
+    let text_stdout = String::from_utf8_lossy(&text_ok.stdout);
+    assert!(text_stdout.contains("[warning]"), "stdout: {text_stdout}");
+    assert!(
+        text_stdout.contains("partitioned_table"),
+        "stdout: {text_stdout}"
+    );
+
+    // 2. Default JSON reports `"ok": true` while preserving the warning finding.
+    let json_ok = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["verify", "--format", "json"])
+        .output()
+        .expect("run verify json on partitioned table");
+    assert!(json_ok.status.success());
+    let parsed_ok: serde_json::Value =
+        serde_json::from_slice(&json_ok.stdout).expect("parse json_ok");
+    assert_eq!(parsed_ok["ok"], true);
+    let findings_ok = parsed_ok["findings"].as_array().expect("findings array");
+    assert_eq!(findings_ok.len(), 1);
+    assert_eq!(findings_ok[0]["severity"], "warning");
+    assert_eq!(findings_ok[0]["kind"], "partitioned_table");
+
+    // 3. Strict `--fail-on warning` exits 1 and sets `"ok": false`.
+    let strict_out = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["verify", "--fail-on", "warning", "--format", "json"])
+        .output()
+        .expect("run verify --fail-on warning");
+    assert_eq!(strict_out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&strict_out.stderr)
+            .contains("verification failed with 1 finding(s)"),
+        "stderr: {}",
+        String::from_utf8_lossy(&strict_out.stderr)
+    );
+    let parsed_strict: serde_json::Value =
+        serde_json::from_slice(&strict_out.stdout).expect("parse json_strict");
+    assert_eq!(parsed_strict["ok"], false);
+
+    // 4. Mixed error + warning: errors sort first; `--fail-on error` reports 1 failing finding
+    //    while `--fail-on warning` reports 2 failing findings.
+    db.execute("ALTER TABLE public.orders DISABLE TRIGGER auditstream_insert")
+        .await
+        .expect("disable orders insert trigger");
+    let mixed_err = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["verify", "--fail-on", "error", "--format", "json"])
+        .output()
+        .expect("run verify mixed --fail-on error");
+    assert_eq!(mixed_err.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&mixed_err.stderr)
+            .contains("verification failed with 1 finding(s)"),
+        "stderr: {}",
+        String::from_utf8_lossy(&mixed_err.stderr)
+    );
+    let parsed_mixed: serde_json::Value =
+        serde_json::from_slice(&mixed_err.stdout).expect("parse mixed json");
+    let mixed_findings = parsed_mixed["findings"].as_array().expect("findings array");
+    assert_eq!(mixed_findings.len(), 2);
+    assert_eq!(mixed_findings[0]["severity"], "error");
+    assert_eq!(mixed_findings[1]["severity"], "warning");
+
+    let mixed_warn = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["verify", "--fail-on", "warning"])
+        .output()
+        .expect("run verify mixed --fail-on warning");
+    assert_eq!(mixed_warn.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&mixed_warn.stderr)
+            .contains("verification failed with 2 finding(s)"),
+        "stderr: {}",
+        String::from_utf8_lossy(&mixed_warn.stderr)
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn verify_cli_reports_tampered_history_renamed_exclude_and_missing_default_and_index() {
+    let db = TestDb::new().await.expect("create TestDb");
+    create_invoice_table(&db).await;
+    install_capture(
+        &db,
+        &[TableTriggerSpec::new(
+            "public",
+            "invoice",
+            vec!["id".to_owned()],
+            vec!["password_hash".to_owned()],
+        )],
+    )
+    .await;
+
+    db.execute("ALTER TABLE public.invoice RENAME COLUMN password_hash TO secret_hash")
+        .await
+        .expect("rename excluded column");
+    db.execute("ALTER FUNCTION auditstream.log_event(text, jsonb, jsonb) SET work_mem = '8MB'")
+        .await
+        .expect("tamper log_event proconfig");
+    db.execute("ALTER TABLE auditstream.changes DETACH PARTITION auditstream.changes_default")
+        .await
+        .expect("detach changes_default");
+    db.execute("DROP INDEX auditstream.changes_lookup_idx")
+        .await
+        .expect("drop changes_lookup_idx");
+    db.execute("ALTER TABLE auditstream.changes ENABLE ROW LEVEL SECURITY")
+        .await
+        .expect("enable unexpected RLS");
+
+    let dir = tempdir().expect("tempdir");
+    fs::write(
+        dir.path().join("auditstream.toml"),
+        "[capture]\ntables = [\"public.invoice\"]\nexclude = [\"public.invoice.password_hash\", \"public.typo_table.secret\"]\n",
+    )
+    .expect("write auditstream.toml with renamed and unmatched excludes");
+
+    let out = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["verify", "--format", "json"])
+        .output()
+        .expect("run verify json");
+    assert_eq!(out.status.code(), Some(1));
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse verify json");
+    assert_eq!(parsed["ok"], false);
+    let findings = parsed["findings"].as_array().expect("findings array");
+
+    for (kind, object) in [
+        ("invalid_exclusion", "public.invoice"),
+        ("invalid_exclusion", "public.typo_table"),
+        ("outdated", "auditstream.log_event(text, jsonb, jsonb)"),
+        ("missing", "auditstream.changes_default"),
+        ("missing", "auditstream.changes_lookup_idx"),
+        ("tampered_history", "auditstream.changes"),
+    ] {
+        assert!(
+            findings
+                .iter()
+                .any(|f| f["kind"] == kind && f["object"] == object && f["severity"] == "error"),
+            "expected ({kind}, {object}) error finding, got: {parsed}"
+        );
+    }
+
+    // Without `capture.tables`, renamed live trigger exclusions and unmatched `capture.exclude`
+    // entries are still flagged as `invalid_exclusion`.
+    fs::write(
+        dir.path().join("auditstream.toml"),
+        "[capture]\nexclude = [\"public.typo_table.secret\"]\n",
+    )
+    .expect("write exclude-only auditstream.toml");
+    let out_omitted = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["verify", "--format", "json"])
+        .output()
+        .expect("run verify json without capture.tables");
+    assert_eq!(out_omitted.status.code(), Some(1));
+    let parsed_omitted: serde_json::Value =
+        serde_json::from_slice(&out_omitted.stdout).expect("parse omitted json");
+    let omitted_findings = parsed_omitted["findings"]
+        .as_array()
+        .expect("findings array");
+    assert!(
+        omitted_findings
+            .iter()
+            .any(|f| f["kind"] == "invalid_exclusion" && f["object"] == "public.typo_table"),
+        "expected unmatched exclude invalid_exclusion without capture.tables, got: {parsed_omitted}"
+    );
+    assert!(
+        omitted_findings
+            .iter()
+            .any(|f| f["kind"] == "invalid_exclusion"
+                && f["object"] == "public.invoice.auditstream_update"),
+        "expected live-trigger renamed exclude invalid_exclusion without capture.tables, got: {parsed_omitted}"
+    );
+}
+
+#[tokio::test]
+async fn verify_cli_reports_hostile_rls_policy_with_attached_default_partition_without_crashing() {
+    use auditstream_pg::ddl::quote_ident;
+
+    let db = TestDb::new().await.expect("create TestDb");
+    create_invoice_table(&db).await;
+
+    let app_role = format!("rls_app_{}", db.database_name());
+    let app_pw = uuid::Uuid::new_v4().simple().to_string();
+    let app_q = quote_ident(&app_role);
+    db.execute(&format!(
+        "CREATE ROLE {app_q} LOGIN PASSWORD '{app_pw}' NOSUPERUSER NOCREATEDB NOCREATEROLE"
+    ))
+    .await
+    .expect("create non-superuser app_role");
+
+    {
+        let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+        let all = migrations::install_statements(
+            &DdlOptions::new(DEFAULT_SCHEMA, vec![app_role.clone()]),
+            &[TableTriggerSpec::new(
+                "public",
+                "invoice",
+                vec!["id".to_owned()],
+                vec!["password_hash".to_owned()],
+            )],
+        )
+        .expect("compose D2+D3 install statements");
+        db.execute_statements(&all).await.expect("install D2+D3");
+    }
+
+    // Seed a row in `changes_default` (so PostgreSQL would evaluate the SELECT RLS policy if any
+    // query touched `auditstream.changes`), then install a hostile `1 / 0 = 1` RLS policy while
+    // keeping `changes_default` attached. Running `auditstream verify` as non-superuser `app_role`
+    // must exit 1 with `tampered_history`, never exit 3 (`division by zero`).
+    db.execute_batch(
+        "INSERT INTO auditstream.changes (occurred_at, source, op, db_user, schema_version) \
+           VALUES ('2020-01-15T10:00:00.000000Z'::timestamptz, 'app', 'rls.seed', 'postgres', 1); \
+         ALTER TABLE auditstream.changes ENABLE ROW LEVEL SECURITY; \
+         ALTER TABLE auditstream.changes FORCE ROW LEVEL SECURITY; \
+         CREATE POLICY rls_trap ON auditstream.changes FOR SELECT USING (1 / 0 = 1);",
+    )
+    .await
+    .expect("seed default row and install hostile RLS policy");
+
+    let base = db.url();
+    let (scheme, rest) = base.split_once("://").expect("valid postgres URL");
+    let (_, host_and_db) = rest.split_once('@').expect("URL has credentials");
+    let app_url = format!("{scheme}://{app_role}:{app_pw}@{host_and_db}");
+
+    let dir = tempdir().expect("tempdir");
+    write_invoice_config(dir.path());
+
+    let out = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", &app_url)
+        .args(["verify", "--format", "json"])
+        .output()
+        .expect("run verify json with hostile RLS as app_role");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "expected CheckFailed (1), not Database (3); stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse verify json");
+    assert_eq!(parsed["ok"], false);
+    assert!(
+        parsed["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .any(|f| f["kind"] == "tampered_history" && f["object"] == "auditstream.changes"),
+        "expected tampered_history finding on auditstream.changes, got: {parsed}"
+    );
+
+    db.execute_batch(&format!(
+        "DROP SCHEMA auditstream CASCADE; DROP ROLE IF EXISTS {app_q};"
+    ))
+    .await
+    .expect("clean up app_role");
+}
+
 #[test]
 fn verify_unreachable_database_exits_3() {
     let dir = tempdir().expect("tempdir");
