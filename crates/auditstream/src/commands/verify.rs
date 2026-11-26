@@ -265,6 +265,11 @@ fn convert_finding(finding: &Finding) -> VerifyFinding {
             "Move rows out of changes_default into monthly partitions, then run `auditstream verify --fix`."
                 .to_owned(),
         ),
+        FindingKind::InvalidExclusion => (
+            "invalid_exclusion",
+            "Remove primary key column(s) from capture.exclude and re-run `auditstream init`."
+                .to_owned(),
+        ),
     };
 
     VerifyFinding {

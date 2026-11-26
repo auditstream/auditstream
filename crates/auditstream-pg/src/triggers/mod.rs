@@ -18,7 +18,10 @@
 //! Actor comment extraction uses pure SQL string builtins (no POSIX regexes),
 //! keeping length bounds explicit in SQL without hitting PostgreSQL's 255 quantifier cap.
 
-use crate::ddl::{DEFAULT_SCHEMA, OWNER_ROLE, function_owner_sql, quote_ident, quote_literal};
+use crate::ddl::{
+    DEFAULT_SCHEMA, OWNER_ROLE, TX_GUARD_SETTING, function_owner_sql, quote_ident, quote_literal,
+    tx_begin_guard_sql,
+};
 
 /// Trigger specification for a single audited PostgreSQL table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +70,21 @@ impl TableTriggerSpec {
         self.is_partitioned = true;
         self
     }
+
+    /// Returns any primary key column names also listed in [`Self::excluded_columns`],
+    /// sorted and deduplicated for deterministic diagnostics.
+    #[must_use]
+    pub fn excluded_primary_key_columns(&self) -> Vec<&str> {
+        let mut bad: Vec<&str> = self
+            .excluded_columns
+            .iter()
+            .filter(|col| self.primary_key.iter().any(|pk| pk == *col))
+            .map(String::as_str)
+            .collect();
+        bad.sort_unstable();
+        bad.dedup();
+        bad
+    }
 }
 
 /// Configuration for [`generate`].
@@ -106,17 +124,29 @@ impl TriggerOptions {
 /// emit each statement cleanly. Re-running the returned statements succeeds and leaves
 /// exactly one trigger per event (`CREATE OR REPLACE TRIGGER`).
 ///
-/// Callers should execute the statements sequentially on a single connection so any
-/// temporary `auditstream_owner` self-grant acquired for a non-superuser migrator is
-/// cleanly revoked by the final statement.
+/// Callers MUST execute the returned statements sequentially inside a single transaction
+/// (`BEGIN; ... COMMIT;`) so any temporary `auditstream_owner` self-grant acquired for a
+/// non-superuser migrator is atomic and cleanly revoked before commit.
 pub fn generate(options: &TriggerOptions) -> Vec<String> {
-    let schema_q = quote_ident(&options.audit_schema);
     let owner_q = quote_ident(OWNER_ROLE);
     let owner_lit = quote_literal(OWNER_ROLE);
 
-    let mut stmts = Vec::with_capacity(8 + options.tables.len() * 4);
-
+    let body = generate_body(options);
+    let mut stmts = Vec::with_capacity(body.len() + 3);
+    stmts.push(tx_begin_guard_sql());
     stmts.push(role_grant_setup_sql(&owner_q, &owner_lit));
+    stmts.extend(body);
+    stmts.push(role_grant_cleanup_sql(&owner_q));
+    stmts
+}
+
+/// Generates trigger functions and per-table trigger definitions without transaction-marker or
+/// role self-grant wrapper blocks (used by migration composers that already manage a
+/// transaction-scoped `auditstream_owner` self-grant).
+pub(crate) fn generate_body(options: &TriggerOptions) -> Vec<String> {
+    let schema_q = quote_ident(&options.audit_schema);
+
+    let mut stmts = Vec::with_capacity(6 + options.tables.len() * 4);
     stmts.push(resolve_actor_sql(&schema_q));
     stmts.push(function_owner_sql(&schema_q, "resolve_actor()"));
     stmts.push(format!(
@@ -133,7 +163,6 @@ pub fn generate(options: &TriggerOptions) -> Vec<String> {
         append_table_triggers(&mut stmts, &schema_q, table);
     }
 
-    stmts.push(role_grant_cleanup_sql(&owner_q));
     stmts
 }
 
@@ -217,16 +246,25 @@ fn role_grant_setup_sql(owner_q: &str, owner_lit: &str) -> String {
     format!(
         "DO $$\n\
 DECLARE\n  \
-  granted_self boolean := false;\n\
+  granted_self boolean := false;\n  \
+  needs_grant boolean := false;\n\
 BEGIN\n  \
-  IF NOT pg_catalog.pg_has_role(current_user, {owner_lit}, 'USAGE') THEN\n    \
+  IF pg_catalog.current_setting('{TX_GUARD_SETTING}', true) IS DISTINCT FROM 'on' THEN\n    \
+    RAISE EXCEPTION 'Auditstream trigger statements must run inside a single transaction'\n      \
+      USING HINT = 'Wrap the generated statements in BEGIN; ... COMMIT; or use a transactional migrator.';\n  \
+  END IF;\n  \
+  needs_grant := NOT pg_catalog.pg_has_role(current_user, {owner_lit}, 'USAGE');\n  \
+  IF NOT needs_grant AND pg_catalog.current_setting('server_version_num')::int >= 160000 THEN\n    \
+    needs_grant := NOT pg_catalog.pg_has_role(current_user, {owner_lit}, 'SET');\n  \
+  END IF;\n  \
+  IF needs_grant THEN\n    \
     EXECUTE pg_catalog.format('GRANT {owner_q} TO %I', current_user);\n    \
     granted_self := true;\n  \
   END IF;\n  \
   PERFORM pg_catalog.set_config(\n    \
     'auditstream._triggers_granted_self',\n    \
     CASE WHEN granted_self THEN '1' ELSE '0' END,\n    \
-    false\n  \
+    true\n  \
   );\n\
 END\n\
 $$"
@@ -239,7 +277,7 @@ fn role_grant_cleanup_sql(owner_q: &str) -> String {
 BEGIN\n  \
   IF pg_catalog.current_setting('auditstream._triggers_granted_self', true) = '1' THEN\n    \
     EXECUTE pg_catalog.format('REVOKE {owner_q} FROM %I', current_user);\n    \
-    PERFORM pg_catalog.set_config('auditstream._triggers_granted_self', '', false);\n  \
+    PERFORM pg_catalog.set_config('auditstream._triggers_granted_self', '', true);\n  \
   END IF;\n\
 END\n\
 $$"

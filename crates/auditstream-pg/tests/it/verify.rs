@@ -15,12 +15,13 @@ async fn install_fixture(db: &TestDb, tables: &[TableTriggerSpec]) {
     let cleanup = ddl_stmts.pop();
     let trigger_stmts = triggers::generate(&TriggerOptions::new(DEFAULT_SCHEMA, tables.to_vec()));
 
-    let mut conn = db.pool().acquire().await.expect("acquire connection");
+    let mut tx = db.pool().begin().await.expect("begin fixture tx");
     for stmt in ddl_stmts.into_iter().chain(trigger_stmts).chain(cleanup) {
-        conn.execute(AssertSqlSafe(stmt))
+        tx.execute(AssertSqlSafe(stmt))
             .await
             .expect("install capture DDL/triggers");
     }
+    tx.commit().await.expect("commit fixture tx");
 }
 
 async fn create_invoice_table(db: &TestDb) {
@@ -428,4 +429,45 @@ async fn installed_captures_discovers_top_level_tables_args_and_trigger_states()
     assert_eq!(ord.excluded_columns, Vec::<String>::new());
     assert_eq!(ord.triggers.len(), 4);
     assert!(ord.triggers.iter().all(|(_, state)| state == "O"));
+}
+
+#[tokio::test]
+async fn reports_error_when_primary_key_column_is_excluded() {
+    let db = TestDb::new().await.expect("create TestDb");
+    create_invoice_table(&db).await;
+    let bad_specs = vec![invoice_spec(vec!["id"])];
+    install_fixture(&db, &bad_specs).await;
+
+    // 1. Config-side exclusion of a PK column reports InvalidExclusion.
+    let report = verify::check(db.pool(), &bad_specs)
+        .await
+        .expect("verify PK exclusion");
+    assert!(report.has_errors());
+    assert!(
+        report.findings.iter().any(|f| {
+            f.kind == FindingKind::InvalidExclusion
+                && f.severity == Severity::Error
+                && f.object == "public.invoice"
+                && f.detail.contains("id")
+        }),
+        "expected InvalidExclusion finding for config PK exclusion, got: {:?}",
+        report.findings
+    );
+
+    // 2. Live trigger excluding a PK column is also flagged even if config no longer excludes it.
+    let clean_specs = vec![invoice_spec(vec![])];
+    let live_report = verify::check(db.pool(), &clean_specs)
+        .await
+        .expect("verify live trigger PK exclusion");
+    assert!(live_report.has_errors());
+    assert!(
+        live_report.findings.iter().any(|f| {
+            f.kind == FindingKind::InvalidExclusion
+                && f.severity == Severity::Error
+                && f.object == "public.invoice.auditstream_update"
+                && f.detail.contains("id")
+        }),
+        "expected InvalidExclusion finding for live trigger PK exclusion, got: {:?}",
+        live_report.findings
+    );
 }

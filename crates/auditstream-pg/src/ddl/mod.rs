@@ -17,6 +17,21 @@ pub const OWNER_ROLE: &str = "auditstream_owner";
 /// `auditstream_owner` role creation across concurrent setup runs.
 const ROLE_LOCK_KEY: i64 = 0x6175_6473_7472_6f77;
 
+/// Transaction-local PostgreSQL setting proving setup statements run inside one transaction.
+pub(crate) const TX_GUARD_SETTING: &str = "auditstream._migration_tx";
+
+/// Marks the enclosing transaction for standalone [`generate`] and [`crate::triggers::generate`]
+/// sequences so role self-grant setup rejects autocommit callers before mutating roles.
+pub(crate) fn tx_begin_guard_sql() -> String {
+    format!(
+        "DO $$\n\
+BEGIN\n  \
+  PERFORM pg_catalog.set_config('{TX_GUARD_SETTING}', 'on', true);\n\
+END\n\
+$$"
+    )
+}
+
 /// Configuration for [`generate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DdlOptions {
@@ -72,15 +87,18 @@ pub(crate) struct GeneratedDdl {
 /// current UTC month and the next three months, plus `changes_default`) are computed
 /// inside PostgreSQL when the SQL executes rather than when `generate()` is called.
 ///
-/// Callers should execute the returned statements sequentially on a single connection
-/// (typically inside one transaction) so the temporary `auditstream._granted_self`
-/// session flag set in statement 1 is visible to the final cleanup statement.
+/// Callers MUST execute the returned statements sequentially inside a single transaction
+/// (`BEGIN; ... COMMIT;`) so the temporary `auditstream_owner` self-grant is atomic and never
+/// outlives a failed setup run. Autocommit execution is rejected before any role or schema DDL
+/// executes.
 ///
 /// The second-to-last statement creates the next three monthly partitions. Creating a
 /// partition locks `changes` until commit, so migrations run it after their trigger statements.
 pub fn generate(options: &DdlOptions) -> Vec<String> {
     let parts = generate_parts(options);
-    let mut stmts = parts.setup;
+    let mut stmts = Vec::with_capacity(parts.setup.len() + 3);
+    stmts.push(tx_begin_guard_sql());
+    stmts.extend(parts.setup);
     stmts.push(parts.future_partitions);
     stmts.push(parts.role_cleanup);
     stmts
@@ -98,7 +116,7 @@ pub(crate) fn generate_parts(options: &DdlOptions) -> GeneratedDdl {
     setup.push(format!(
         "CREATE SCHEMA IF NOT EXISTS {schema_q} AUTHORIZATION {owner_q}"
     ));
-    setup.push(changes_table_sql(&schema_q));
+    setup.push(changes_table_sql(&schema_q, &owner_lit));
     setup.push(partitions_sql(&schema_lit, &owner_lit, 0, 0));
 
     // Named indexes: BRIN on occurred_at, B-tree on (xact_id, id) for export cursor reads
@@ -155,60 +173,80 @@ fn role_setup_sql(owner_q: &str, owner_lit: &str) -> String {
     format!(
         "DO $$\n\
 DECLARE\n  \
-  granted_self boolean := false;\n\
+  granted_self boolean := false;\n  \
+  needs_grant boolean := false;\n\
 BEGIN\n  \
+  IF pg_catalog.current_setting('{TX_GUARD_SETTING}', true) IS DISTINCT FROM 'on' THEN\n    \
+    RAISE EXCEPTION 'Auditstream DDL statements must run inside a single transaction'\n      \
+      USING HINT = 'Wrap the generated statements in BEGIN; ... COMMIT; or use a transactional migrator.';\n  \
+  END IF;\n  \
   PERFORM pg_catalog.pg_advisory_xact_lock({ROLE_LOCK_KEY});\n  \
   IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = {owner_lit}) THEN\n    \
     EXECUTE 'CREATE ROLE {owner_q} NOLOGIN';\n  \
   END IF;\n  \
-  IF NOT pg_catalog.pg_has_role(current_user, {owner_lit}, 'USAGE') THEN\n    \
+  needs_grant := NOT pg_catalog.pg_has_role(current_user, {owner_lit}, 'USAGE');\n  \
+  IF NOT needs_grant AND pg_catalog.current_setting('server_version_num')::int >= 160000 THEN\n    \
+    needs_grant := NOT pg_catalog.pg_has_role(current_user, {owner_lit}, 'SET');\n  \
+  END IF;\n  \
+  IF needs_grant THEN\n    \
     EXECUTE pg_catalog.format('GRANT {owner_q} TO %I', current_user);\n    \
     granted_self := true;\n  \
   END IF;\n  \
   PERFORM pg_catalog.set_config(\n    \
     'auditstream._granted_self',\n    \
     CASE WHEN granted_self THEN '1' ELSE '0' END,\n    \
-    false\n  \
+    true\n  \
   );\n\
 END\n\
 $$"
     )
 }
 
-fn changes_table_sql(schema_q: &str) -> String {
-    format!(
-        "CREATE TABLE IF NOT EXISTS {schema_q}.changes (\n  \
-  id bigint GENERATED ALWAYS AS IDENTITY,\n  \
-  event_id uuid NOT NULL DEFAULT gen_random_uuid(),\n  \
-  occurred_at timestamptz NOT NULL DEFAULT clock_timestamp(),\n  \
-  xact_id xid8 NOT NULL DEFAULT pg_current_xact_id(),\n  \
-  source text NOT NULL DEFAULT 'db',\n  \
-  schema_name text,\n  \
-  table_name text,\n  \
-  table_oid oid,\n  \
-  op text NOT NULL,\n  \
-  record_id jsonb,\n  \
-  before jsonb,\n  \
-  after jsonb,\n  \
-  changed text[],\n  \
-  actor jsonb,\n  \
-  context jsonb,\n  \
-  actor_source text,\n  \
-  db_user text NOT NULL DEFAULT session_user,\n  \
-  schema_version smallint NOT NULL DEFAULT 1,\n  \
-  PRIMARY KEY (id, occurred_at),\n  \
-  CONSTRAINT changes_source_check CHECK (source IN ('db', 'app')),\n  \
-  CONSTRAINT changes_actor_source_check CHECK (\n    \
-    actor_source IS NULL OR actor_source IN ('set_config', 'comment', 'jwt', 'invalid')\n  \
-  ),\n  \
-  CONSTRAINT changes_schema_version_check CHECK (schema_version >= 1)\n\
-) PARTITION BY RANGE (occurred_at)"
-    )
+fn changes_table_sql(schema_q: &str, owner_lit: &str) -> String {
+    do_block(&format!(
+        "DECLARE\n  \
+  prev_role name := current_user;\n\
+BEGIN\n  \
+  EXECUTE pg_catalog.format('SET LOCAL ROLE %I', {owner_lit});\n  \
+  CREATE TABLE IF NOT EXISTS {schema_q}.changes (\n    \
+    id bigint GENERATED ALWAYS AS IDENTITY,\n    \
+    event_id uuid NOT NULL DEFAULT gen_random_uuid(),\n    \
+    occurred_at timestamptz NOT NULL DEFAULT clock_timestamp(),\n    \
+    xact_id xid8 NOT NULL DEFAULT pg_current_xact_id(),\n    \
+    source text NOT NULL DEFAULT 'db',\n    \
+    schema_name text,\n    \
+    table_name text,\n    \
+    table_oid oid,\n    \
+    op text NOT NULL,\n    \
+    record_id jsonb,\n    \
+    before jsonb,\n    \
+    after jsonb,\n    \
+    changed text[],\n    \
+    actor jsonb,\n    \
+    context jsonb,\n    \
+    actor_source text,\n    \
+    db_user text NOT NULL DEFAULT session_user,\n    \
+    schema_version smallint NOT NULL DEFAULT 1,\n    \
+    PRIMARY KEY (id, occurred_at),\n    \
+    CONSTRAINT changes_source_check CHECK (source IN ('db', 'app')),\n    \
+    CONSTRAINT changes_actor_source_check CHECK (\n      \
+      actor_source IS NULL OR actor_source IN ('set_config', 'comment', 'jwt', 'invalid')\n    \
+    ),\n    \
+    CONSTRAINT changes_schema_version_check CHECK (schema_version >= 1)\n  \
+  ) PARTITION BY RANGE (occurred_at);\n  \
+  SET LOCAL ROLE NONE;\n  \
+  IF prev_role <> current_user THEN\n    \
+    EXECUTE pg_catalog.format('SET LOCAL ROLE %I', prev_role);\n  \
+  END IF;\n\
+END"
+    ))
 }
 
 /// Creates the missing monthly partitions `first_month..=last_month` months after the current
-/// UTC month and gives them to the owner role. Month 0 also covers `changes` and its DEFAULT
-/// partition, which captured writes need as soon as the triggers exist.
+/// UTC month under `auditstream_owner` (preventing `ALTER DEFAULT PRIVILEGES` for the migrator
+/// role from granting table writes on child partitions), reconciles ownership if needed, and
+/// strips any leaked non-owner write/public grants on managed tables. Month 0 also covers
+/// `changes` and its DEFAULT partition, which captured writes need as soon as the triggers exist.
 fn partitions_sql(schema_lit: &str, owner_lit: &str, first_month: u32, last_month: u32) -> String {
     let (default_partition, managed_tables) = if first_month == 0 {
         let create = format!(
@@ -225,13 +263,16 @@ fn partitions_sql(schema_lit: &str, owner_lit: &str, first_month: u32, last_mont
     };
     do_block(&format!(
         "DECLARE
+  prev_role name := current_user;
   base_month timestamp := pg_catalog.date_trunc('month', pg_catalog.now() AT TIME ZONE 'UTC');
   m int;
   month_start timestamp;
   month_end timestamp;
   part_name name;
+  grantee_oid oid;
   managed_tables name[] := {managed_tables};
 BEGIN
+  EXECUTE pg_catalog.format('SET LOCAL ROLE %I', {owner_lit});
 {default_partition}  FOR m IN {first_month}..{last_month} LOOP
     month_start := base_month + pg_catalog.make_interval(months => m);
     month_end := base_month + pg_catalog.make_interval(months => m + 1);
@@ -246,6 +287,10 @@ BEGIN
     );
     managed_tables := pg_catalog.array_append(managed_tables, part_name);
   END LOOP;
+  SET LOCAL ROLE NONE;
+  IF prev_role <> current_user THEN
+    EXECUTE pg_catalog.format('SET LOCAL ROLE %I', prev_role);
+  END IF;
   FOR part_name IN
     SELECT c.relname FROM pg_catalog.pg_class c
     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -254,6 +299,44 @@ BEGIN
     ORDER BY c.relname
   LOOP
     EXECUTE pg_catalog.format('ALTER TABLE %I.%I OWNER TO %I', {schema_lit}, part_name, {owner_lit});
+  END LOOP;
+  FOR part_name, grantee_oid IN
+    SELECT DISTINCT c.relname, a.grantee
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) AS a
+    WHERE n.nspname = {schema_lit}
+      AND c.relname = ANY (managed_tables)
+      AND c.relacl IS NOT NULL
+      AND a.grantee <> c.relowner
+      AND (a.grantee = 0 OR a.privilege_type <> 'SELECT')
+    ORDER BY c.relname, a.grantee
+  LOOP
+    IF grantee_oid = 0 THEN
+      EXECUTE pg_catalog.format('REVOKE ALL ON TABLE %I.%I FROM PUBLIC', {schema_lit}, part_name);
+    ELSIF part_name = 'changes' THEN
+      EXECUTE pg_catalog.format(
+        'REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON TABLE %I.%I FROM %I',
+        {schema_lit},
+        part_name,
+        pg_catalog.pg_get_userbyid(grantee_oid)
+      );
+      IF pg_catalog.current_setting('server_version_num')::int >= 170000 THEN
+        EXECUTE pg_catalog.format(
+          'REVOKE MAINTAIN ON TABLE %I.%I FROM %I',
+          {schema_lit},
+          part_name,
+          pg_catalog.pg_get_userbyid(grantee_oid)
+        );
+      END IF;
+    ELSE
+      EXECUTE pg_catalog.format(
+        'REVOKE ALL ON TABLE %I.%I FROM %I',
+        {schema_lit},
+        part_name,
+        pg_catalog.pg_get_userbyid(grantee_oid)
+      );
+    END IF;
   END LOOP;
 END"
     ))
@@ -370,7 +453,7 @@ fn role_cleanup_sql(owner_q: &str) -> String {
 BEGIN\n  \
   IF pg_catalog.current_setting('auditstream._granted_self', true) = '1' THEN\n    \
     EXECUTE pg_catalog.format('REVOKE {owner_q} FROM %I', current_user);\n    \
-    PERFORM pg_catalog.set_config('auditstream._granted_self', '', false);\n  \
+    PERFORM pg_catalog.set_config('auditstream._granted_self', '', true);\n  \
   END IF;\n\
 END\n\
 $$"

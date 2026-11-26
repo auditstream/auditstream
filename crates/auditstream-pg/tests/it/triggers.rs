@@ -13,10 +13,11 @@ use sqlx::{AssertSqlSafe, Connection, Executor, Row};
 use uuid::Uuid;
 
 async fn run_statements(conn: &mut PgConnection, stmts: &[String]) -> Result<(), sqlx::Error> {
+    let mut tx = conn.begin().await?;
     for stmt in stmts {
-        conn.execute(AssertSqlSafe(stmt.clone())).await?;
+        tx.execute(AssertSqlSafe(stmt.clone())).await?;
     }
-    Ok(())
+    tx.commit().await
 }
 
 fn app_role_url(db: &TestDb, role: &str, password: &str) -> String {

@@ -61,6 +61,9 @@ pub enum FindingKind {
     PartitionedTable,
     /// The `changes_default` partition holds rows, blocking monthly partition creation.
     DefaultPartitionRows,
+    /// A primary key column is listed in excluded columns (either in configuration or on an
+    /// installed trigger), which causes `capture()` to record `NULL` values inside `record_id`.
+    InvalidExclusion,
 }
 
 /// Single drift finding returned by [`check`] and [`check_with_options`].
@@ -700,6 +703,20 @@ fn check_single_table(
         });
     }
 
+    let config_pk_excluded = spec.excluded_primary_key_columns();
+    if !config_pk_excluded.is_empty() {
+        findings.push(Finding {
+            kind: FindingKind::InvalidExclusion,
+            severity: Severity::Error,
+            table: Some(fq_table.clone()),
+            object: fq_table.clone(),
+            detail: format!(
+                "primary key column(s) {} cannot be excluded on `{fq_table}` because `record_id` requires them",
+                config_pk_excluded.join(", ")
+            ),
+        });
+    }
+
     let rel_triggers = triggers_by_rel.get(&cat.oid);
     let expected_args = expected_trigger_args(spec, is_partitioned_live);
 
@@ -734,6 +751,17 @@ fn check_single_table(
             });
         }
 
+        if config_pk_excluded.is_empty() {
+            check_live_trigger_pk_exclusions(
+                trig,
+                expected.name,
+                &fq_table,
+                &object,
+                &spec.primary_key,
+                findings,
+            );
+        }
+
         let diffs = diff_trigger(trig, expected, audit_schema, &expected_args);
         if !diffs.is_empty() {
             findings.push(Finding {
@@ -751,21 +779,68 @@ fn check_single_table(
     }
 
     if is_partitioned_live && let Some(clones) = partition_clones.get(&cat.oid) {
-        for clone in clones {
-            if let Some(state_label) = disabled_state_label(&clone.tgenabled) {
-                let child_fq = format!("{}.{}", clone.child_schema, clone.child_table);
-                findings.push(Finding {
-                    kind: FindingKind::Disabled,
-                    severity: Severity::Error,
-                    table: Some(fq_table.clone()),
-                    object: format!("{child_fq}.{}", clone.tgname),
-                    detail: format!(
-                        "cloned trigger `{}` on child partition `{child_fq}` (of `{fq_table}`) is {state_label} (`tgenabled = '{}'`)",
-                        clone.tgname, clone.tgenabled
-                    ),
-                });
-            }
+        check_partition_update_clones(&fq_table, clones, findings);
+    }
+}
+
+fn check_partition_update_clones(
+    fq_table: &str,
+    clones: &[PartitionCloneRow],
+    findings: &mut Vec<Finding>,
+) {
+    for clone in clones {
+        if let Some(state_label) = disabled_state_label(&clone.tgenabled) {
+            let child_fq = format!("{}.{}", clone.child_schema, clone.child_table);
+            findings.push(Finding {
+                kind: FindingKind::Disabled,
+                severity: Severity::Error,
+                table: Some(fq_table.to_owned()),
+                object: format!("{child_fq}.{}", clone.tgname),
+                detail: format!(
+                    "cloned trigger `{}` on child partition `{child_fq}` (of `{fq_table}`) is {state_label} (`tgenabled = '{}'`)",
+                    clone.tgname, clone.tgenabled
+                ),
+            });
         }
+    }
+}
+
+fn check_live_trigger_pk_exclusions(
+    trig: &TriggerCatalogRow,
+    trigger_name: &str,
+    fq_table: &str,
+    object: &str,
+    primary_key: &[String],
+    findings: &mut Vec<Finding>,
+) {
+    if primary_key.is_empty() {
+        return;
+    }
+    let live_args = decode_tgargs(&trig.tgargs, trig.tgnargs);
+    let Some(live_excluded) = live_args
+        .get(1)
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+    else {
+        return;
+    };
+    let mut bad_live: Vec<&str> = live_excluded
+        .iter()
+        .filter(|col| primary_key.iter().any(|pk| pk == *col))
+        .map(String::as_str)
+        .collect();
+    bad_live.sort_unstable();
+    bad_live.dedup();
+    if !bad_live.is_empty() {
+        findings.push(Finding {
+            kind: FindingKind::InvalidExclusion,
+            severity: Severity::Error,
+            table: Some(fq_table.to_owned()),
+            object: object.to_owned(),
+            detail: format!(
+                "installed trigger `{trigger_name}` on `{fq_table}` excludes primary key column(s) {}",
+                bad_live.join(", ")
+            ),
+        });
     }
 }
 

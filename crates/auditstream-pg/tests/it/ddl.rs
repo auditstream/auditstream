@@ -13,6 +13,12 @@ async fn run_statements(conn: &mut PgConnection, stmts: &[String]) -> Result<(),
     Ok(())
 }
 
+async fn run_statements_tx(conn: &mut PgConnection, stmts: &[String]) -> Result<(), sqlx::Error> {
+    let mut tx = conn.begin().await?;
+    run_statements(&mut tx, stmts).await?;
+    tx.commit().await
+}
+
 fn app_role_url(db: &TestDb, role: &str, password: &str) -> String {
     let base = db.url();
     let (scheme, rest) = base.split_once("://").expect("valid postgres URL");
@@ -65,7 +71,9 @@ async fn reapplying_ddl_skips_redundant_owner_changes() {
     let schema = r#"Audit "History's" $$v1$$"#;
     let mut statements = ddl::generate(&DdlOptions::new(schema, vec![]));
     statements.extend(triggers::generate(&TriggerOptions::new(schema, vec![])));
-    run_statements(&mut conn, &statements).await.expect("setup");
+    run_statements_tx(&mut conn, &statements)
+        .await
+        .expect("setup");
 
     conn.execute(
         "CREATE FUNCTION reject_redundant_alter() RETURNS event_trigger LANGUAGE plpgsql
@@ -76,7 +84,7 @@ async fn reapplying_ddl_skips_redundant_owner_changes() {
     .await
     .expect("watch for redundant ALTERs");
 
-    run_statements(&mut conn, &statements)
+    run_statements_tx(&mut conn, &statements)
         .await
         .expect("matching owners should be left in place");
 }
@@ -88,7 +96,9 @@ async fn reapplying_ddl_does_not_block_history_writes() {
     let mut conn = PgConnection::connect(db.url()).await.expect("connect");
     let mut statements = ddl::generate(&DdlOptions::default());
     statements.extend(triggers::generate(&TriggerOptions::default()));
-    run_statements(&mut conn, &statements).await.expect("setup");
+    run_statements_tx(&mut conn, &statements)
+        .await
+        .expect("setup");
 
     // A refresh migration holds its locks until it commits. Every audited write inserts into
     // the history table, so a lock that conflicts with ROW EXCLUSIVE stalls all of them and can
@@ -161,7 +171,7 @@ async fn setup_runs_as_non_superuser_revokes_self_grant_and_fails_without_self_g
         let mut conn = PgConnection::connect(db.url())
             .await
             .expect("migrator connect");
-        run_statements(&mut conn, &stmts)
+        run_statements_tx(&mut conn, &stmts)
             .await
             .expect("non-superuser setup must succeed");
 
@@ -402,7 +412,7 @@ async fn setup_runs_as_non_superuser_revokes_self_grant_and_fails_without_self_g
         let mut conn = PgConnection::connect(db.url())
             .await
             .expect("migrator reconnect");
-        run_statements(&mut conn, &stmts)
+        run_statements_tx(&mut conn, &stmts)
             .await
             .expect("second setup run must succeed idempotently");
         conn.close().await.expect("close migrator 2");
@@ -463,7 +473,7 @@ async fn setup_runs_as_non_superuser_revokes_self_grant_and_fails_without_self_g
         let mut conn2 = PgConnection::connect(db2.url())
             .await
             .expect("migrator2 connect");
-        let err = run_statements(&mut conn2, &without_self_grant)
+        let err = run_statements_tx(&mut conn2, &without_self_grant)
             .await
             .expect_err("non-superuser setup without self-grant must fail");
         assert_eq!(
@@ -487,6 +497,254 @@ async fn setup_runs_as_non_superuser_revokes_self_grant_and_fails_without_self_g
             quote_ident(&app_role)
         )))
         .await;
+    let _ = admin
+        .execute(AssertSqlSafe(format!(
+            "DROP ROLE IF EXISTS {}",
+            quote_ident(OWNER_ROLE)
+        )))
+        .await;
+    let _ = admin.close().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn alter_default_privileges_cannot_grant_writes_on_changes_or_child_partitions() {
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+
+    let db = TestDb::non_superuser()
+        .await
+        .expect("create non-superuser TestDb");
+    let admin_url = db.admin_url().to_owned();
+    let migrator_role = db.role_name().expect("migrator role").to_owned();
+    let app_role = format!("defpriv_{}", db.database_name());
+    let app_pw = Uuid::new_v4().simple().to_string();
+
+    {
+        let mut admin = PgConnection::connect(&admin_url)
+            .await
+            .expect("admin connect");
+        admin
+            .execute(AssertSqlSafe(format!(
+                "DROP ROLE IF EXISTS {}",
+                quote_ident(OWNER_ROLE)
+            )))
+            .await
+            .expect("drop owner role");
+        admin
+            .execute(AssertSqlSafe(format!(
+                "CREATE ROLE {} LOGIN PASSWORD '{app_pw}'",
+                quote_ident(&app_role)
+            )))
+            .await
+            .expect("create app role");
+        admin.close().await.expect("close admin");
+    }
+
+    let stmts = ddl::generate(&DdlOptions::new(DEFAULT_SCHEMA, vec![app_role.clone()]));
+    {
+        let mut conn = PgConnection::connect(db.url())
+            .await
+            .expect("migrator connect");
+        // Simulate a common managed-Postgres setup where the migration role automatically
+        // grants ALL ON TABLES to the application role and PUBLIC.
+        conn.execute(AssertSqlSafe(format!(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE {} GRANT ALL ON TABLES TO {}",
+            quote_ident(&migrator_role),
+            quote_ident(&app_role),
+        )))
+        .await
+        .expect("set default privileges for app_role");
+        conn.execute(AssertSqlSafe(format!(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE {} GRANT ALL ON TABLES TO PUBLIC",
+            quote_ident(&migrator_role),
+        )))
+        .await
+        .expect("set default privileges for PUBLIC");
+
+        let mut tx = conn.begin().await.expect("begin setup tx");
+        run_statements(&mut tx, &stmts)
+            .await
+            .expect("apply DDL under ALTER DEFAULT PRIVILEGES");
+        tx.commit().await.expect("commit setup tx");
+        conn.close().await.expect("close migrator");
+    }
+
+    let now_utc = OffsetDateTime::now_utc();
+    let current_part = format!(
+        "auditstream.changes_{:04}_{:02}",
+        now_utc.year(),
+        u8::from(now_utc.month())
+    );
+
+    let app_url = app_role_url(&db, &app_role, &app_pw);
+    let mut app_conn = PgConnection::connect(&app_url)
+        .await
+        .expect("app_role connect");
+
+    for target in [
+        "auditstream.changes",
+        "auditstream.changes_default",
+        current_part.as_str(),
+    ] {
+        for sql in [
+            format!("INSERT INTO {target} (op) VALUES ('FAKE')"),
+            format!("UPDATE {target} SET op = 'FAKE'"),
+            format!("DELETE FROM {target}"),
+            format!("TRUNCATE {target}"),
+        ] {
+            let err = app_conn
+                .execute(AssertSqlSafe(sql.clone()))
+                .await
+                .expect_err(&format!("expected permission denied for: {sql}"));
+            assert!(
+                err.to_string().contains("permission denied"),
+                "expected permission denied for {sql}, got {err}"
+            );
+        }
+    }
+
+    // Also verify re-applying DDL heals leaked write grants on pre-existing partitions and changes
+    // (simulating an upgrade from a v0.1.0 database installed under ALTER DEFAULT PRIVILEGES).
+    {
+        let (base, _) = admin_url.rsplit_once('/').expect("admin url slash");
+        let admin_db_url = format!("{base}/{}", db.database_name());
+        let mut db_admin = PgConnection::connect(&admin_db_url)
+            .await
+            .expect("admin connect target db");
+        db_admin
+            .execute(AssertSqlSafe(format!(
+                "GRANT ALL ON TABLE auditstream.changes, auditstream.changes_default, {current_part} TO {}",
+                quote_ident(&app_role),
+            )))
+            .await
+            .expect("inject legacy leaked grants");
+        db_admin.close().await.expect("close db_admin");
+
+        let mut migrator = PgConnection::connect(db.url())
+            .await
+            .expect("migrator reconnect");
+        run_statements_tx(&mut migrator, &stmts)
+            .await
+            .expect("re-apply DDL to heal leaked grants");
+        migrator.close().await.expect("close migrator");
+    }
+
+    for target in [
+        "auditstream.changes",
+        "auditstream.changes_default",
+        current_part.as_str(),
+    ] {
+        let err = app_conn
+            .execute(AssertSqlSafe(format!("DELETE FROM {target}")))
+            .await
+            .expect_err(&format!("healed {target} must deny DELETE"));
+        assert!(
+            err.to_string().contains("permission denied"),
+            "expected permission denied after healing {target}, got {err}"
+        );
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM auditstream.changes")
+        .fetch_one(&mut app_conn)
+        .await
+        .expect("app_role retains SELECT on auditstream.changes after healing");
+    assert_eq!(count, 0);
+
+    app_conn.close().await.expect("close app_conn");
+    drop(db);
+    let mut admin = PgConnection::connect(&admin_url)
+        .await
+        .expect("admin cleanup");
+    let _ = admin
+        .execute(AssertSqlSafe(format!(
+            "DROP ROLE IF EXISTS {}",
+            quote_ident(&app_role)
+        )))
+        .await;
+    let _ = admin
+        .execute(AssertSqlSafe(format!(
+            "DROP ROLE IF EXISTS {}",
+            quote_ident(OWNER_ROLE)
+        )))
+        .await;
+    let _ = admin.close().await;
+}
+
+#[tokio::test]
+async fn autocommit_and_failed_tx_never_leave_migrator_holding_auditstream_owner() {
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+
+    let db = TestDb::non_superuser()
+        .await
+        .expect("create non-superuser TestDb");
+    let admin_url = db.admin_url().to_owned();
+    let migrator_role = db.role_name().expect("migrator role").to_owned();
+
+    {
+        let mut admin = PgConnection::connect(&admin_url)
+            .await
+            .expect("admin connect");
+        admin
+            .execute(AssertSqlSafe(format!(
+                "DROP ROLE IF EXISTS {}",
+                quote_ident(OWNER_ROLE)
+            )))
+            .await
+            .expect("drop owner role");
+        admin.close().await.expect("close admin");
+    }
+
+    let stmts = ddl::generate(&DdlOptions::default());
+    let mut conn = PgConnection::connect(db.url())
+        .await
+        .expect("migrator connect");
+
+    // 1. Autocommit execution with a mid-setup failure must fail BEFORE granting auditstream_owner.
+    let mut autocommit_stmts = stmts.clone();
+    autocommit_stmts.insert(2, "SELECT 1 / 0".to_owned());
+    let _ = run_statements(&mut conn, &autocommit_stmts)
+        .await
+        .expect_err("autocommit execution must fail");
+
+    let has_usage_after_autocommit: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $2) AND pg_catalog.pg_has_role($1, $2, 'USAGE')")
+            .bind(&migrator_role)
+            .bind(OWNER_ROLE)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap_or(false);
+    assert!(
+        !has_usage_after_autocommit,
+        "autocommit failure must never leave migrator holding USAGE on {OWNER_ROLE}"
+    );
+
+    // 2. A mid-transaction failure inside BEGIN/ROLLBACK must also leave zero elevated membership.
+    {
+        let mut tx = conn.begin().await.expect("begin failing tx");
+        let mut failing_stmts = stmts.clone();
+        failing_stmts.insert(failing_stmts.len() - 1, "SELECT 1 / 0".to_owned());
+        let _ = run_statements(&mut tx, &failing_stmts)
+            .await
+            .expect_err("injected error fails tx");
+        tx.rollback().await.expect("rollback failed tx");
+    }
+
+    let has_usage_after_rollback: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $2) AND pg_catalog.pg_has_role($1, $2, 'USAGE')")
+            .bind(&migrator_role)
+            .bind(OWNER_ROLE)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap_or(false);
+    assert!(
+        !has_usage_after_rollback,
+        "rolled-back transaction must never leave migrator holding USAGE on {OWNER_ROLE}"
+    );
+
+    conn.close().await.expect("close conn");
+    drop(db);
+    let mut admin = PgConnection::connect(&admin_url)
+        .await
+        .expect("admin cleanup");
     let _ = admin
         .execute(AssertSqlSafe(format!(
             "DROP ROLE IF EXISTS {}",

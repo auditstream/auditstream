@@ -136,20 +136,26 @@ impl CaptureFixture {
             }
 
             let ddl_stmts = ddl::generate(&DdlOptions::new(DEFAULT_SCHEMA, vec![app_role.clone()]));
-            for stmt in &ddl_stmts {
-                setup
-                    .execute(AssertSqlSafe(stmt.clone()))
-                    .await
-                    .unwrap_or_else(|e| panic!("D2 DDL failed: {e}\nSQL: {stmt}"));
+            {
+                let mut tx = setup.begin().await.expect("begin DDL tx");
+                for stmt in &ddl_stmts {
+                    tx.execute(AssertSqlSafe(stmt.clone()))
+                        .await
+                        .unwrap_or_else(|e| panic!("D2 DDL failed: {e}\nSQL: {stmt}"));
+                }
+                tx.commit().await.expect("commit DDL tx");
             }
 
             let trigger_stmts =
                 triggers::generate(&TriggerOptions::new(DEFAULT_SCHEMA, specs.clone()));
-            for stmt in &trigger_stmts {
-                setup
-                    .execute(AssertSqlSafe(stmt.clone()))
-                    .await
-                    .unwrap_or_else(|e| panic!("D3 trigger failed: {e}\nSQL: {stmt}"));
+            {
+                let mut tx = setup.begin().await.expect("begin trigger tx");
+                for stmt in &trigger_stmts {
+                    tx.execute(AssertSqlSafe(stmt.clone()))
+                        .await
+                        .unwrap_or_else(|e| panic!("D3 trigger failed: {e}\nSQL: {stmt}"));
+                }
+                tx.commit().await.expect("commit trigger tx");
             }
 
             for spec in &specs {

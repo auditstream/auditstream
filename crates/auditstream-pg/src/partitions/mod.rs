@@ -309,9 +309,9 @@ pub async fn ensure_ahead_with_options(
         .await?;
 
     let granted_self = ensure_owner_membership(&mut tx).await?;
+    let saved_role = enter_owner_role(&mut tx).await?;
 
     let schema_q = quote_ident(&options.schema);
-    let owner_q = quote_ident(OWNER_ROLE);
 
     let mut created = Vec::new();
     let mut skipped = Vec::new();
@@ -345,10 +345,7 @@ pub async fn ensure_ahead_with_options(
             .await
         {
             Ok(_) => {
-                let alter_sql = format!("ALTER TABLE {schema_q}.{part_q} OWNER TO {owner_q}");
-                sqlx::query(AssertSqlSafe(alter_sql))
-                    .execute(&mut *tx)
-                    .await?;
+                sanitize_child_partition_acl(&mut tx, &options.schema, &part_name).await?;
                 sqlx::query("RELEASE SAVEPOINT auditstream_create_part")
                     .execute(&mut *tx)
                     .await?;
@@ -382,6 +379,8 @@ pub async fn ensure_ahead_with_options(
             }
         }
     }
+
+    restore_role(&mut tx, &saved_role).await?;
 
     if granted_self {
         revoke_owner_membership(&mut tx).await?;
@@ -660,16 +659,104 @@ async fn count_all_default_rows(
         .await
 }
 
+async fn enter_owner_role(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(String, String), sqlx::Error> {
+    let saved: (String, String) = sqlx::query_as("SELECT current_user::text, session_user::text")
+        .fetch_one(&mut **tx)
+        .await?;
+    let set_owner_sql = format!("SET LOCAL ROLE {}", quote_ident(OWNER_ROLE));
+    sqlx::query(AssertSqlSafe(set_owner_sql))
+        .execute(&mut **tx)
+        .await?;
+    Ok(saved)
+}
+
+async fn restore_role(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    (prev_role, session_role): &(String, String),
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SET LOCAL ROLE NONE")
+        .execute(&mut **tx)
+        .await?;
+    if prev_role != session_role {
+        let restore_sql = format!("SET LOCAL ROLE {}", quote_ident(prev_role));
+        sqlx::query(AssertSqlSafe(restore_sql))
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn sanitize_child_partition_acl(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    schema: &str,
+    part_name: &str,
+) -> Result<(), sqlx::Error> {
+    let grantees: Vec<(i64, Option<String>)> = sqlx::query_as(
+        "SELECT DISTINCT a.grantee::bigint, \
+                CASE WHEN a.grantee = 0 THEN NULL ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END \
+           FROM pg_catalog.pg_class c \
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+           CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) AS a \
+          WHERE n.nspname = $1 \
+            AND c.relname = $2 \
+            AND c.relacl IS NOT NULL \
+            AND a.grantee <> c.relowner \
+            AND (a.grantee = 0 OR a.privilege_type <> 'SELECT') \
+          ORDER BY 1",
+    )
+    .bind(schema)
+    .bind(part_name)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let schema_q = quote_ident(schema);
+    let part_q = quote_ident(part_name);
+    for (grantee_oid, grantee_name) in grantees {
+        let revoke_sql = if grantee_oid == 0 {
+            format!("REVOKE ALL ON TABLE {schema_q}.{part_q} FROM PUBLIC")
+        } else if let Some(role) = grantee_name {
+            format!(
+                "REVOKE ALL ON TABLE {schema_q}.{part_q} FROM {}",
+                quote_ident(&role)
+            )
+        } else {
+            continue;
+        };
+        sqlx::query(AssertSqlSafe(revoke_sql))
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
 async fn ensure_owner_membership(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<bool, sqlx::Error> {
-    let has_role: bool =
+    let has_usage: bool =
         sqlx::query_scalar("SELECT pg_catalog.pg_has_role(current_user, $1, 'USAGE')")
             .bind(OWNER_ROLE)
             .fetch_one(&mut **tx)
             .await?;
 
-    if has_role {
+    let mut needs_grant = !has_usage;
+    if !needs_grant {
+        let server_version_num: i32 =
+            sqlx::query_scalar("SELECT pg_catalog.current_setting('server_version_num')::int")
+                .fetch_one(&mut **tx)
+                .await?;
+        if server_version_num >= 160_000 {
+            let has_set: bool =
+                sqlx::query_scalar("SELECT pg_catalog.pg_has_role(current_user, $1, 'SET')")
+                    .bind(OWNER_ROLE)
+                    .fetch_one(&mut **tx)
+                    .await?;
+            needs_grant = !has_set;
+        }
+    }
+
+    if !needs_grant {
         return Ok(false);
     }
 

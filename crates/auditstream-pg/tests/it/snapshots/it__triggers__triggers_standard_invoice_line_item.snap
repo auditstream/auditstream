@@ -3,17 +3,32 @@ source: crates/auditstream-pg/tests/it/triggers.rs
 expression: "standard.join(\";\\n\\n\")"
 ---
 DO $$
+BEGIN
+  PERFORM pg_catalog.set_config('auditstream._migration_tx', 'on', true);
+END
+$$;
+
+DO $$
 DECLARE
   granted_self boolean := false;
+  needs_grant boolean := false;
 BEGIN
-  IF NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'USAGE') THEN
+  IF pg_catalog.current_setting('auditstream._migration_tx', true) IS DISTINCT FROM 'on' THEN
+    RAISE EXCEPTION 'Auditstream trigger statements must run inside a single transaction'
+      USING HINT = 'Wrap the generated statements in BEGIN; ... COMMIT; or use a transactional migrator.';
+  END IF;
+  needs_grant := NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'USAGE');
+  IF NOT needs_grant AND pg_catalog.current_setting('server_version_num')::int >= 160000 THEN
+    needs_grant := NOT pg_catalog.pg_has_role(current_user, 'auditstream_owner', 'SET');
+  END IF;
+  IF needs_grant THEN
     EXECUTE pg_catalog.format('GRANT "auditstream_owner" TO %I', current_user);
     granted_self := true;
   END IF;
   PERFORM pg_catalog.set_config(
     'auditstream._triggers_granted_self',
     CASE WHEN granted_self THEN '1' ELSE '0' END,
-    false
+    true
   );
 END
 $$;
@@ -534,7 +549,7 @@ DO $$
 BEGIN
   IF pg_catalog.current_setting('auditstream._triggers_granted_self', true) = '1' THEN
     EXECUTE pg_catalog.format('REVOKE "auditstream_owner" FROM %I', current_user);
-    PERFORM pg_catalog.set_config('auditstream._triggers_granted_self', '', false);
+    PERFORM pg_catalog.set_config('auditstream._triggers_granted_self', '', true);
   END IF;
 END
 $$

@@ -13,12 +13,11 @@ async fn install_ddl(db: &TestDb) {
         .await
         .expect("acquire cluster lock for role setup");
     let stmts = ddl::generate(&DdlOptions::new(DEFAULT_SCHEMA, vec![]));
-    let mut conn = db.pool().acquire().await.expect("acquire conn");
+    let mut tx = db.pool().begin().await.expect("begin ddl tx");
     for stmt in stmts {
-        conn.execute(AssertSqlSafe(stmt))
-            .await
-            .expect("apply D2 DDL");
+        tx.execute(AssertSqlSafe(stmt)).await.expect("apply D2 DDL");
     }
+    tx.commit().await.expect("commit ddl tx");
 }
 
 #[tokio::test]
@@ -56,12 +55,13 @@ async fn non_superuser_creates_future_partitions_owned_by_auditstream_owner_and_
 
     let stmts = ddl::generate(&DdlOptions::new(DEFAULT_SCHEMA, vec![]));
     {
-        let mut conn = db.pool().acquire().await.expect("acquire conn");
+        let mut tx = db.pool().begin().await.expect("begin ddl tx");
         for stmt in stmts {
-            conn.execute(AssertSqlSafe(stmt))
+            tx.execute(AssertSqlSafe(stmt))
                 .await
                 .expect("apply D2 DDL as non-superuser");
         }
+        tx.commit().await.expect("commit ddl tx");
     }
 
     // D2 pre-creates months 0..=3; asking for 5 months ahead should create months 4 and 5.
@@ -346,4 +346,112 @@ async fn history_stats_reports_missing_clean_contiguous_gap_and_default_rows() {
         "expected positive total_size_bytes, got {}",
         after.total_size_bytes
     );
+}
+
+#[tokio::test]
+async fn ensure_ahead_under_alter_default_privileges_keeps_child_partitions_append_only() {
+    let _lock = TestDb::cluster_lock().await.expect("acquire cluster lock");
+    let db = TestDb::non_superuser()
+        .await
+        .expect("create non_superuser TestDb");
+    let admin_url = db.admin_url().to_owned();
+    let migrator_role = db.role_name().expect("migrator role").to_owned();
+    let app_role = format!("partdef_{}", db.database_name());
+    let app_pw = uuid::Uuid::new_v4().simple().to_string();
+
+    {
+        let mut admin = PgConnection::connect(&admin_url)
+            .await
+            .expect("admin connect");
+        admin
+            .execute(AssertSqlSafe(format!(
+                "DO $$ \
+                 BEGIN \
+                   DROP ROLE IF EXISTS {owner}; \
+                 EXCEPTION WHEN dependent_objects_still_exist THEN \
+                   EXECUTE 'GRANT {owner} TO {migrator} WITH ADMIN OPTION'; \
+                 END $$",
+                owner = quote_ident(OWNER_ROLE),
+                migrator = quote_ident(&migrator_role),
+            )))
+            .await
+            .expect("prepare owner role");
+        admin
+            .execute(AssertSqlSafe(format!(
+                "CREATE ROLE {} LOGIN PASSWORD '{app_pw}'",
+                quote_ident(&app_role)
+            )))
+            .await
+            .expect("create app role");
+        admin.close().await.expect("close admin");
+    }
+
+    let stmts = ddl::generate(&DdlOptions::new(DEFAULT_SCHEMA, vec![app_role.clone()]));
+    {
+        let mut tx = db.pool().begin().await.expect("begin ddl tx");
+        for stmt in stmts {
+            tx.execute(AssertSqlSafe(stmt))
+                .await
+                .expect("apply DDL as non-superuser");
+        }
+        tx.commit().await.expect("commit ddl tx");
+    }
+
+    // Configure ALTER DEFAULT PRIVILEGES on the migrator role AFTER initial install,
+    // then run ensure_ahead to create future months 4..=5.
+    db.execute(&format!(
+        "ALTER DEFAULT PRIVILEGES FOR ROLE {} GRANT ALL ON TABLES TO {}",
+        quote_ident(&migrator_role),
+        quote_ident(&app_role),
+    ))
+    .await
+    .expect("alter default privileges for app_role");
+
+    let report = partitions::ensure_ahead(db.pool(), DEFAULT_SCHEMA, 5)
+        .await
+        .expect("ensure_ahead under ALTER DEFAULT PRIVILEGES");
+    assert_eq!(report.created.len(), 2);
+
+    let base = db.url();
+    let (scheme, rest) = base.split_once("://").expect("valid postgres URL");
+    let (_, host_and_db) = rest.split_once('@').expect("URL has credentials");
+    let app_url = format!("{scheme}://{app_role}:{app_pw}@{host_and_db}");
+    let mut app_conn = PgConnection::connect(&app_url)
+        .await
+        .expect("connect app_role");
+
+    for ym in &report.created {
+        let target = format!("auditstream.{}", ym.partition_name());
+        let (start_utc, _) = ym.utc_bounds();
+        for sql in [
+            format!(
+                "INSERT INTO {target} (occurred_at, op) VALUES ('{start_utc}'::timestamptz, 'FAKE')"
+            ),
+            format!("UPDATE {target} SET op = 'FAKE'"),
+            format!("DELETE FROM {target}"),
+            format!("TRUNCATE {target}"),
+        ] {
+            let err = app_conn
+                .execute(AssertSqlSafe(sql.clone()))
+                .await
+                .expect_err(&format!("expected permission denied for: {sql}"));
+            assert!(
+                err.to_string().contains("permission denied"),
+                "expected permission denied for {sql}, got {err}"
+            );
+        }
+    }
+
+    app_conn.close().await.expect("close app_conn");
+    drop(db);
+    let mut admin = PgConnection::connect(&admin_url)
+        .await
+        .expect("admin cleanup");
+    let _ = admin
+        .execute(AssertSqlSafe(format!(
+            "DROP ROLE IF EXISTS {}",
+            quote_ident(&app_role)
+        )))
+        .await;
+    let _ = admin.close().await;
 }
