@@ -668,6 +668,8 @@ pub(crate) struct CaptureConfig {
     pub(crate) tables: Vec<String>,
     /// Excluded columns (`schema.table.column`).
     pub(crate) exclude: Vec<String>,
+    /// Configured application PostgreSQL roles checked for Row-Level Security bypasses.
+    pub(crate) app_roles: Vec<String>,
 }
 
 /// Resolved `[migrations]` configuration section.
@@ -714,6 +716,8 @@ struct CaptureFileConfig {
     tables: Vec<String>,
     #[serde(default)]
     exclude: Vec<String>,
+    #[serde(default)]
+    app_roles: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -772,6 +776,7 @@ impl Config {
         let mut capture = CaptureConfig {
             tables: file.capture.tables,
             exclude: file.capture.exclude,
+            app_roles: file.capture.app_roles,
         };
         let mut migrations = MigrationsConfig {
             format: file.migrations.format,
@@ -792,40 +797,8 @@ impl Config {
             compiled_redaction,
         };
 
-        match &cli.command {
-            Command::Init(args) => {
-                if !args.table.is_empty() {
-                    capture.tables.clone_from(&args.table);
-                }
-                if !args.exclude.is_empty() {
-                    capture.exclude.clone_from(&args.exclude);
-                }
-                if let Some(format) = args.migrations {
-                    migrations.format = Some(format);
-                }
-                if let Some(dir) = &args.out {
-                    migrations.dir = Some(dir.clone());
-                }
-            }
-            Command::Export(args) => {
-                if let Some(cursor_file) = &args.cursor_file {
-                    export.cursor_file = Some(cursor_file.clone());
-                }
-                if let Some(batch_size) = args.batch_size {
-                    export.batch_size = batch_size;
-                }
-                let (format, path) = match export.sink {
-                    SinkConfig::Jsonl { path } => (Format::Jsonl, path),
-                    SinkConfig::Csv { path } => (Format::Csv, path),
-                };
-                let path = args.output.clone().or(path);
-                export.sink = match args.format.unwrap_or(format) {
-                    Format::Jsonl => SinkConfig::Jsonl { path },
-                    Format::Csv => SinkConfig::Csv { path },
-                };
-            }
-            Command::Status(_) | Command::Verify(_) | Command::History(_) => {}
-        }
+        apply_command_overrides(&cli.command, &mut capture, &mut migrations, &mut export);
+        validate_app_roles(&capture.app_roles)?;
 
         let file_path = cli
             .config
@@ -843,6 +816,72 @@ impl Config {
             export,
         })
     }
+}
+
+fn apply_command_overrides(
+    command: &Command,
+    capture: &mut CaptureConfig,
+    migrations: &mut MigrationsConfig,
+    export: &mut ExportConfig,
+) {
+    match command {
+        Command::Init(args) => apply_init_overrides(args, capture, migrations),
+        Command::Export(args) => apply_export_overrides(args, export),
+        Command::Verify(args) if !args.app_role.is_empty() => {
+            capture.app_roles.clone_from(&args.app_role);
+        }
+        Command::Verify(_) | Command::Status(_) | Command::History(_) => {}
+    }
+}
+
+fn apply_init_overrides(
+    args: &crate::commands::init::Args,
+    capture: &mut CaptureConfig,
+    migrations: &mut MigrationsConfig,
+) {
+    if !args.table.is_empty() {
+        capture.tables.clone_from(&args.table);
+    }
+    if !args.exclude.is_empty() {
+        capture.exclude.clone_from(&args.exclude);
+    }
+    if let Some(format) = args.migrations {
+        migrations.format = Some(format);
+    }
+    if let Some(dir) = &args.out {
+        migrations.dir = Some(dir.clone());
+    }
+}
+
+fn apply_export_overrides(args: &crate::commands::export::Args, export: &mut ExportConfig) {
+    if let Some(cursor_file) = &args.cursor_file {
+        export.cursor_file = Some(cursor_file.clone());
+    }
+    if let Some(batch_size) = args.batch_size {
+        export.batch_size = batch_size;
+    }
+    let (format, path) = match &export.sink {
+        SinkConfig::Jsonl { path } => (Format::Jsonl, path.clone()),
+        SinkConfig::Csv { path } => (Format::Csv, path.clone()),
+    };
+    let path = args.output.clone().or(path);
+    export.sink = match args.format.unwrap_or(format) {
+        Format::Jsonl => SinkConfig::Jsonl { path },
+        Format::Csv => SinkConfig::Csv { path },
+    };
+}
+
+fn validate_app_roles(app_roles: &[String]) -> anyhow::Result<()> {
+    if app_roles
+        .iter()
+        .any(|role| role.is_empty() || role.contains('\0'))
+    {
+        return Err(anyhow!(
+            "app role name must not be empty or contain NUL bytes"
+        ))
+        .exit_code(Exit::Usage);
+    }
+    Ok(())
 }
 
 fn load_file_config(explicit_path: Option<&Path>, cwd: &Path) -> anyhow::Result<FileConfig> {
@@ -896,6 +935,7 @@ mod tests {
         assert_eq!(cfg.schema, DEFAULT_SCHEMA);
         assert_eq!(cfg.capture.tables, Vec::<String>::new());
         assert_eq!(cfg.capture.exclude, Vec::<String>::new());
+        assert_eq!(cfg.capture.app_roles, Vec::<String>::new());
         assert_eq!(cfg.migrations.format, None);
         assert_eq!(cfg.migrations.dir, None);
         assert_eq!(cfg.export.cursor_file, None);
@@ -915,6 +955,7 @@ schema = "custom_audit"
 [capture]
 tables = ["public.invoice"]
 exclude = ["public.invoice.password_hash"]
+app_roles = ["app_user"]
 
 [migrations]
 format = "prisma"
@@ -939,6 +980,30 @@ batch_size = 250
         assert_eq!(cfg.schema, "custom_audit");
         assert_eq!(cfg.capture.tables, vec!["public.invoice"]);
         assert_eq!(cfg.capture.exclude, vec!["public.invoice.password_hash"]);
+        assert_eq!(cfg.capture.app_roles, vec!["app_user"]);
+
+        let cli_override = Cli::try_parse_from([
+            "auditstream",
+            "verify",
+            "--app-role",
+            "override_a",
+            "--app-role",
+            "override_b",
+        ])
+        .unwrap();
+        let overridden = Config::load_with_fallback_env(&cli_override, dir.path(), None).unwrap();
+        assert_eq!(
+            overridden.capture.app_roles,
+            vec!["override_a", "override_b"]
+        );
+
+        for bad_role in ["", "app\0user"] {
+            let cli_bad_role =
+                Cli::try_parse_from(["auditstream", "verify", "--app-role", bad_role]).unwrap();
+            let err = Config::load_with_fallback_env(&cli_bad_role, dir.path(), None).unwrap_err();
+            assert_eq!(exit_code_for(&err), Exit::Usage, "role={bad_role:?}");
+            assert!(err.to_string().contains("app role"), "{err}");
+        }
         assert_eq!(cfg.migrations.format, Some(MigrationFormat::Prisma));
         assert_eq!(cfg.migrations.dir, Some(PathBuf::from("prisma/migrations")));
         assert_eq!(

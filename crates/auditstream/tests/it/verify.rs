@@ -668,7 +668,7 @@ async fn verify_cli_reports_tampered_history_renamed_exclude_and_missing_default
         ("outdated", "auditstream.log_event(text, jsonb, jsonb)"),
         ("missing", "auditstream.changes_default"),
         ("missing", "auditstream.changes_lookup_idx"),
-        ("tampered_history", "auditstream.changes"),
+        ("rls_without_select_policy", "auditstream.changes"),
     ] {
         assert!(
             findings
@@ -746,7 +746,7 @@ async fn verify_cli_reports_hostile_rls_policy_with_attached_default_partition_w
     // Seed a row in `changes_default` (so PostgreSQL would evaluate the SELECT RLS policy if any
     // query touched `auditstream.changes`), then install a hostile `1 / 0 = 1` RLS policy while
     // keeping `changes_default` attached. Running `auditstream verify` as non-superuser `app_role`
-    // must exit 1 with `tampered_history`, never exit 3 (`division by zero`).
+    // must exit 1 with `forced_rls` and `rls_hides_default_partition`, never exit 3 (`division by zero`).
     db.execute_batch(
         "INSERT INTO auditstream.changes (occurred_at, source, op, db_user, schema_version) \
            VALUES ('2020-01-15T10:00:00.000000Z'::timestamptz, 'app', 'rls.seed', 'postgres', 1); \
@@ -779,13 +779,22 @@ async fn verify_cli_reports_hostile_rls_policy_with_attached_default_partition_w
     );
     let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse verify json");
     assert_eq!(parsed["ok"], false);
+    let findings = parsed["findings"].as_array().expect("findings array");
     assert!(
-        parsed["findings"]
-            .as_array()
-            .expect("findings array")
-            .iter()
-            .any(|f| f["kind"] == "tampered_history" && f["object"] == "auditstream.changes"),
-        "expected tampered_history finding on auditstream.changes, got: {parsed}"
+        findings.iter().any(|f| {
+            f["kind"] == "forced_rls"
+                && f["severity"] == "error"
+                && f["object"] == "auditstream.changes"
+        }),
+        "expected forced_rls error on auditstream.changes, got: {parsed}"
+    );
+    assert!(
+        findings.iter().any(|f| {
+            f["kind"] == "rls_hides_default_partition"
+                && f["severity"] == "warning"
+                && f["object"] == "auditstream.changes_default"
+        }),
+        "expected rls_hides_default_partition warning on auditstream.changes_default, got: {parsed}"
     );
 
     db.execute_batch(&format!(
@@ -793,6 +802,153 @@ async fn verify_cli_reports_hostile_rls_policy_with_attached_default_partition_w
     ))
     .await
     .expect("clean up app_role");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn verify_cli_rls_checks_and_app_roles_via_config_and_flag() {
+    use auditstream_pg::ddl::quote_ident;
+
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let mut db = TestDb::new().await.expect("create TestDb");
+    create_invoice_table(&db).await;
+
+    let suffix = db.database_name().to_owned();
+    let app_role = format!("vcli_app_{suffix}");
+    let exp_role = format!("vcli_exp_{suffix}");
+    let bypass_role = format!("vcli_byp_{suffix}");
+    db.track_role(&app_role);
+    db.track_role(&exp_role);
+    db.track_role(&bypass_role);
+
+    let app_pw = uuid::Uuid::new_v4().simple().to_string();
+    let exp_pw = uuid::Uuid::new_v4().simple().to_string();
+    let app_q = quote_ident(&app_role);
+    let exp_q = quote_ident(&exp_role);
+    let byp_q = quote_ident(&bypass_role);
+
+    db.execute_batch(&format!(
+        "CREATE ROLE {app_q} LOGIN PASSWORD '{app_pw}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS; \
+         CREATE ROLE {exp_q} LOGIN PASSWORD '{exp_pw}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS; \
+         CREATE ROLE {byp_q} NOLOGIN NOSUPERUSER BYPASSRLS;"
+    ))
+    .await
+    .expect("create CLI verify RLS roles");
+
+    let all = migrations::install_statements(
+        &DdlOptions::new(DEFAULT_SCHEMA, vec![app_role.clone()]),
+        &[TableTriggerSpec::new(
+            "public",
+            "invoice",
+            vec!["id".to_owned()],
+            vec!["password_hash".to_owned()],
+        )],
+    )
+    .expect("compose install statements");
+    db.execute_statements(&all).await.expect("install capture");
+
+    db.execute_batch(&format!(
+        "GRANT USAGE ON SCHEMA auditstream TO {exp_q}; \
+         GRANT SELECT ON auditstream.changes TO {exp_q}; \
+         ALTER TABLE auditstream.changes ENABLE ROW LEVEL SECURITY; \
+         CREATE POLICY tenant_app ON auditstream.changes FOR SELECT TO {app_q} \
+           USING (actor->>'tenant' = pg_catalog.current_setting('app.tenant', true)); \
+         CREATE POLICY exporter_all ON auditstream.changes FOR SELECT TO {exp_q} USING (true);"
+    ))
+    .await
+    .expect("enable multi-tenant RLS");
+
+    let base = db.url();
+    let (scheme, rest) = base.split_once("://").expect("valid postgres URL");
+    let (_, host_and_db) = rest.split_once('@').expect("URL has credentials");
+    let app_url = format!("{scheme}://{app_role}:{app_pw}@{host_and_db}");
+    let exp_url = format!("{scheme}://{exp_role}:{exp_pw}@{host_and_db}");
+
+    let dir = tempdir().expect("tempdir");
+    fs::write(
+        dir.path().join("auditstream.toml"),
+        format!("[capture]\ntables = [\"public.invoice\"]\nexclude = [\"public.invoice.password_hash\"]\napp_roles = [\"{bypass_role}\"]\n"),
+    )
+    .expect("write auditstream.toml with capture.app_roles");
+
+    // 1. As app_user: warnings (rls_hides_default_partition + rls_bypassed_by_app_role from config)
+    //    exit 0 under default --fail-on error and exit 1 under --fail-on warning.
+    let app_err_mode = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", &app_url)
+        .args(["verify", "--format", "json"])
+        .output()
+        .expect("run verify as app_user");
+    assert_eq!(app_err_mode.status.code(), Some(0));
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&app_err_mode.stdout).expect("parse json");
+    assert_eq!(parsed["ok"], true);
+    let findings = parsed["findings"].as_array().expect("findings array");
+    assert_eq!(
+        findings.len(),
+        2,
+        "expected exactly 2 warnings, got: {parsed}"
+    );
+    assert!(findings.iter().any(|f| {
+        f["kind"] == "rls_hides_default_partition"
+            && f["severity"] == "warning"
+            && f["object"] == "auditstream.changes_default"
+    }));
+    assert!(findings.iter().any(|f| {
+        f["kind"] == "rls_bypassed_by_app_role"
+            && f["severity"] == "warning"
+            && f["object"] == bypass_role
+    }));
+
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", &app_url)
+        .args(["verify", "--fail-on", "warning"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("rls_hides_default_partition"))
+        .stdout(predicate::str::contains("rls_bypassed_by_app_role"));
+
+    // 2. As auditstream_exporter with `--app-role <safe_app_role>` overriding config:
+    //    passes cleanly with zero findings even under `--fail-on warning`!
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", &exp_url)
+        .args(["verify", "--fail-on", "warning", "--app-role", &app_role])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("ok: no findings"));
+
+    // 3. Non-vacuous `--app-role` positive check: omit `app_roles` from config and pass the
+    //    bypassing role via `--app-role` -> fails under `--fail-on warning` with exactly 1 finding!
+    write_invoice_config(dir.path());
+    let flag_bypass = auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", &exp_url)
+        .args([
+            "verify",
+            "--format",
+            "json",
+            "--fail-on",
+            "warning",
+            "--app-role",
+            &bypass_role,
+        ])
+        .output()
+        .expect("run verify with --app-role <bypass_role>");
+    assert_eq!(flag_bypass.status.code(), Some(1));
+    let flag_parsed: serde_json::Value =
+        serde_json::from_slice(&flag_bypass.stdout).expect("parse flag json");
+    assert_eq!(flag_parsed["ok"], false);
+    let flag_findings = flag_parsed["findings"].as_array().expect("findings array");
+    assert_eq!(
+        flag_findings.len(),
+        1,
+        "expected exactly 1 finding from --app-role override, got: {flag_parsed}"
+    );
+    assert_eq!(flag_findings[0]["kind"], "rls_bypassed_by_app_role");
+    assert_eq!(flag_findings[0]["severity"], "warning");
+    assert_eq!(flag_findings[0]["object"], bypass_role);
 }
 
 #[test]

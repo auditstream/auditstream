@@ -99,6 +99,7 @@ pub struct TestDb {
     admin_url: String,
     database_name: String,
     role_name: Option<String>,
+    extra_roles: Vec<String>,
     pool: PgPool,
 }
 
@@ -130,6 +131,7 @@ impl TestDb {
             admin_url: admin_url.into(),
             database_name: db_name,
             role_name: None,
+            extra_roles: Vec::new(),
             pool,
         })
     }
@@ -181,7 +183,7 @@ impl TestDb {
         {
             Ok(pool) => pool,
             Err(err) => {
-                drop_database_and_role(admin_url.as_str(), &db_name, Some(&role_name)).await;
+                drop_database_and_role(admin_url.as_str(), &db_name, Some(&role_name), &[]).await;
                 return Err(err.into());
             }
         };
@@ -191,8 +193,15 @@ impl TestDb {
             admin_url: admin_url.into(),
             database_name: db_name,
             role_name: Some(role_name),
+            extra_roles: Vec::new(),
             pool,
         })
+    }
+
+    /// Registers an additional cluster-wide role created by a test so [`Drop`] drops it
+    /// automatically (even during a panic unwind) after `DROP DATABASE ... WITH (FORCE)`.
+    pub fn track_role(&mut self, role: impl Into<String>) {
+        self.extra_roles.push(role.into());
     }
 
     /// Acquires a cluster-wide advisory lock in the `postgres` maintenance
@@ -384,6 +393,7 @@ impl Drop for TestDb {
         let admin_url = self.admin_url.clone();
         let db_name = self.database_name.clone();
         let role_name = self.role_name.clone();
+        let extra_roles = std::mem::take(&mut self.extra_roles);
 
         // Run async cleanup on a dedicated OS thread with its own single-thread
         // Tokio runtime so Drop works reliably inside both `current_thread` and
@@ -409,6 +419,7 @@ impl Drop for TestDb {
                 &admin_url,
                 &db_name,
                 role_name.as_deref(),
+                &extra_roles,
             ));
         });
 
@@ -418,7 +429,12 @@ impl Drop for TestDb {
     }
 }
 
-async fn drop_database_and_role(admin_url: &str, db_name: &str, role_name: Option<&str>) {
+async fn drop_database_and_role(
+    admin_url: &str,
+    db_name: &str,
+    role_name: Option<&str>,
+    extra_roles: &[String],
+) {
     let mut admin = match PgConnection::connect(admin_url).await {
         Ok(conn) => conn,
         Err(err) => {
@@ -435,7 +451,12 @@ async fn drop_database_and_role(admin_url: &str, db_name: &str, role_name: Optio
         eprintln!("auditstream-testkit: failed to drop database `{db_name}`: {err}");
     }
 
-    if let Some(role) = role_name {
+    for role in extra_roles
+        .iter()
+        .rev()
+        .map(String::as_str)
+        .chain(role_name)
+    {
         let drop_role_sql = format!("DROP ROLE IF EXISTS {}", quote_ident(role));
         if let Err(err) = admin.execute(AssertSqlSafe(drop_role_sql)).await {
             eprintln!("auditstream-testkit: failed to drop role `{role}`: {err}");

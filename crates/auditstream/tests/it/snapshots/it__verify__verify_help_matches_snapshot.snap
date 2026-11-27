@@ -50,6 +50,9 @@ Options:
           
           [env: AUDITSTREAM_SCHEMA=]
 
+      --app-role <ROLE>
+          Application PostgreSQL role checked for RLS bypasses when RLS is enabled on `changes` (repeatable)
+
   -v, --verbose...
           Increase log verbosity (`-v` info, `-vv` debug)
 

@@ -57,6 +57,9 @@ pub(crate) struct Args {
     /// Replay from the beginning and replace the stored cursor.
     #[arg(long)]
     from_start: bool,
+    /// Allow exporting when Row-Level Security filters rows on `<schema>.changes` (for intentional per-tenant exports).
+    #[arg(long)]
+    allow_rls_filtered: bool,
     /// Format for the stderr summary (`text` or `json`; defaults to `json` with `--log-format json`, else `text`).
     #[arg(long, value_enum)]
     pub(crate) stats_format: Option<StatsFormat>,
@@ -132,6 +135,8 @@ struct Checkpoint {
     output_len: Option<u64>,
     #[serde(default, skip_serializing_if = "Redaction::is_empty")]
     redaction: Redaction,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    allow_rls_filtered: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,6 +279,10 @@ impl Checkpoint {
                 "--output",
             ),
             (self.redaction_differs(request), "export.redaction"),
+            (
+                self.allow_rls_filtered != request.allow_rls_filtered,
+                "--allow-rls-filtered",
+            ),
         ] {
             if changed {
                 return Err(anyhow!(
@@ -595,6 +604,7 @@ fn open_checkpoint(
         sink: runtime_sink.fingerprint(),
         output_len: None,
         redaction: config.export.redaction.clone(),
+        allow_rls_filtered: args.allow_rls_filtered,
     };
     let Some(path) = &config.export.cursor_file else {
         return Ok(OpenedCheckpoint {
@@ -861,6 +871,12 @@ async fn export_with_pool(
         .context("identifying PostgreSQL database")
         .exit_code(Exit::Database)?
         .into();
+    if !args.allow_rls_filtered {
+        reader::ensure_export_rls_safe(&pool, &config.schema)
+            .await
+            .context("checking Row-Level Security posture before export")
+            .exit_code(Exit::Database)?;
+    }
     let current_timeline_id = database.timeline_id;
     let mut opened = open_checkpoint(args, config, database)?;
 
@@ -895,7 +911,8 @@ async fn export_with_pool(
         &config.schema,
         opened.checkpoint.cursor,
         args.filters.reader_filter(),
-    );
+    )
+    .allow_rls_filtered(args.allow_rls_filtered);
     let mut sink = LazySink::new(opened.runtime_sink, opened.file.is_some());
     let mut source = ExportSource {
         reader,
@@ -1045,6 +1062,7 @@ mod tests {
             sink: sink.fingerprint(),
             output_len,
             redaction: Redaction::default(),
+            allow_rls_filtered: false,
         }
     }
 
@@ -1319,6 +1337,23 @@ mod tests {
         assert_eq!(exit_code_for(&err), Exit::Usage);
         assert!(err.to_string().contains("--tenant"), "{err}");
         assert!(err.to_string().contains("--from-start"), "{err}");
+
+        // Switching between unfiltered and `--allow-rls-filtered` requires `--from-start`.
+        let mut rls_filtered = saved.clone();
+        rls_filtered.allow_rls_filtered = true;
+        let err = saved.check_resume(&rls_filtered).expect_err("must reject");
+        assert_eq!(exit_code_for(&err), Exit::Usage);
+        assert!(err.to_string().contains("--allow-rls-filtered"), "{err}");
+        assert!(err.to_string().contains("--from-start"), "{err}");
+        let err = rls_filtered.check_resume(&saved).expect_err("must reject");
+        assert_eq!(exit_code_for(&err), Exit::Usage);
+        assert!(err.to_string().contains("--allow-rls-filtered"), "{err}");
+
+        // Unfiltered checkpoints omit `allow_rls_filtered`; filtered checkpoints persist it.
+        let serialized_unfiltered = serde_json::to_string(&saved).expect("serialize unfiltered");
+        assert!(!serialized_unfiltered.contains("allow_rls_filtered"));
+        let serialized_filtered = serde_json::to_string(&rls_filtered).expect("serialize filtered");
+        assert!(serialized_filtered.contains("\"allow_rls_filtered\":true"));
     }
 
     #[tokio::test]

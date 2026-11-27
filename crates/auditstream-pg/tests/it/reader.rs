@@ -1786,3 +1786,328 @@ async fn reader_qualified_order_by_works_with_custom_schema_and_same_timestamp_t
 
     drop(db);
 }
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn export_rls_guard_fails_closed_for_zero_filtered_and_restrictive_policies_and_allows_unobstructed_exporter()
+ {
+    use auditstream_pg::reader::{check_export_rls, ensure_export_rls_safe};
+
+    let _lock = TestDb::cluster_lock().await.expect("acquire cluster lock");
+    let mut fixture = setup_reader_db().await;
+    let suffix = fixture.db.database_name().to_owned();
+    let exp_group = format!("expgrp_{suffix}");
+    let noinherit_role = format!("noinh_{suffix}");
+    fixture.db.track_role(fixture.app_role.clone());
+    fixture.db.track_role(fixture.reader_role.clone());
+    fixture.db.track_role(exp_group.clone());
+    fixture.db.track_role(noinherit_role.clone());
+
+    let noinherit_pw = Uuid::new_v4().simple().to_string();
+    let app_q = quote_ident(&fixture.app_role);
+    let exp_q = quote_ident(&fixture.reader_role);
+    let grp_q = quote_ident(&exp_group);
+    let noi_q = quote_ident(&noinherit_role);
+
+    fixture
+        .db
+        .execute_batch(&format!(
+            "CREATE ROLE {grp_q} NOLOGIN; \
+             CREATE ROLE {noi_q} LOGIN PASSWORD '{noinherit_pw}' NOSUPERUSER NOBYPASSRLS NOINHERIT; \
+             GRANT {grp_q} TO {exp_q}; \
+             GRANT {grp_q} TO {noi_q}; \
+             GRANT USAGE ON SCHEMA auditstream TO {noi_q}; \
+             GRANT SELECT ON auditstream.changes TO {noi_q}; \
+             ALTER TABLE auditstream.changes ENABLE ROW LEVEL SECURITY;"
+        ))
+        .await
+        .expect("create group/noinherit roles and enable non-forced RLS on changes");
+
+    let noinherit_url = app_role_url(&fixture.db, &noinherit_role, &noinherit_pw);
+    let noinherit_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&noinherit_url)
+        .await
+        .expect("connect noinherit_pool");
+
+    // Seed all 4 audited events across 2 tenants in ONE transaction via real non-superuser
+    // `app_user` DML writes AFTER `ENABLE ROW LEVEL SECURITY` (without FORCE):
+    // 1) proves non-superuser app capture works under non-forced RLS, and
+    // 2) assigns all 4 rows one shared `xact_id` so they become visible atomically.
+    {
+        let mut tx = fixture.app_pool.begin().await.expect("begin seed tx");
+        for (id, tenant) in [
+            (1, "tenant_a"),
+            (2, "tenant_a"),
+            (3, "tenant_b"),
+            (4, "tenant_b"),
+        ] {
+            let actor_json = format!(r#"{{"type":"user","id":"u{id}","tenant":"{tenant}"}}"#);
+            sqlx::query("SELECT pg_catalog.set_config('auditstream.actor', $1, true)")
+                .bind(&actor_json)
+                .execute(&mut *tx)
+                .await
+                .expect("set actor");
+            sqlx::query("INSERT INTO public.invoice (id, status, total) VALUES ($1, 'open', 10)")
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .expect("insert invoice under non-forced RLS");
+        }
+        tx.commit().await.expect("commit seed tx");
+    }
+
+    // 1. 0 policies -> both app_user and exporter fail closed without advancing cursor.
+    let status_zero = check_export_rls(&fixture.reader_pool, DEFAULT_SCHEMA)
+        .await
+        .expect("check_export_rls with 0 policies");
+    assert!(status_zero.table_exists);
+    assert!(status_zero.row_security_active);
+    assert!(!status_zero.allows_unfiltered_export());
+    assert_eq!(status_zero.applicable_permissive_select_policies, 0);
+
+    for (label, pool) in [
+        ("exporter", &fixture.reader_pool),
+        ("app_user", &fixture.app_pool),
+    ] {
+        let mut zero_src = PgEventSource::with_default_schema(pool.clone(), Cursor::new(0, 0));
+        let err = zero_src
+            .next_batch(10)
+            .await
+            .expect_err("0-policy RLS must fail closed");
+        assert!(
+            matches!(err, SourceError::RlsFiltered(_)),
+            "{label} got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no applicable PERMISSIVE SELECT policy"),
+            "{msg}"
+        );
+        assert!(msg.contains("auditstream_exporter"), "{msg}");
+        assert!(msg.contains("BYPASSRLS"), "{msg}");
+        assert!(msg.contains("--allow-rls-filtered"), "{msg}");
+        assert_eq!(zero_src.current_position(), Cursor::new(0, 0));
+    }
+
+    // 2. Tenant-filtered PERMISSIVE policy for app_user -> fails closed by default (via both
+    //    `ensure_export_rls_safe` and `PgEventSource::next_batch`), succeeds with
+    //    `.allow_rls_filtered(true)` returning ONLY tenant_a's exact 2 rows.
+    fixture
+        .db
+        .execute(&format!(
+            "CREATE POLICY tenant_read ON auditstream.changes FOR SELECT TO {app_q} \
+               USING (actor->>'tenant' = pg_catalog.current_setting('app.tenant', true))"
+        ))
+        .await
+        .expect("create tenant_read policy");
+
+    let filtered_err = ensure_export_rls_safe(&fixture.app_pool, DEFAULT_SCHEMA)
+        .await
+        .expect_err("tenant-filtered policy must fail closed");
+    assert!(
+        matches!(filtered_err, SourceError::RlsFiltered(_)),
+        "got: {filtered_err:?}"
+    );
+    assert!(
+        filtered_err
+            .to_string()
+            .contains("without an unobstructed PERMISSIVE USING (true)"),
+        "{filtered_err}"
+    );
+    let mut blocked_app_src =
+        PgEventSource::with_default_schema(fixture.app_pool.clone(), Cursor::new(0, 0));
+    let blocked_app_err = blocked_app_src
+        .next_batch(10)
+        .await
+        .expect_err("tenant-filtered PgEventSource must fail closed");
+    assert!(matches!(blocked_app_err, SourceError::RlsFiltered(_)));
+    assert_eq!(blocked_app_src.current_position(), Cursor::new(0, 0));
+
+    let tenant_a_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                conn.execute("SELECT pg_catalog.set_config('app.tenant', 'tenant_a', false)")
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&fixture.app_url)
+        .await
+        .expect("connect tenant_a pool");
+    let mut allowed_src =
+        PgEventSource::with_default_schema(tenant_a_pool.clone(), Cursor::new(0, 0))
+            .allow_rls_filtered(true);
+    assert!(allowed_src.is_rls_filtered_allowed());
+    let tenant_events = drain_until(&mut allowed_src, 10, 2, Duration::from_secs(15)).await;
+    assert!(
+        allowed_src
+            .next_batch(10)
+            .await
+            .expect("tail check after tenant_a drain")
+            .is_none(),
+        "RLS must hide tenant_b rows from tenant_a export"
+    );
+    let tenant_record_ids: Vec<&str> = tenant_events
+        .iter()
+        .map(|ev| ev.record_id.as_deref().expect("record_id").get())
+        .collect();
+    assert_eq!(tenant_record_ids, vec![r#"{"id":1}"#, r#"{"id":2}"#]);
+    for ev in &tenant_events {
+        let actor: serde_json::Value =
+            serde_json::from_str(ev.actor.as_deref().expect("actor").get()).expect("actor json");
+        assert_eq!(actor["tenant"], "tenant_a");
+    }
+
+    // 3. Unobstructed PERMISSIVE USING (true) granted via inherited group role (`FOR ALL` /
+    //    `polcmd = '*'`):
+    //    - INHERIT exporter sees all 4 events (both tenants).
+    //    - NOINHERIT exporter still fails closed (proving pg_has_role(..., 'USAGE') accuracy!).
+    fixture
+        .db
+        .execute(&format!(
+            "CREATE POLICY exporter_all ON auditstream.changes FOR ALL TO {grp_q} USING (true)"
+        ))
+        .await
+        .expect("create inherited FOR ALL exporter policy");
+
+    let noinh_status = check_export_rls(&noinherit_pool, DEFAULT_SCHEMA)
+        .await
+        .expect("check_export_rls for NOINHERIT role");
+    assert!(noinh_status.row_security_active);
+    assert!(
+        !noinh_status.allows_unfiltered_export(),
+        "NOINHERIT member must NOT inherit group USING (true) policy: {noinh_status:?}"
+    );
+    let noinh_err = PgEventSource::with_default_schema(noinherit_pool.clone(), Cursor::new(0, 0))
+        .next_batch(10)
+        .await
+        .expect_err("NOINHERIT exporter must fail closed");
+    assert!(matches!(noinh_err, SourceError::RlsFiltered(_)));
+
+    let exp_status = check_export_rls(&fixture.reader_pool, DEFAULT_SCHEMA)
+        .await
+        .expect("check_export_rls for INHERIT exporter");
+    assert!(exp_status.row_security_active);
+    assert!(exp_status.has_unrestricted_permissive_select);
+    assert_eq!(
+        exp_status.blocking_restrictive_policies,
+        Vec::<String>::new()
+    );
+    assert!(exp_status.allows_unfiltered_export());
+    let mut exp_src =
+        PgEventSource::with_default_schema(fixture.reader_pool.clone(), Cursor::new(0, 0));
+    let all_events = drain_until(&mut exp_src, 10, 4, Duration::from_secs(15)).await;
+    assert!(
+        exp_src
+            .next_batch(10)
+            .await
+            .expect("tail check after full drain")
+            .is_none()
+    );
+    let all_record_ids: Vec<&str> = all_events
+        .iter()
+        .map(|ev| ev.record_id.as_deref().expect("record_id").get())
+        .collect();
+    assert_eq!(
+        all_record_ids,
+        vec![r#"{"id":1}"#, r#"{"id":2}"#, r#"{"id":3}"#, r#"{"id":4}"#]
+    );
+    let tenants: Vec<String> = all_events
+        .iter()
+        .map(|ev| {
+            let actor: serde_json::Value =
+                serde_json::from_str(ev.actor.as_deref().expect("actor").get())
+                    .expect("actor json");
+            actor["tenant"].as_str().expect("tenant").to_owned()
+        })
+        .collect();
+    assert_eq!(
+        tenants,
+        vec!["tenant_a", "tenant_a", "tenant_b", "tenant_b"]
+    );
+
+    // 4. Mid-window pagination guard: read Batch 1 (size 2, keeping `active_window` open), then
+    //    add a PUBLIC RESTRICTIVE policy before Batch 2 -> Batch 2 MUST fail closed with
+    //    `SourceError::RlsFiltered` instead of silently advancing the cursor past hidden rows!
+    let mut paged_src =
+        PgEventSource::with_default_schema(fixture.reader_pool.clone(), Cursor::new(0, 0));
+    let batch1 = paged_src
+        .next_batch(2)
+        .await
+        .expect("batch 1 succeeds")
+        .expect("batch 1 yields first 2 rows");
+    assert_eq!(batch1.events.len(), 2);
+    let batch1_cursor = batch1.cursor.expect("batch 1 cursor");
+    paged_src.ack(&batch1_cursor).await.expect("ack batch 1");
+
+    fixture
+        .db
+        .execute(
+            "CREATE POLICY rest_public ON auditstream.changes AS RESTRICTIVE FOR ALL TO PUBLIC \
+             USING (actor->>'tenant' = 'tenant_a')",
+        )
+        .await
+        .expect("create PUBLIC RESTRICTIVE FOR ALL policy mid-window");
+
+    let batch2_err = paged_src
+        .next_batch(2)
+        .await
+        .expect_err("Batch 2 on cached active_window must still fail closed after RLS narrows");
+    assert!(
+        matches!(batch2_err, SourceError::RlsFiltered(_)),
+        "expected RlsFiltered on Batch 2, got: {batch2_err:?}"
+    );
+    assert!(
+        batch2_err.to_string().contains("rest_public"),
+        "{batch2_err}"
+    );
+    assert_eq!(
+        paged_src.current_position(),
+        batch1_cursor,
+        "failed Batch 2 must not advance cursor"
+    );
+
+    // Fresh reader with PERMISSIVE USING (true) + PUBLIC RESTRICTIVE policy also fails closed.
+    let rest_status = check_export_rls(&fixture.reader_pool, DEFAULT_SCHEMA)
+        .await
+        .expect("check_export_rls with PUBLIC RESTRICTIVE");
+    assert!(rest_status.has_unrestricted_permissive_select);
+    assert_eq!(
+        rest_status.blocking_restrictive_policies,
+        vec!["rest_public"]
+    );
+    assert!(!rest_status.allows_unfiltered_export());
+
+    let mut rest_src =
+        PgEventSource::with_default_schema(fixture.reader_pool.clone(), Cursor::new(0, 0));
+    let rest_err = rest_src
+        .next_batch(10)
+        .await
+        .expect_err("PERMISSIVE USING (true) + RESTRICTIVE policy must fail closed");
+    assert!(matches!(rest_err, SourceError::RlsFiltered(_)));
+    assert!(rest_err.to_string().contains("rest_public"), "{rest_err}");
+    assert_eq!(rest_src.current_position(), Cursor::new(0, 0));
+
+    // A RESTRICTIVE policy targeting only `app_user` (or `USING (true)`) must NOT block `exporter`.
+    fixture
+        .db
+        .execute_batch(&format!(
+            "DROP POLICY rest_public ON auditstream.changes; \
+             CREATE POLICY rest_app_only ON auditstream.changes AS RESTRICTIVE FOR SELECT TO {app_q} \
+               USING (actor->>'tenant' = 'tenant_a'); \
+             CREATE POLICY rest_true ON auditstream.changes AS RESTRICTIVE FOR SELECT TO PUBLIC \
+               USING (true);"
+        ))
+        .await
+        .expect("replace with non-blocking restrictive policies");
+    ensure_export_rls_safe(&fixture.reader_pool, DEFAULT_SCHEMA)
+        .await
+        .expect("non-applicable and USING (true) RESTRICTIVE policies must allow exporter");
+
+    tenant_a_pool.close().await;
+    noinherit_pool.close().await;
+    fixture.app_pool.close().await;
+    fixture.reader_pool.close().await;
+}
