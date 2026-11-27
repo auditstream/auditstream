@@ -186,6 +186,96 @@ async fn preserves_40_digit_numeric_trailing_zero_decimal_and_u64_overflow_byte_
 }
 
 #[tokio::test]
+async fn compacts_pretty_printed_raw_values_into_single_line_preserving_numbers_keys_and_strings() {
+    let validator = load_event_schema();
+    let huge_numeric = "123456789012345678901234567890.1234567890";
+    let trailing_zero = "1.10";
+    let above_u64_max = "18446744073709551616999999";
+
+    let mut db_event = sample_events_all_five_kinds().remove(1);
+    db_event.record_id = Some(raw_json(" \r\n\t {\n  \"id\" : 1\n}\r\n "));
+    db_event.before = Some(raw_json(
+        "{\r\n\t\"status\": \"  in   progress  \",\r\n\t\"path\": \"C:\\\\dir\\\\\"\r\n}",
+    ));
+    db_event.after = Some(raw_json(&format!(
+        " \n{{\n  \"huge\": {huge_numeric},\n  \"price\": {trailing_zero},\n  \"big_int\": {above_u64_max},\n  \"neg_zero\": -0.00,\n  \"sci\": 1e+30,\n  \"z_key\": 1,\n  \"a_key\": 2,\n  \"note\": \"line1\\nline2\\r\\n\\t\\\"quoted\\\" \\\\ end\",\n  \"slashes\": \"a\\\\\\\"b\",\n  \"dir\": \"trailing\\\\\",\n  \"unicode\": \"é 日 🚀 \u{2028}\u{2029}   spaces\"\n}}\r\n"
+    )));
+    db_event.actor = Some(raw_json("{\n  \"type\": \"user\",\n  \"id\": \"usr 1\"\n}"));
+    db_event.context = Some(raw_json(
+        "{\r\n  \"requestId\": \"req_1\",\r\n  \"source\": \"api gateway\"\r\n}",
+    ));
+
+    let mut app_event = sample_events_all_five_kinds().remove(4);
+    app_event.record_id = Some(raw_json("{\n  \"id\": \"inv_42\"\n}"));
+    app_event.after = Some(raw_json(
+        " \r\n[\n  1.10,\n  \"a \\\"b\\\" c\",\n  {\n    \"k\" : \"v  w\"\n  }\n]\r\n ",
+    ));
+
+    let events = vec![db_event, app_event];
+    let mut sink = JsonLinesSink::new(Vec::<u8>::new());
+    sink.write(&Batch::new(events.clone(), Some(Cursor::new(10, 2))))
+        .await
+        .expect("write pretty-printed batch");
+    sink.flush().await.expect("flush");
+
+    let output = String::from_utf8(sink.into_inner()).expect("valid utf-8");
+    assert!(output.ends_with('\n'));
+    assert_eq!(
+        output.bytes().filter(|&b| b == b'\n').count(),
+        events.len(),
+        "each event must occupy exactly one LF-terminated line: {output:?}"
+    );
+    assert!(
+        !output.contains('\r'),
+        "raw CR must never appear in JSONL output: {output:?}"
+    );
+    assert!(
+        !output.contains('\t'),
+        "raw TAB must never appear in JSONL output: {output:?}"
+    );
+
+    let lines: Vec<&str> = output.split('\n').filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), events.len());
+
+    // Line 0: schema-valid, arbitrary-precision numbers and key order preserved byte-for-byte.
+    let db_val: Value = serde_json::from_str(lines[0]).expect("parse line 0 JSON");
+    assert!(
+        validator.is_valid(&db_val),
+        "line 0 failed event.schema.json: {}",
+        lines[0]
+    );
+    assert!(lines[0].contains(&format!(r#""huge":{huge_numeric}"#)));
+    assert!(lines[0].contains(&format!(r#""price":{trailing_zero}"#)));
+    assert!(lines[0].contains(&format!(r#""big_int":{above_u64_max}"#)));
+    assert!(lines[0].contains(r#""neg_zero":-0.00"#));
+    assert!(lines[0].contains(r#""sci":1e+30"#));
+    assert!(lines[0].contains(r#""z_key":1,"a_key":2"#));
+    assert!(lines[0].contains(r#""dir":"trailing\\""#));
+    assert!(lines[0].contains(r#""status":"  in   progress  ""#));
+
+    // Line 1: pretty-printed non-object app payload compacted without mutating string spaces/numbers.
+    assert!(lines[1].contains(r#""after":[1.10,"a \"b\" c",{"k":"v  w"}]"#));
+
+    // Every RawValue field round-trips to the exact same JSON Value as the pretty-printed input.
+    for (line, expected) in lines.iter().zip(events.iter()) {
+        let parsed: Event = serde_json::from_str(line).expect("parse Event from compacted line");
+        for (got_field, exp_field) in [
+            (parsed.record_id.as_deref(), expected.record_id.as_deref()),
+            (parsed.before.as_deref(), expected.before.as_deref()),
+            (parsed.after.as_deref(), expected.after.as_deref()),
+            (parsed.actor.as_deref(), expected.actor.as_deref()),
+            (parsed.context.as_deref(), expected.context.as_deref()),
+        ] {
+            let got_val: Option<Value> =
+                got_field.map(|raw| serde_json::from_str(raw.get()).expect("valid got json"));
+            let exp_val: Option<Value> =
+                exp_field.map(|raw| serde_json::from_str(raw.get()).expect("valid exp json"));
+            assert_eq!(got_val, exp_val);
+        }
+    }
+}
+
+#[tokio::test]
 async fn any_sink_file_target_creates_appends_and_syncs_on_flush() {
     let dir = tempdir().expect("tempdir");
     let file_path = dir.path().join("audit.jsonl");
@@ -314,6 +404,8 @@ fn sink_config_round_trips_through_toml() {
 fn arb_tricky_text() -> impl Strategy<Value = String> {
     proptest::collection::vec(
         prop_oneof![
+            Just(' '),
+            Just('\t'),
             Just('\n'),
             Just('\r'),
             Just('\u{2028}'),
@@ -369,6 +461,78 @@ proptest! {
         for (line, expected) in lines.iter().zip(events.iter()) {
             let parsed: Event = serde_json::from_str(line).expect("each line is valid Event JSON");
             prop_assert_eq!(&parsed, expected);
+        }
+    }
+
+    #[test]
+    fn pretty_printed_raw_values_always_emit_one_valid_line_per_event(
+        texts in proptest::collection::vec(arb_tricky_text(), 1..8)
+    ) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+
+        let events: Vec<Event> = texts
+            .iter()
+            .enumerate()
+            .map(|(idx, text)| {
+                let mut ev = sample_events_all_five_kinds().remove(1);
+                ev.event_id = Uuid::from_u128(idx as u128 + 1);
+                let pretty_obj = serde_json::to_string_pretty(&serde_json::json!({
+                    "id": idx,
+                    "note": text,
+                    "nested": { "k": text }
+                }))
+                .expect("pretty json");
+                // Embed CRLF + TAB inside the JSON object itself (`serde_json::to_string_pretty`
+                // escapes all newlines inside string values as `\\n`, so raw `\n` is structural).
+                let crlf_tab_obj = pretty_obj.replace('\n', "\r\n\t");
+                ev.record_id = Some(raw_json(&format!("{{\r\n\t\"id\": {idx}\r\n}}")));
+                ev.before = Some(raw_json(&crlf_tab_obj));
+                ev.after = Some(raw_json(&crlf_tab_obj));
+                ev.actor = Some(raw_json(&serde_json::to_string_pretty(&serde_json::json!({
+                    "type": "user",
+                    "id": text
+                })).expect("pretty actor")));
+                ev.context = Some(raw_json(&serde_json::to_string_pretty(&serde_json::json!({
+                    "requestId": text
+                })).expect("pretty context")));
+                ev
+            })
+            .collect();
+
+        let output = rt.block_on(async {
+            let mut sink = JsonLinesSink::new(Vec::<u8>::new());
+            let cursor_id = i64::try_from(events.len()).expect("len fits i64");
+            sink.write(&Batch::new(events.clone(), Some(Cursor::new(1, cursor_id))))
+                .await
+                .expect("write");
+            sink.flush().await.expect("flush");
+            String::from_utf8(sink.into_inner()).expect("valid utf-8")
+        });
+
+        prop_assert!(output.ends_with('\n'));
+        prop_assert_eq!(output.bytes().filter(|&b| b == b'\n').count(), events.len());
+        prop_assert!(!output.contains('\r'));
+        prop_assert!(!output.contains('\t'));
+        let lines: Vec<&str> = output.split('\n').filter(|l| !l.is_empty()).collect();
+        prop_assert_eq!(lines.len(), events.len());
+        for (line, expected) in lines.iter().zip(events.iter()) {
+            let parsed: Event = serde_json::from_str(line).expect("each line is valid Event JSON");
+            for (got_f, exp_f) in [
+                (parsed.record_id.as_deref(), expected.record_id.as_deref()),
+                (parsed.before.as_deref(), expected.before.as_deref()),
+                (parsed.after.as_deref(), expected.after.as_deref()),
+                (parsed.actor.as_deref(), expected.actor.as_deref()),
+                (parsed.context.as_deref(), expected.context.as_deref()),
+            ] {
+                let got_val: Option<Value> =
+                    got_f.map(|raw| serde_json::from_str(raw.get()).expect("got json"));
+                let exp_val: Option<Value> =
+                    exp_f.map(|raw| serde_json::from_str(raw.get()).expect("exp json"));
+                prop_assert_eq!(got_val, exp_val);
+            }
         }
     }
 }

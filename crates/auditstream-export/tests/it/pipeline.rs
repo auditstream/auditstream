@@ -725,3 +725,75 @@ async fn pipeline_applies_redaction_before_sink_write_and_fails_closed_before_ac
         "failed redaction must abort before sink.write, sink.flush, and source.ack"
     );
 }
+
+#[tokio::test]
+async fn pipeline_redaction_and_multi_batch_jsonl_compact_pretty_raw_values_and_reuse_line_buf() {
+    use auditstream_core::{CompiledRedaction, Redaction, RedactionMode, RedactionRule};
+
+    let mut pretty_event = make_event(0);
+    pretty_event.record_id = Some(
+        RawValue::from_string("{\r\n\t\"email\": \"alice@example.com\"\r\n}".to_owned())
+            .expect("pretty record_id"),
+    );
+    pretty_event.after = Some(
+        RawValue::from_string(
+            "{\r\n\t\"email\": \"alice@example.com\",\r\n\t\"nested\": {\r\n\t\t\"amount\": 123456789012345678901234.567890,\r\n\t\t\"note\": \"keep   spaces\"\r\n\t}\r\n}"
+                .to_owned(),
+        )
+        .expect("pretty after"),
+    );
+    pretty_event.actor = Some(
+        RawValue::from_string("{\n  \"type\": \"user\",\n  \"id\": \"usr_1\"\n}".to_owned())
+            .expect("pretty actor"),
+    );
+    pretty_event.context = Some(
+        RawValue::from_string("{\r\n  \"source\": \"api gateway\"\r\n}".to_owned())
+            .expect("pretty context"),
+    );
+
+    let compact_event = make_event(1);
+    let records = vec![
+        (Cursor::new(300, 1), pretty_event),
+        (Cursor::new(301, 2), compact_event.clone()),
+    ];
+    let compiled = CompiledRedaction::compile(&Redaction::new(vec![RedactionRule::for_table(
+        "public.invoice",
+        ["email"],
+        RedactionMode::Mask,
+    )]))
+    .expect("compile redaction");
+
+    let acked = Arc::new(Mutex::new(Cursor::new(0, 0)));
+    let mut source = MemorySource::from_store(records, Arc::clone(&acked), None);
+    let mut sink = JsonLinesSink::new(Vec::<u8>::new());
+    let report = run(
+        &mut source,
+        &mut sink,
+        &Options::with_batch_size(1).with_redaction(compiled),
+    )
+    .await
+    .expect("multi-batch redacted jsonl run");
+
+    assert_eq!(report.batches, 2);
+    assert_eq!(report.events, 2);
+
+    let output = String::from_utf8(sink.into_inner()).expect("utf8 jsonl");
+    assert!(output.ends_with('\n'));
+    assert_eq!(output.bytes().filter(|&b| b == b'\n').count(), 2);
+    assert!(!output.contains('\r'));
+    assert!(!output.contains('\t'));
+
+    let lines: Vec<&str> = output.split('\n').filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 2);
+
+    // Batch 1: after.email redacted, untouched nested object + record_id compacted onto one line,
+    // numeric precision preserved, and natural-PK record_id remains unmodified as documented.
+    assert!(lines[0].contains(r#""record_id":{"email":"alice@example.com"}"#));
+    assert!(lines[0].contains(
+        r#""after":{"email":"[redacted]","nested":{"amount":123456789012345678901234.567890,"note":"keep   spaces"}}"#
+    ));
+
+    // Batch 2: compact event round-trips identically after line_buf reuse across batches.
+    let parsed_second: Event = serde_json::from_str(lines[1]).expect("parse second event");
+    assert_eq!(parsed_second, compact_event);
+}

@@ -45,6 +45,7 @@ Configure `[[export.redaction.rules]]` in `auditstream.toml` to mask (`"[redacte
 
 - **Secrets belong in `capture.exclude`:** Export redaction runs only when events leave PostgreSQL. Secrets, credentials, password hashes, and payment card numbers must be excluded via `capture.exclude` so they are never stored in `auditstream.changes`.
 - **Top-level keys only & fail-closed:** Redaction matches top-level JSON object keys only (nested dot-paths such as `metadata.ssn` exit `2` at startup) and preserves untouched key order and arbitrary-precision PostgreSQL `numeric` values. If a matching rule encounters a non-object or malformed JSON payload (such as an `app` event whose `data` is a JSON array), the export aborts with exit code `5` before writing or advancing the cursor.
+- **`record_id` is never redacted:** Rules only modify `before`, `after`, and (for `mode = "remove"`) `changed`. Tables with natural PII primary keys (for example `email` or `ssn`) or `app` events that put PII in `target` still export `record_id` in plaintext; prefer surrogate primary keys and opaque `target` identifiers when exported streams must exclude PII. See [Configuration reference: Export redaction](../config.md#export-redaction-exportredactionrules).
 
 ## Tenant filtering notes
 

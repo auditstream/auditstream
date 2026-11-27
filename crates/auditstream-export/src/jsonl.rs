@@ -10,9 +10,10 @@ use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter, Stdout};
 /// UTF-8 JSON line terminated with `\n`.
 ///
 /// Serializes [`Event`](auditstream_core::Event) directly through `serde_json` (with
-/// `raw_value` and `arbitrary_precision`) so JSON columns (`record_id`, `before`, `after`,
-/// `actor`, `context`) pass through byte-for-byte without rounding numeric values or
-/// reordering object keys.
+/// `raw_value` and `arbitrary_precision`) and strips insignificant ASCII whitespace outside
+/// JSON string literals in place, so JSON columns (`record_id`, `before`, `after`, `actor`,
+/// `context`) always emit on a single line without rounding numeric values or reordering
+/// object keys.
 #[derive(Debug)]
 pub struct JsonLinesSink<W> {
     writer: BufWriter<W>,
@@ -49,6 +50,7 @@ impl<W: AsyncWrite + Unpin + Send> Sink for JsonLinesSink<W> {
         for event in &batch.events {
             self.line_buf.clear();
             serde_json::to_writer(&mut self.line_buf, event)?;
+            crate::compact_json_bytes_in_place(&mut self.line_buf);
             self.line_buf.push(b'\n');
             self.writer.write_all(&self.line_buf).await?;
         }
