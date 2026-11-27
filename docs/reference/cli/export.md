@@ -56,7 +56,7 @@ When RLS is active for the connected role, export **fails closed** with exit cod
 - at least one applicable `PERMISSIVE` policy covering `SELECT` (`polcmd IN ('*', 'r')`, including policies targeting `PUBLIC` or inherited roles) has `USING (true)`, **and**
 - zero applicable `RESTRICTIVE` policies covering `SELECT` have a `USING` expression other than `'true'`.
 
-To export all tenants safely under RLS — including on managed PostgreSQL providers such as Amazon RDS, Neon, and Supabase where non-superuser `BYPASSRLS` is disallowed — create a dedicated `NOSUPERUSER NOBYPASSRLS` role (for example `auditstream_exporter`) with `USAGE` on the audit schema, `SELECT` on `<schema>.changes`, and a `PERMISSIVE` `SELECT` policy `USING (true)` that is not narrowed by any applicable `RESTRICTIVE` policy.
+To export all tenants safely under RLS — including on PostgreSQL 15 and managed PostgreSQL providers such as Amazon RDS where non-superuser `BYPASSRLS` is disallowed, and without relying on elevated `BYPASSRLS` admin roles on Neon or Supabase — create a dedicated `NOSUPERUSER NOBYPASSRLS` role (for example `auditstream_exporter`) with `USAGE` on the audit schema, `SELECT` on `<schema>.changes`, and a `PERMISSIVE` `SELECT` policy `USING (true)` that is not narrowed by any applicable `RESTRICTIVE` policy. See [Isolate tenants with Row-Level Security (RLS)](../../how-to/multi-tenant-rls.md).
 Pass `--allow-rls-filtered` only when an intentionally RLS-filtered (for example per-tenant) export is desired.
 
 ## Tenant filtering notes

@@ -42,3 +42,14 @@ GRANT EXECUTE ON FUNCTION auditstream.log_event(text, jsonb, jsonb) TO app_user;
 
 Do not grant `INSERT`, `UPDATE`, `DELETE`, or `TRUNCATE` on `auditstream.changes` to the application role.
 `auditstream history` and `auditstream export` both work with `SELECT`-only access on `auditstream.changes`.
+
+## Multi-tenant Row-Level Security (RLS)
+
+Default admin roles on Neon (`neondb_owner`, `neon_superuser`) and Supabase (`postgres`, `service_role`) carry `BYPASSRLS` and silently bypass RLS, while Amazon RDS disallows `BYPASSRLS` on customer admin roles (`rds_superuser`).
+For portable, least-privilege multi-tenant RLS on `auditstream.changes`:
+
+- Create a dedicated `NOSUPERUSER NOBYPASSRLS` `app_user` via SQL for runtime queries, and dedicated `NOSUPERUSER NOBYPASSRLS` `auditstream_exporter` and `auditstream_verify` roles with `PERMISSIVE` `SELECT` policies `USING (true)` and zero `RESTRICTIVE` policies. Connect `auditstream export` as `auditstream_exporter` (connecting as `app_user` fails closed with exit code `3` under RLS).
+- Enable `ALTER TABLE auditstream.changes ENABLE ROW LEVEL SECURITY;` as `auditstream_owner` — never `FORCE ROW LEVEL SECURITY` (which breaks `SECURITY DEFINER` capture writes), never grant `SELECT` on child partitions, and scope tenant policies `TO app_user` (never `TO PUBLIC`).
+- On Neon's stateless HTTP driver, run `set_config('app.tenant', $1, true)` and the `SELECT` together inside one HTTP batch transaction (`sql.transaction([...])`), or use Neon Authorize (`pg_session_jwt` `auth.session()`) / Supabase JWT claims (`request.jwt.claims`) and update the RLS policy's right-hand side to match.
+
+See [Isolate tenants with Row-Level Security (RLS)](multi-tenant-rls.md) for the complete row-data RLS policy, AST-matched expression index, `record_id` lookup workarounds, and `verify`/`export` RLS guards.

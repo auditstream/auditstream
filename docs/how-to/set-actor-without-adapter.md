@@ -33,6 +33,14 @@ COMMIT;
 
 When both `set_config` and a trailing comment are present, `set_config` takes precedence.
 
+### When to prefer `set_config` (bulk updates and backfills)
+
+For high-volume single-statement bulk `UPDATE` workloads and backfills, prefer transaction-local `set_config('auditstream.actor', '<json>', true)` over a trailing SQL comment.
+Because `auditstream_update` runs `FOR EACH ROW`, `set_config` skips per-row SQL comment parsing and cuts 100,000-row bulk-`UPDATE` execution time by **~32%–40%** with zero security trade-offs.
+See [ADR-0010](../decisions/0010-no-guc-actor-caching-in-capture-trigger.md) and [How capture works: Bulk `UPDATE`s and backfills](../explanation/how-capture-works.md#bulk-updates-and-backfills-use-set_config) for benchmark details.
+
+Note: behind AWS RDS Proxy, `set_config(..., true)` triggers session pinning; keep trailing SQL comments for normal OLTP writes behind RDS Proxy and run large backfills on a direct connection.
+
 ## Record application events (`auditstream.log_event`)
 
 Call `auditstream.log_event(action, target, data)` to log domain events that do not modify an audited table:
