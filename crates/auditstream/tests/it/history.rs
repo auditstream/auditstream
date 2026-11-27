@@ -227,6 +227,58 @@ fn validation_errors_exit_2_without_connecting() {
 }
 
 #[test]
+fn redaction_validation_errors_exit_2_without_connecting() {
+    let dir = tempdir().expect("tempdir");
+
+    // --redact cannot be combined with --unredacted
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .args(["history", "--redact", "--unredacted"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("--unredacted"));
+
+    // --omit-payload cannot be combined with --diff
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .args(["history", "--diff", "--omit-payload"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("--omit-payload"));
+
+    // --redact fails closed when no [[export.redaction.rules]] are configured (with or without --omit-payload)
+    for args in [
+        &["history", "--redact"][..],
+        &["history", "--redact", "--omit-payload"][..],
+    ] {
+        auditstream_cmd()
+            .current_dir(dir.path())
+            .args(args)
+            .assert()
+            .code(2)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::contains("export.redaction.rules"));
+    }
+
+    // Invalid [[export.redaction.rules]] in auditstream.toml exits 2 without connecting
+    let bad_cfg_dir = tempdir().expect("tempdir");
+    std::fs::write(
+        bad_cfg_dir.path().join("auditstream.toml"),
+        "[[export.redaction.rules]]\ntable = \"public.invoice\"\ncolumns = [\"metadata.ssn\"]\n",
+    )
+    .expect("write invalid redaction config");
+    auditstream_cmd()
+        .current_dir(bad_cfg_dir.path())
+        .args(["history"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("nested JSON path"));
+}
+
+#[test]
 fn unreachable_database_exits_3_and_redacts_password() {
     let dir = tempdir().expect("tempdir");
     let secret = "history_secret_pw_54321";
@@ -702,4 +754,499 @@ async fn history_diff_renders_update_insert_delete_and_sanitizes_terminal_output
     assert!(stdout.contains("+ status: \"draft\"\n"), "{stdout}");
     assert!(stdout.contains("- status: \"sent\"\n"), "{stdout}");
     assert!(stdout.contains("user:admin (set_config)"), "{stdout}");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn history_applies_configured_redaction_supports_unredacted_and_omit_payload() {
+    let db = TestDb::new().await.expect("create TestDb");
+    install_history_schema(&db).await;
+
+    db.execute(
+        r#"INSERT INTO auditstream.changes
+           (occurred_at, source, schema_name, table_name, op, record_id, before, after, changed, actor, actor_source, db_user, schema_version) VALUES
+           ('2026-06-15T10:00:00Z'::timestamptz, 'db', 'public', 'invoice', 'INSERT', '{"id":1}'::jsonb,
+            NULL,
+            '{"id":1,"ssn":"111-11-1111","tax_id":"TAX-INIT","amount":10.50,"status":"draft"}'::jsonb,
+            NULL,
+            '{"type":"user","id":"usr_1"}'::jsonb, 'set_config', 'app_owner', 1),
+           ('2026-06-15T11:00:00Z'::timestamptz, 'db', 'public', 'invoice', 'UPDATE', '{"id":1}'::jsonb,
+            '{"id":1,"ssn":"111-11-1111","tax_id":"TAX-INIT","amount":10.50,"status":"draft"}'::jsonb,
+            jsonb_build_object(
+              'id', 1,
+              'ssn', '222-22-2222',
+              'tax_id', 'TAX-NEXT',
+              'amount', 12345678901234567890.123456789::numeric,
+              'status', E'\x1b[31msent\x1b[0m'
+            ),
+            ARRAY['ssn','tax_id','amount','status'],
+            '{"type":"user","id":"usr_1"}'::jsonb, 'set_config', 'app_owner', 1),
+           ('2026-06-15T12:00:00Z'::timestamptz, 'db', 'public', 'invoice', 'UPDATE', '{"id":2}'::jsonb,
+            '{"id":2,"tax_id":"TAX-ONLY-OLD","status":"open"}'::jsonb,
+            '{"id":2,"tax_id":"TAX-ONLY-NEW","status":"open"}'::jsonb,
+            ARRAY['tax_id'],
+            '{"type":"user","id":"usr_2"}'::jsonb, 'set_config', 'app_owner', 1),
+           ('2026-06-15T12:30:00Z'::timestamptz, 'db', 'public', 'invoice', 'UPDATE', '{"id":3}'::jsonb,
+            '{"id":3,"ssn":"333-33-3333","tax_id":"TAX-NULL-OLD","status":"open"}'::jsonb,
+            '{"id":3,"ssn":"444-44-4444","tax_id":"TAX-NULL-NEW","status":"open"}'::jsonb,
+            NULL,
+            '{"type":"user","id":"usr_2"}'::jsonb, 'set_config', 'app_owner', 1),
+           ('2026-06-15T12:45:00Z'::timestamptz, 'db', 'public', 'invoice', 'DELETE', '{"id":4}'::jsonb,
+            '{"id":4,"ssn":"555-55-5555","tax_id":"TAX-DEL","status":"void"}'::jsonb,
+            NULL,
+            NULL,
+            '{"type":"user","id":"usr_2"}'::jsonb, 'set_config', 'app_owner', 1),
+           ('2026-06-15T13:00:00Z'::timestamptz, 'app', NULL, NULL, 'invoice.exported', '{"id":1}'::jsonb,
+            NULL,
+            '{"recipient_email":"secret@example.com","format":"csv"}'::jsonb,
+            NULL,
+            '{"type":"user","id":"usr_3"}'::jsonb, 'set_config', 'app_owner', 1)"#,
+    )
+    .await
+    .expect("seed redaction rows");
+
+    let dir = tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("auditstream.toml"),
+        format!(
+            "database_url = {:?}\n\n\
+             [[export.redaction.rules]]\n\
+             table = \"public.invoice\"\n\
+             columns = [\"ssn\"]\n\
+             mode = \"mask\"\n\n\
+             [[export.redaction.rules]]\n\
+             table = \"invoice\"\n\
+             columns = [\"tax_id\"]\n\
+             mode = \"remove\"\n\n\
+             [[export.redaction.rules]]\n\
+             action = \"*\"\n\
+             columns = [\"recipient_email\"]\n\
+             mode = \"mask\"\n",
+            db.url()
+        ),
+    )
+    .expect("write auditstream.toml");
+
+    let secrets = [
+        "111-11-1111",
+        "222-22-2222",
+        "333-33-3333",
+        "444-44-4444",
+        "555-55-5555",
+        "TAX-INIT",
+        "TAX-NEXT",
+        "TAX-ONLY-OLD",
+        "TAX-ONLY-NEW",
+        "TAX-NULL-OLD",
+        "TAX-NULL-NEW",
+        "TAX-DEL",
+        "secret@example.com",
+    ];
+    let validator = load_event_schema();
+
+    // 1. Default --format json automatically applies configured redaction and emits stderr note.
+    let json_out = auditstream_cmd()
+        .current_dir(dir.path())
+        .args(["history", "--format", "json"])
+        .output()
+        .expect("run redacted history json");
+    assert!(
+        json_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&json_out.stderr)
+    );
+    let json_stdout = String::from_utf8(json_out.stdout.clone()).expect("utf8 stdout");
+    let json_stderr = String::from_utf8(json_out.stderr).expect("utf8 stderr");
+    for secret in secrets {
+        assert!(!json_stdout.contains(secret), "json stdout leaked {secret}");
+    }
+    assert!(
+        !json_stdout.contains("tax_id"),
+        "removed column name leaked in json stdout: {json_stdout}"
+    );
+    assert!(
+        json_stdout.contains("12345678901234567890.123456789"),
+        "expected untouched arbitrary-precision numeric preserved"
+    );
+    assert_eq!(
+        json_stderr,
+        "redaction active (3 configured rules; pass --unredacted to disable)\n"
+    );
+
+    let events = parse_json_lines(&json_out.stdout);
+    assert_eq!(events.len(), 6);
+    for (idx, ev) in events.iter().enumerate() {
+        let errors: Vec<String> = validator
+            .iter_errors(ev)
+            .map(|e| format!("{} at {}", e, e.instance_path()))
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "redacted event #{idx} violated event.schema.json: {errors:?}\nevent: {ev}"
+        );
+    }
+    assert_eq!(events[0]["after"]["recipient_email"], "[redacted]");
+    assert_eq!(events[0]["after"]["format"], "csv");
+    assert_eq!(events[1]["op"], "DELETE");
+    assert_eq!(events[1]["before"]["ssn"], "[redacted]");
+    assert!(events[1]["before"].get("tax_id").is_none());
+    assert!(events[2]["changed"].is_null());
+    assert_eq!(events[2]["before"]["ssn"], "[redacted]");
+    assert_eq!(events[2]["after"]["ssn"], "[redacted]");
+    assert_eq!(events[3]["changed"], serde_json::json!([]));
+    assert_eq!(events[4]["before"]["ssn"], "[redacted]");
+    assert_eq!(events[4]["after"]["ssn"], "[redacted]");
+    assert_eq!(
+        events[4]["changed"],
+        serde_json::json!(["ssn", "amount", "status"])
+    );
+    assert_eq!(events[5]["after"]["ssn"], "[redacted]");
+
+    // 2. Explicit --redact succeeds with configured rules, --log-format json formats stderr note,
+    //    and --quiet suppresses the stderr note.
+    let json_log_out = auditstream_cmd()
+        .current_dir(dir.path())
+        .args([
+            "--log-format",
+            "json",
+            "history",
+            "--redact",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run --redact with --log-format json");
+    assert!(json_log_out.status.success());
+    assert_eq!(json_log_out.stdout, json_out.stdout);
+    let json_log_stderr = String::from_utf8(json_log_out.stderr).expect("utf8 stderr");
+    let log_lines: Vec<&str> = json_log_stderr.lines().collect();
+    assert_eq!(
+        log_lines.len(),
+        1,
+        "expected single JSON stderr note: {json_log_stderr}"
+    );
+    let log_record: serde_json::Value =
+        serde_json::from_str(log_lines[0]).expect("valid JSON stderr note");
+    assert_eq!(log_record["level"], "INFO");
+    assert!(
+        log_record["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("redaction active"))
+    );
+
+    let quiet_out = auditstream_cmd()
+        .current_dir(dir.path())
+        .args(["--quiet", "history", "--format", "json"])
+        .output()
+        .expect("run quiet redacted history");
+    assert!(quiet_out.status.success());
+    assert_eq!(String::from_utf8_lossy(&quiet_out.stderr), "");
+    assert_eq!(quiet_out.stdout, json_out.stdout);
+
+    // 3. --diff automatically redacts values, drops removed columns, handles DELETE and NULL changed,
+    //    and preserves terminal escaping.
+    let diff_out = auditstream_cmd()
+        .current_dir(dir.path())
+        .args(["history", "--diff"])
+        .output()
+        .expect("run redacted history --diff");
+    assert!(diff_out.status.success());
+    let diff_stdout = String::from_utf8(diff_out.stdout).expect("utf8 diff stdout");
+    let diff_stderr = String::from_utf8(diff_out.stderr).expect("utf8 diff stderr");
+    for secret in secrets {
+        assert!(!diff_stdout.contains(secret), "diff stdout leaked {secret}");
+    }
+    assert!(
+        !diff_stdout.contains("tax_id"),
+        "diff leaked removed column"
+    );
+    assert!(
+        !diff_stdout.chars().any(|ch| ch.is_control() && ch != '\n'),
+        "diff output leaked control char: {diff_stdout:?}"
+    );
+    assert_eq!(
+        diff_stdout
+            .matches("~ ssn: \"[redacted]\" -> \"[redacted]\"\n")
+            .count(),
+        2,
+        "expected both UPDATE with changed and UPDATE with NULL changed to show masked ssn diff: {diff_stdout}"
+    );
+    assert!(diff_stdout.contains("- ssn: \"[redacted]\"\n"));
+    assert!(diff_stdout.contains("~ status: \"draft\" -> \"sent\"\n"));
+    assert!(diff_stdout.contains("+ recipient_email: \"[redacted]\"\n"));
+    assert!(diff_stdout.contains("  (no column changes)\n"));
+    assert!(diff_stderr.contains("redaction active"));
+
+    // 4. --format table drops removed columns from CHANGED and emits stderr note.
+    let table_out = auditstream_cmd()
+        .current_dir(dir.path())
+        .args(["history", "--format", "table"])
+        .output()
+        .expect("run redacted history table");
+    assert!(table_out.status.success());
+    let table_stdout = String::from_utf8(table_out.stdout).expect("utf8 table stdout");
+    assert!(
+        !table_stdout.contains("tax_id"),
+        "table leaked removed col: {table_stdout}"
+    );
+    assert!(table_stdout.contains("ssn,amount,status"), "{table_stdout}");
+    let all_removed_row = table_stdout
+        .lines()
+        .find(|line| line.starts_with("2026-06-15T12:00:00.000000Z"))
+        .expect("row where only removed column changed");
+    assert!(all_removed_row.ends_with("  -"), "{all_removed_row}");
+    assert!(String::from_utf8_lossy(&table_out.stderr).contains("redaction active"));
+
+    // 5. Empty query result with redaction configured emits only "no events matched".
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .args(["history", "--actor", "no_such_actor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::eq("no events matched\n"));
+
+    // 6. --unredacted break-glass restores raw values and suppresses redaction stderr note.
+    let unredacted_json = auditstream_cmd()
+        .current_dir(dir.path())
+        .args(["history", "--format", "json", "--unredacted"])
+        .output()
+        .expect("run --unredacted json");
+    assert!(unredacted_json.status.success());
+    assert_eq!(String::from_utf8_lossy(&unredacted_json.stderr), "");
+    let raw_json_stdout = String::from_utf8(unredacted_json.stdout).expect("utf8");
+    for secret in secrets {
+        assert!(
+            raw_json_stdout.contains(secret),
+            "expected --unredacted to include {secret}"
+        );
+    }
+
+    let unredacted_diff = auditstream_cmd()
+        .current_dir(dir.path())
+        .args(["history", "--diff", "--unredacted"])
+        .output()
+        .expect("run --unredacted diff");
+    assert!(unredacted_diff.status.success());
+    assert_eq!(String::from_utf8_lossy(&unredacted_diff.stderr), "");
+    let raw_diff_stdout = String::from_utf8(unredacted_diff.stdout).expect("utf8");
+    assert!(raw_diff_stdout.contains("~ ssn: \"111-11-1111\" -> \"222-22-2222\"\n"));
+    assert!(raw_diff_stdout.contains("~ tax_id: \"TAX-INIT\" -> \"TAX-NEXT\"\n"));
+    assert!(raw_diff_stdout.contains("- ssn: \"555-55-5555\"\n"));
+
+    // 7. --omit-payload (with and without explicit --redact) keeps metadata + changed column names
+    //    (still respecting remove rules) while setting before/after to null.
+    for omit_args in [
+        &["history", "--format", "json", "--omit-payload"][..],
+        &["history", "--format", "json", "--redact", "--omit-payload"][..],
+    ] {
+        let omit_json = auditstream_cmd()
+            .current_dir(dir.path())
+            .args(omit_args)
+            .output()
+            .expect("run --omit-payload json");
+        assert!(omit_json.status.success());
+        let omit_stdout = String::from_utf8(omit_json.stdout.clone()).expect("utf8");
+        let omit_stderr = String::from_utf8(omit_json.stderr).expect("utf8");
+        for secret in secrets {
+            assert!(
+                !omit_stdout.contains(secret),
+                "omit-payload leaked {secret}"
+            );
+        }
+        assert!(
+            !omit_stdout.contains("tax_id"),
+            "omit-payload leaked removed col"
+        );
+        assert!(!omit_stdout.contains("12345678901234567890.123456789"));
+        assert_eq!(
+            omit_stderr,
+            "redaction active (3 configured rules; payloads omitted via --omit-payload)\n"
+        );
+        let omitted_events = parse_json_lines(&omit_json.stdout);
+        assert_eq!(omitted_events.len(), 6);
+        for ev in &omitted_events {
+            assert!(ev["before"].is_null());
+            assert!(ev["after"].is_null());
+            let errors: Vec<String> = validator
+                .iter_errors(ev)
+                .map(|e| format!("{} at {}", e, e.instance_path()))
+                .collect();
+            assert!(errors.is_empty(), "omit-payload event invalid: {errors:?}");
+        }
+        assert_eq!(omitted_events[4]["schema_name"], "public");
+        assert_eq!(omitted_events[4]["table_name"], "invoice");
+        assert_eq!(omitted_events[4]["record_id"], serde_json::json!({"id": 1}));
+        assert_eq!(omitted_events[4]["actor"]["id"], "usr_1");
+        assert_eq!(omitted_events[4]["actor_source"], "set_config");
+        assert_eq!(
+            omitted_events[4]["changed"],
+            serde_json::json!(["ssn", "amount", "status"])
+        );
+    }
+
+    // 8. --omit-payload --unredacted omits before/after while keeping removed cols in changed.
+    let omit_unredacted = auditstream_cmd()
+        .current_dir(dir.path())
+        .args([
+            "history",
+            "--format",
+            "json",
+            "--omit-payload",
+            "--unredacted",
+        ])
+        .output()
+        .expect("run --omit-payload --unredacted");
+    assert!(omit_unredacted.status.success());
+    assert_eq!(String::from_utf8_lossy(&omit_unredacted.stderr), "");
+    let omit_unredacted_events = parse_json_lines(&omit_unredacted.stdout);
+    assert!(omit_unredacted_events[4]["before"].is_null());
+    assert!(omit_unredacted_events[4]["after"].is_null());
+    assert_eq!(
+        omit_unredacted_events[4]["changed"],
+        serde_json::json!(["ssn", "tax_id", "amount", "status"])
+    );
+
+    // 9. --omit-payload with no configured redaction rules omits payloads quietly.
+    let plain_dir = tempdir().expect("tempdir");
+    let omit_no_rules = auditstream_cmd()
+        .current_dir(plain_dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", db.url())
+        .args(["history", "--format", "json", "--omit-payload"])
+        .output()
+        .expect("run --omit-payload without rules");
+    assert!(omit_no_rules.status.success());
+    assert_eq!(String::from_utf8_lossy(&omit_no_rules.stderr), "");
+    let omit_no_rules_stdout = String::from_utf8(omit_no_rules.stdout.clone()).expect("utf8");
+    for secret in secrets {
+        assert!(
+            !omit_no_rules_stdout.contains(secret),
+            "omit-payload without rules leaked {secret}"
+        );
+    }
+    let omit_no_rules_events = parse_json_lines(&omit_no_rules.stdout);
+    assert_eq!(omit_no_rules_events.len(), 6);
+    assert!(
+        omit_no_rules_events
+            .iter()
+            .all(|ev| ev["before"].is_null() && ev["after"].is_null())
+    );
+    assert_eq!(
+        omit_no_rules_events[4]["changed"],
+        serde_json::json!(["ssn", "tax_id", "amount", "status"])
+    );
+
+    // 10. --omit-payload works cleanly with --format table and emits redaction stderr note.
+    let omit_table = auditstream_cmd()
+        .current_dir(dir.path())
+        .args(["history", "--format", "table", "--omit-payload"])
+        .output()
+        .expect("run --omit-payload table");
+    assert!(omit_table.status.success());
+    let omit_table_stdout = String::from_utf8(omit_table.stdout).expect("utf8");
+    assert!(omit_table_stdout.contains("ssn,amount,status"));
+    assert!(!omit_table_stdout.contains("tax_id"));
+    assert_eq!(
+        String::from_utf8_lossy(&omit_table.stderr),
+        "redaction active (3 configured rules; payloads omitted via --omit-payload)\n"
+    );
+}
+
+#[tokio::test]
+async fn history_redaction_fails_closed_on_non_object_payload() {
+    let db = TestDb::new().await.expect("create TestDb");
+    install_history_schema(&db).await;
+
+    // Seed a valid row NEWER than the non-object row (so events[0] succeeds redaction and
+    // events[1] fails under occurred_at DESC), proving fail-closed redaction never leaks
+    // earlier valid rows to stdout.
+    db.execute(
+        r#"INSERT INTO auditstream.changes
+           (occurred_at, source, schema_name, table_name, op, record_id, after, actor, actor_source, db_user, schema_version) VALUES
+           ('2026-06-15T10:00:00Z'::timestamptz, 'db', 'public', 'invoice', 'INSERT', '{"id":1}'::jsonb,
+            '{"id":1,"ssn":"999-99-9999"}'::jsonb, '{"type":"user","id":"usr_1"}'::jsonb, 'set_config', 'app_owner', 1),
+           ('2026-06-15T11:00:00Z'::timestamptz, 'app', NULL, NULL, 'batch.run', NULL,
+            '["sensitive_array_element"]'::jsonb, '{"type":"service","id":"worker_1"}'::jsonb, 'set_config', 'app_owner', 1),
+           ('2026-06-15T12:00:00Z'::timestamptz, 'db', 'public', 'invoice', 'INSERT', '{"id":2}'::jsonb,
+            '{"id":2,"ssn":"888-88-8888","note":"newest_valid_row"}'::jsonb, '{"type":"user","id":"usr_2"}'::jsonb, 'set_config', 'app_owner', 1)"#,
+    )
+    .await
+    .expect("seed non-object payload row");
+
+    let dir = tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("auditstream.toml"),
+        format!(
+            "database_url = {:?}\n\n\
+             [[export.redaction.rules]]\n\
+             table = \"*\"\n\
+             columns = [\"ssn\"]\n\
+             mode = \"mask\"\n",
+            db.url()
+        ),
+    )
+    .expect("write auditstream.toml");
+
+    // Fails closed with exit 5 and completely empty stdout across json, diff, and table.
+    for args in [
+        &["history", "--format", "json"][..],
+        &["history", "--diff"][..],
+        &["history", "--format", "table"][..],
+    ] {
+        auditstream_cmd()
+            .current_dir(dir.path())
+            .args(args)
+            .assert()
+            .code(5)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::contains("expected a JSON object"))
+            .stderr(predicate::str::contains("888-88-8888").not())
+            .stderr(predicate::str::contains("999-99-9999").not())
+            .stderr(predicate::str::contains("newest_valid_row").not())
+            .stderr(predicate::str::contains("sensitive_array_element").not())
+            .stderr(predicate::str::contains("redaction active").not());
+    }
+
+    // --log-format json emits a single ERROR record with exit_code 5.
+    let json_err = auditstream_cmd()
+        .current_dir(dir.path())
+        .args(["--log-format", "json", "history", "--format", "json"])
+        .output()
+        .expect("run json-log fail-closed");
+    assert_eq!(json_err.status.code(), Some(5));
+    assert_eq!(json_err.stdout.as_slice(), b"");
+    let stderr_text = String::from_utf8(json_err.stderr).expect("utf8");
+    let lines: Vec<&str> = stderr_text.lines().collect();
+    assert_eq!(lines.len(), 1, "{stderr_text}");
+    let parsed: serde_json::Value = serde_json::from_str(lines[0]).expect("valid JSON error");
+    assert_eq!(parsed["level"], "ERROR");
+    assert_eq!(parsed["exit_code"], 5);
+
+    // --omit-payload clears the non-object payload safely without leaking array contents.
+    let omit_out = auditstream_cmd()
+        .current_dir(dir.path())
+        .args(["history", "--format", "json", "--omit-payload"])
+        .output()
+        .expect("run --omit-payload on non-object payload");
+    assert!(omit_out.status.success());
+    let omit_stdout = String::from_utf8(omit_out.stdout.clone()).expect("utf8");
+    assert!(!omit_stdout.contains("sensitive_array_element"));
+    assert!(!omit_stdout.contains("888-88-8888"));
+    assert!(!omit_stdout.contains("999-99-9999"));
+    let omitted = parse_json_lines(&omit_out.stdout);
+    assert_eq!(omitted.len(), 3);
+    assert!(
+        omitted
+            .iter()
+            .all(|ev| ev["before"].is_null() && ev["after"].is_null())
+    );
+
+    // --unredacted bypasses redaction cleanly.
+    let unredacted_out = auditstream_cmd()
+        .current_dir(dir.path())
+        .args(["history", "--format", "json", "--unredacted"])
+        .output()
+        .expect("run --unredacted on non-object payload");
+    assert!(unredacted_out.status.success());
+    assert!(String::from_utf8_lossy(&unredacted_out.stdout).contains("sensitive_array_element"));
 }

@@ -30,11 +30,11 @@ Values resolve in strict order (first non-empty source wins; empty environment v
 | `export.cursor_file` | path | none | `export --cursor-file` | none |
 | `export.batch_size` | integer | `1000` | `export --batch-size` | none |
 | `export.sink` | table with `type` (`jsonl` or `csv`) and optional `path` | JSON Lines on stdout | `export --format` overrides `type` and `--output` overrides `path` | none |
-| `export.redaction.rules` | list of redaction rule tables (`table` or `action`, `columns`, `mode`) | `[]` | none | none |
+| `export.redaction.rules` | list of redaction rule tables (`table` or `action`, `columns`, `mode`) | `[]` | `history --redact` (require) / `history --unredacted` (disable in `history`) | none |
 
 ## Export redaction (`[[export.redaction.rules]]`)
 
-Each rule masks (`mode = "mask"`, the default) or removes (`mode = "remove"`) top-level keys inside `before` and `after` before events reach any export sink:
+Each rule masks (`mode = "mask"`, the default) or removes (`mode = "remove"`) top-level keys inside `before` and `after` before events reach any export sink or `auditstream history` output (unless `auditstream history --unredacted` is passed):
 
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
@@ -44,8 +44,8 @@ Each rule masks (`mode = "mask"`, the default) or removes (`mode = "remove"`) to
 | `mode` | `mask` or `remove` | no (`mask`) | `mask` replaces values with `"[redacted]"` and keeps column names in `changed`; `remove` drops keys from `before`, `after`, and `changed`. `remove` overrides `mask` when both match |
 
 - **When to use `capture.exclude` vs. `export.redaction`:** Always put secrets, credentials, password hashes, payment card numbers (PAN/CVV), and API tokens in **`capture.exclude`** so capture triggers never write them into `auditstream.changes`. Use **`export.redaction`** for application events (`auditstream.log_event()`, which has no capture-time column exclusion), retroactive minimization of historical rows, and two-tier exports (keeping full operational rows in PostgreSQL while sending minimized JSONL/CSV feeds to external SIEMs or customers).
-- **Top-level keys only & fail-closed:** Rules match top-level JSON object keys only (leaving `record_id`, untouched key order, and arbitrary-precision PostgreSQL `numeric` values intact). If a matching rule encounters a non-object or malformed JSON payload (for example, an `app` event whose `data` is a JSON array), export fails closed with exit code `5` before writing to the sink or advancing the cursor.
-- **`record_id` is never redacted (natural-PK and `app` target PII caveat):** `[[export.redaction.rules]]` intentionally leaves `record_id` unmodified (and `capture.exclude` cannot exclude primary key columns) so downstream consumers can correlate events across operations and reconstruct per-record histories. If an audited table uses a natural PII primary key (such as `email`, `ssn`, or `phone`) — or an `auditstream.log_event()` call places PII inside its `target` JSON object — matching redaction rules mask or remove those keys from `before` and `after` while still exporting `record_id` in plaintext. Prefer surrogate primary keys (such as UUIDs or integer IDs) on audited tables and pass opaque identifiers in `log_event()` `target` payloads when exported streams must exclude PII.
+- **Top-level keys only & fail-closed:** Rules match top-level JSON object keys only (leaving `record_id`, untouched key order, and arbitrary-precision PostgreSQL `numeric` values intact). If a matching rule encounters a non-object or malformed JSON payload (for example, an `app` event whose `data` is a JSON array), `auditstream export` fails closed with exit code `5` before writing to the sink or advancing the cursor, and `auditstream history` fails closed with exit code `5` before emitting the redaction note or writing to stdout (unless `--omit-payload` or `--unredacted` is passed).
+- **`record_id` is never redacted (natural-PK and `app` target PII caveat):** `[[export.redaction.rules]]` intentionally leaves `record_id` unmodified (and `capture.exclude` cannot exclude primary key columns) so downstream consumers and operators can correlate events across operations and reconstruct per-record histories. If an audited table uses a natural PII primary key (such as `email`, `ssn`, or `phone`) — or an `auditstream.log_event()` call places PII inside its `target` JSON object — matching redaction rules mask or remove those keys from `before` and `after` while still outputting `record_id` in plaintext in both `export` and `history`. Prefer surrogate primary keys (such as UUIDs or integer IDs) on audited tables and pass opaque identifiers in `log_event()` `target` payloads when exported streams or history output must exclude PII.
 
 ## Example
 

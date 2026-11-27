@@ -28,7 +28,7 @@ auditstream [GLOBAL OPTIONS] <COMMAND> [COMMAND OPTIONS]
 | [`init`](init.md) | Generate audit schema and trigger migrations (`--table`, `--exclude`, `--migrations`, `--out`, `--dry-run`) |
 | [`status`](status.md) | Show audit schema, trigger and partition status (`--format`) |
 | [`verify`](verify.md) | Verify triggers, schema integrity and default partition health (`--format`, `--fix`, `--fail-on`) |
-| [`history`](history.md) | Inspect recorded audit history and row diffs (`--table`, `--record-id`, `--actor`, `--tenant`, `--since`, `--until`, `--limit`, `--format`, `--diff`) |
+| [`history`](history.md) | Inspect recorded audit history and row diffs (`--table`, `--record-id`, `--actor`, `--tenant`, `--since`, `--until`, `--limit`, `--format`, `--diff`, `--redact`, `--unredacted`, `--omit-payload`) |
 | [`export`](export.md) | Export recorded audit events (`--format`, `--output`, `--cursor-file`, `--batch-size`, `--from-start`, `--stats-format`, `--since`, `--until`, `--actor`, `--tenant`, `--source`) |
 
 ## Streams, logging and secrets

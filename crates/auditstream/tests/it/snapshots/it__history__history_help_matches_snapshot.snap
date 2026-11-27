@@ -80,6 +80,15 @@ Options:
       --diff
           Show field-level `before -> after` diffs (`--format table` only)
 
+      --redact
+          Require configured `[export.redaction]` rules (auto-applied when present; exits 2 if none)
+
+      --unredacted
+          Disable configured `[export.redaction]` rules for break-glass local inspection
+
+      --omit-payload
+          Omit `before` and `after` payloads, keeping event metadata and `changed` column names
+
   -h, --help
           Print help (see a summary with '-h')
 

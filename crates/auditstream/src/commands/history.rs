@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 use std::io::{self, IsTerminal as _};
 
 use anyhow::anyhow;
-use auditstream_core::{Actor, ActorSource, ActorType, Event, diff};
+use auditstream_core::{Actor, ActorSource, ActorType, CompiledRedaction, Event, Redaction, diff};
 use auditstream_pg::reader::{self, HistoryQuery, MAX_LOOKUP_LIMIT, RecordIdFilter};
 use clap::{Args as ClapArgs, ValueEnum};
 use serde_json::Value;
@@ -92,14 +92,46 @@ pub(crate) struct Args {
     /// Show field-level `before -> after` diffs (`--format table` only).
     #[arg(long)]
     pub(crate) diff: bool,
+
+    #[command(flatten)]
+    pub(crate) redaction: RedactionArgs,
+}
+
+/// Redaction and payload-omission flags for `auditstream history`.
+#[derive(Debug, Default, ClapArgs)]
+pub(crate) struct RedactionArgs {
+    /// Require configured `[export.redaction]` rules (auto-applied when present; exits 2 if none).
+    #[arg(long)]
+    pub(crate) redact: bool,
+
+    /// Disable configured `[export.redaction]` rules for break-glass local inspection.
+    #[arg(long)]
+    pub(crate) unredacted: bool,
+
+    /// Omit `before` and `after` payloads, keeping event metadata and `changed` column names.
+    #[arg(long)]
+    pub(crate) omit_payload: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RedactionPlan {
+    apply_rules: bool,
+    omit_payload: bool,
+    for_diff: bool,
+    rule_count: usize,
 }
 
 /// Runs the `history` command.
 pub(crate) fn run(args: &Args, config: &Config) -> anyhow::Result<()> {
     let query = build_query(args)?;
+    let plan = resolve_redaction_plan(
+        args,
+        &config.export.redaction,
+        &config.export.compiled_redaction,
+    )?;
     let db_url = require_database_url(config)?;
 
-    let events = run_async(async {
+    let mut events = run_async(async {
         let pool = connect_database(db_url).await?;
 
         let result = reader::lookup(&pool, &config.schema, &query)
@@ -116,36 +148,52 @@ pub(crate) fn run(args: &Args, config: &Config) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    prepare_events(&mut events, plan, &config.export.compiled_redaction)?;
+    if plan.apply_rules {
+        logging::emit_note(
+            config.log_format,
+            config.quiet,
+            &format_redaction_notice(plan),
+        );
+    }
+
+    write_output(args, &events)
+}
+
+fn write_output(args: &Args, events: &[Event]) -> anyhow::Result<()> {
     let mut out = io::stdout().lock();
     match args.format {
         OutputFormat::Table if args.diff => {
-            let use_color = should_use_color();
-            for line in render_diff_lines(&events, use_color) {
-                if !write_stdout(&mut out, line.as_bytes())? {
-                    break;
-                }
-            }
+            let lines = render_diff_lines(events, should_use_color());
+            write_lines(&mut out, &lines)
         }
         OutputFormat::Table => {
-            for line in render_table_lines(&events) {
-                if !write_stdout(&mut out, line.as_bytes())? {
-                    break;
-                }
-            }
+            let lines = render_table_lines(events);
+            write_lines(&mut out, &lines)
         }
-        OutputFormat::Json => {
-            for event in &events {
-                let mut line = serde_json::to_string(event)
-                    .map_err(|err| anyhow!("failed to serialize event JSON: {err}"))
-                    .exit_code(Exit::Internal)?;
-                line.push('\n');
-                if !write_stdout(&mut out, line.as_bytes())? {
-                    break;
-                }
-            }
+        OutputFormat::Json => write_json_lines(&mut out, events),
+    }
+}
+
+fn write_lines<W: io::Write>(out: &mut W, lines: &[String]) -> anyhow::Result<()> {
+    for line in lines {
+        if !write_stdout(out, line.as_bytes())? {
+            break;
         }
     }
+    Ok(())
+}
 
+fn write_json_lines<W: io::Write>(out: &mut W, events: &[Event]) -> anyhow::Result<()> {
+    for event in events {
+        let mut line = serde_json::to_string(event)
+            .map_err(|err| anyhow!("failed to serialize event JSON: {err}"))
+            .exit_code(Exit::Internal)?;
+        line.push('\n');
+        if !write_stdout(out, line.as_bytes())? {
+            break;
+        }
+    }
     Ok(())
 }
 
@@ -224,6 +272,93 @@ fn build_query(args: &Args) -> anyhow::Result<HistoryQuery> {
         source: None,
         limit: args.limit,
     })
+}
+
+fn resolve_redaction_plan(
+    args: &Args,
+    redaction: &Redaction,
+    compiled: &CompiledRedaction,
+) -> anyhow::Result<RedactionPlan> {
+    if args.redaction.redact && args.redaction.unredacted {
+        return Err(anyhow!("--redact cannot be combined with --unredacted"))
+            .exit_code(Exit::Usage);
+    }
+
+    if args.diff && args.redaction.omit_payload {
+        return Err(anyhow!(
+            "--omit-payload cannot be combined with --diff (--diff displays before/after row payloads)"
+        ))
+        .exit_code(Exit::Usage);
+    }
+
+    let has_rules = !compiled.is_empty();
+    let rule_count = redaction.rules.len();
+
+    if args.redaction.redact && !has_rules {
+        return Err(anyhow!(
+            "--redact requires at least one [[export.redaction.rules]] rule in configuration"
+        ))
+        .exit_code(Exit::Usage);
+    }
+
+    Ok(RedactionPlan {
+        apply_rules: has_rules && !args.redaction.unredacted,
+        omit_payload: args.redaction.omit_payload,
+        for_diff: args.diff,
+        rule_count,
+    })
+}
+
+fn populate_diff_changed_if_absent(event: &mut Event) {
+    if event.changed.is_none() && event.before.is_some() && event.after.is_some() {
+        event.changed = diff::changed(event.before.as_deref(), event.after.as_deref());
+    }
+}
+
+fn prepare_events(
+    events: &mut [Event],
+    plan: RedactionPlan,
+    compiled: &CompiledRedaction,
+) -> anyhow::Result<()> {
+    if plan.omit_payload {
+        for event in events.iter_mut() {
+            event.before = None;
+            event.after = None;
+        }
+    }
+
+    if plan.apply_rules {
+        for event in events.iter_mut() {
+            if plan.for_diff {
+                populate_diff_changed_if_absent(event);
+            }
+            compiled
+                .apply(event)
+                .map_err(|err| anyhow!("failed to redact audit event: {err}"))
+                .exit_code(Exit::Internal)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn format_redaction_notice(plan: RedactionPlan) -> String {
+    let noun = if plan.rule_count == 1 {
+        "rule"
+    } else {
+        "rules"
+    };
+    if plan.omit_payload {
+        format!(
+            "redaction active ({} configured {noun}; payloads omitted via --omit-payload)",
+            plan.rule_count
+        )
+    } else {
+        format!(
+            "redaction active ({} configured {noun}; pass --unredacted to disable)",
+            plan.rule_count
+        )
+    }
 }
 
 fn parse_record_id_filter(raw: &str) -> anyhow::Result<RecordIdFilter> {
@@ -464,8 +599,8 @@ fn format_diff_body(event: &Event, use_color: bool) -> Vec<String> {
     match (before, after) {
         (Some(Value::Object(before_map)), Some(Value::Object(after_map))) => {
             let keys: Vec<String> = match event.changed.as_deref() {
-                Some(cols) if !cols.is_empty() => cols.to_vec(),
-                _ => diff::changed(event.before.as_deref(), event.after.as_deref())
+                Some(cols) => cols.to_vec(),
+                None => diff::changed(event.before.as_deref(), event.after.as_deref())
                     .unwrap_or_default(),
             };
             if keys.is_empty() {
@@ -666,13 +801,14 @@ fn actor_source_str(source: Option<ActorSource>) -> &'static str {
 mod tests {
     use std::ffi::OsStr;
 
-    use auditstream_core::Event;
+    use auditstream_core::{CompiledRedaction, Event, Redaction, RedactionMode, RedactionRule};
     use auditstream_pg::reader::RecordIdFilter;
     use serde_json::value::RawValue;
 
     use super::{
-        Args, DEFAULT_LIMIT, OutputFormat, build_query, format_actor, format_utc_rfc3339,
-        parse_record_id_filter, parse_time_flag, render_diff_lines, render_table_lines,
+        Args, DEFAULT_LIMIT, OutputFormat, RedactionArgs, RedactionPlan, build_query, format_actor,
+        format_redaction_notice, format_utc_rfc3339, parse_record_id_filter, parse_time_flag,
+        prepare_events, render_diff_lines, render_table_lines, resolve_redaction_plan,
         should_use_color_with,
     };
     use crate::commands::common::sanitize_terminal;
@@ -689,7 +825,14 @@ mod tests {
             limit: DEFAULT_LIMIT,
             format: OutputFormat::Table,
             diff: false,
+            redaction: RedactionArgs::default(),
         }
+    }
+
+    fn policy_with_rules(rules: Vec<RedactionRule>) -> (Redaction, CompiledRedaction) {
+        let redaction = Redaction::new(rules);
+        let compiled = redaction.compile().expect("valid test redaction rules");
+        (redaction, compiled)
     }
 
     fn event_from_json(raw: &str) -> Event {
@@ -1038,6 +1181,419 @@ mod tests {
         assert!(
             table_out.contains("a,status"),
             "table swallowed sibling changed column: {table_out:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_redaction_plan_handles_defaults_and_explicit_flags() {
+        let (empty_redaction, empty_compiled) = policy_with_rules(vec![]);
+        let (rules_redaction, rules_compiled) = policy_with_rules(vec![
+            RedactionRule::for_table("public.invoice", ["ssn"], RedactionMode::Mask),
+            RedactionRule::for_table("public.invoice", ["tax_id"], RedactionMode::Remove),
+        ]);
+
+        // No rules configured -> inactive by default, explicit --redact fails closed (exit 2).
+        let plan = resolve_redaction_plan(&base_args(), &empty_redaction, &empty_compiled).unwrap();
+        assert_eq!(
+            plan,
+            RedactionPlan {
+                apply_rules: false,
+                omit_payload: false,
+                for_diff: false,
+                rule_count: 0,
+            }
+        );
+
+        let mut explicit_redact = base_args();
+        explicit_redact.redaction.redact = true;
+        assert_eq!(
+            exit_code_for(
+                &resolve_redaction_plan(&explicit_redact, &empty_redaction, &empty_compiled)
+                    .unwrap_err()
+            ),
+            Exit::Usage
+        );
+
+        // --omit-payload without configured rules succeeds without requiring redaction rules,
+        // while --redact --omit-payload still fails closed (exit 2) when no rules exist.
+        let mut omit_no_rules = base_args();
+        omit_no_rules.redaction.omit_payload = true;
+        assert_eq!(
+            resolve_redaction_plan(&omit_no_rules, &empty_redaction, &empty_compiled).unwrap(),
+            RedactionPlan {
+                apply_rules: false,
+                omit_payload: true,
+                for_diff: false,
+                rule_count: 0,
+            }
+        );
+
+        let mut redact_and_omit = base_args();
+        redact_and_omit.redaction.redact = true;
+        redact_and_omit.redaction.omit_payload = true;
+        assert_eq!(
+            exit_code_for(
+                &resolve_redaction_plan(&redact_and_omit, &empty_redaction, &empty_compiled)
+                    .unwrap_err()
+            ),
+            Exit::Usage
+        );
+        assert_eq!(
+            resolve_redaction_plan(&redact_and_omit, &rules_redaction, &rules_compiled).unwrap(),
+            RedactionPlan {
+                apply_rules: true,
+                omit_payload: true,
+                for_diff: false,
+                rule_count: 2,
+            }
+        );
+
+        // Rules configured -> automatically applied, --redact succeeds, --unredacted opts out.
+        let auto_plan =
+            resolve_redaction_plan(&base_args(), &rules_redaction, &rules_compiled).unwrap();
+        assert_eq!(
+            auto_plan,
+            RedactionPlan {
+                apply_rules: true,
+                omit_payload: false,
+                for_diff: false,
+                rule_count: 2,
+            }
+        );
+        assert_eq!(
+            resolve_redaction_plan(&explicit_redact, &rules_redaction, &rules_compiled).unwrap(),
+            auto_plan
+        );
+
+        let mut unredacted = base_args();
+        unredacted.redaction.unredacted = true;
+        assert!(
+            !resolve_redaction_plan(&unredacted, &rules_redaction, &rules_compiled)
+                .unwrap()
+                .apply_rules
+        );
+    }
+
+    #[test]
+    fn resolve_redaction_plan_rejects_conflicts_and_formats_notices() {
+        let (empty_redaction, empty_compiled) = policy_with_rules(vec![]);
+        let (rules_redaction, rules_compiled) = policy_with_rules(vec![
+            RedactionRule::for_table("public.invoice", ["ssn"], RedactionMode::Mask),
+            RedactionRule::for_table("public.invoice", ["tax_id"], RedactionMode::Remove),
+        ]);
+
+        // --redact + --unredacted conflicts (exit 2).
+        let mut both = base_args();
+        both.redaction.redact = true;
+        both.redaction.unredacted = true;
+        assert_eq!(
+            exit_code_for(
+                &resolve_redaction_plan(&both, &rules_redaction, &rules_compiled).unwrap_err()
+            ),
+            Exit::Usage
+        );
+
+        // --omit-payload + --diff conflicts (exit 2).
+        let mut omit_diff = base_args();
+        omit_diff.diff = true;
+        omit_diff.redaction.omit_payload = true;
+        assert_eq!(
+            exit_code_for(
+                &resolve_redaction_plan(&omit_diff, &empty_redaction, &empty_compiled).unwrap_err()
+            ),
+            Exit::Usage
+        );
+
+        // Plural and singular notice formatting (with and without --omit-payload).
+        let plural_plan =
+            resolve_redaction_plan(&base_args(), &rules_redaction, &rules_compiled).unwrap();
+        assert_eq!(
+            format_redaction_notice(plural_plan),
+            "redaction active (2 configured rules; pass --unredacted to disable)"
+        );
+
+        let (one_redaction, one_compiled) = policy_with_rules(vec![RedactionRule::for_table(
+            "invoice",
+            ["ssn"],
+            RedactionMode::Mask,
+        )]);
+        let mut omit_only = base_args();
+        omit_only.redaction.omit_payload = true;
+        let omit_plan = resolve_redaction_plan(&omit_only, &one_redaction, &one_compiled).unwrap();
+        assert!(omit_plan.apply_rules);
+        assert!(omit_plan.omit_payload);
+        assert_eq!(
+            format_redaction_notice(omit_plan),
+            "redaction active (1 configured rule; payloads omitted via --omit-payload)"
+        );
+    }
+
+    #[test]
+    fn prepare_events_applies_mask_remove_and_omit_payload() {
+        let compiled = CompiledRedaction::compile(&Redaction::new(vec![
+            RedactionRule::for_table("public.invoice", ["ssn"], RedactionMode::Mask),
+            RedactionRule::for_table("public.invoice", ["tax_id"], RedactionMode::Remove),
+        ]))
+        .unwrap();
+
+        let original = event_from_json(
+            r#"{
+                "event_id": "00000000-0000-4000-8000-000000000020",
+                "occurred_at": "2026-06-15T00:00:00.000000Z",
+                "source": "db",
+                "schema_name": "public",
+                "table_name": "invoice",
+                "op": "UPDATE",
+                "record_id": {"id": 1},
+                "before": {"id": 1, "ssn": "111-11-1111", "tax_id": "TX-OLD", "amount": 10.50},
+                "after": {"id": 1, "ssn": "222-22-2222", "tax_id": "TX-NEW", "amount": 12345678901234567890.123456789},
+                "changed": ["ssn", "tax_id", "amount"],
+                "actor": {"type": "user", "id": "usr_1"},
+                "context": {"requestId": "req_42"},
+                "actor_source": "set_config",
+                "db_user": "postgres",
+                "schema_version": 1
+            }"#,
+        );
+
+        // 1. Mask + remove redaction applied across json, diff, and table views.
+        let mut redacted = vec![original.clone()];
+        let apply_plan = RedactionPlan {
+            apply_rules: true,
+            omit_payload: false,
+            for_diff: false,
+            rule_count: 2,
+        };
+        prepare_events(&mut redacted, apply_plan, &compiled).unwrap();
+
+        let json_out = serde_json::to_string(&redacted[0]).unwrap();
+        let diff_out = render_diff_lines(&redacted, false).join("");
+        let table_out = render_table_lines(&redacted).join("");
+
+        for (label, output) in [
+            ("json", &json_out),
+            ("diff", &diff_out),
+            ("table", &table_out),
+        ] {
+            assert!(!output.contains("111-11-1111"), "{label} leaked before ssn");
+            assert!(!output.contains("222-22-2222"), "{label} leaked after ssn");
+            assert!(!output.contains("TX-OLD"), "{label} leaked before tax_id");
+            assert!(!output.contains("TX-NEW"), "{label} leaked after tax_id");
+            assert!(
+                !output.contains("tax_id"),
+                "{label} leaked removed column name"
+            );
+        }
+        assert!(json_out.contains(r#""ssn":"[redacted]""#));
+        assert!(json_out.contains("12345678901234567890.123456789"));
+        assert!(diff_out.contains("~ ssn: \"[redacted]\" -> \"[redacted]\"\n"));
+        assert!(diff_out.contains("~ amount: 10.50 -> 12345678901234567890.123456789\n"));
+        assert!(table_out.contains("ssn,amount"));
+
+        // 2. --omit-payload strips only before/after, preserving all metadata and filtered changed names.
+        let mut omitted = vec![original.clone()];
+        let omit_redacted_plan = RedactionPlan {
+            apply_rules: true,
+            omit_payload: true,
+            for_diff: false,
+            rule_count: 2,
+        };
+        prepare_events(&mut omitted, omit_redacted_plan, &compiled).unwrap();
+        let mut expected_omitted = original.clone();
+        expected_omitted.before = None;
+        expected_omitted.after = None;
+        expected_omitted.changed = Some(vec!["ssn".to_owned(), "amount".to_owned()]);
+        assert_eq!(omitted[0], expected_omitted);
+
+        // 3. --omit-payload with --unredacted strips only before/after and preserves all metadata & changed cols.
+        let mut omitted_unredacted = vec![original.clone()];
+        let omit_unredacted_plan = RedactionPlan {
+            apply_rules: false,
+            omit_payload: true,
+            for_diff: false,
+            rule_count: 2,
+        };
+        prepare_events(&mut omitted_unredacted, omit_unredacted_plan, &compiled).unwrap();
+        let mut expected_unredacted = original;
+        expected_unredacted.before = None;
+        expected_unredacted.after = None;
+        assert_eq!(omitted_unredacted[0], expected_unredacted);
+    }
+
+    #[test]
+    fn prepare_events_handles_delete_null_changed_fallback_and_empty_changed() {
+        let compiled = CompiledRedaction::compile(&Redaction::new(vec![
+            RedactionRule::for_table("public.invoice", ["ssn"], RedactionMode::Mask),
+            RedactionRule::for_table("public.invoice", ["tax_id"], RedactionMode::Remove),
+        ]))
+        .unwrap();
+
+        let delete_event = event_from_json(
+            r#"{
+                "event_id": "00000000-0000-4000-8000-000000000022",
+                "occurred_at": "2026-06-15T01:00:00.000000Z",
+                "source": "db",
+                "schema_name": "public",
+                "table_name": "invoice",
+                "op": "DELETE",
+                "record_id": {"id": 5},
+                "before": {"id": 5, "ssn": "555-55-5555", "tax_id": "TX-DEL"},
+                "after": null,
+                "changed": null,
+                "actor": null,
+                "context": null,
+                "actor_source": null,
+                "db_user": "postgres",
+                "schema_version": 1
+            }"#,
+        );
+        let null_changed_update = event_from_json(
+            r#"{
+                "event_id": "00000000-0000-4000-8000-000000000023",
+                "occurred_at": "2026-06-15T02:00:00.000000Z",
+                "source": "db",
+                "schema_name": "public",
+                "table_name": "invoice",
+                "op": "UPDATE",
+                "record_id": {"id": 6},
+                "before": {"id": 6, "ssn": "111-11-1111", "tax_id": "TX-A", "status": "draft"},
+                "after": {"id": 6, "ssn": "222-22-2222", "tax_id": "TX-B", "status": "draft"},
+                "changed": null,
+                "actor": null,
+                "context": null,
+                "actor_source": null,
+                "db_user": "postgres",
+                "schema_version": 1
+            }"#,
+        );
+        let all_removed_update = event_from_json(
+            r#"{
+                "event_id": "00000000-0000-4000-8000-000000000024",
+                "occurred_at": "2026-06-15T03:00:00.000000Z",
+                "source": "db",
+                "schema_name": "public",
+                "table_name": "invoice",
+                "op": "UPDATE",
+                "record_id": {"id": 7},
+                "before": {"id": 7, "tax_id": "TX-1", "status": "old"},
+                "after": {"id": 7, "tax_id": "TX-2", "status": "new"},
+                "changed": ["tax_id"],
+                "actor": null,
+                "context": null,
+                "actor_source": null,
+                "db_user": "postgres",
+                "schema_version": 1
+            }"#,
+        );
+
+        let diff_plan = RedactionPlan {
+            apply_rules: true,
+            omit_payload: false,
+            for_diff: true,
+            rule_count: 2,
+        };
+        let mut diff_batch = vec![
+            delete_event,
+            null_changed_update.clone(),
+            all_removed_update,
+        ];
+        prepare_events(&mut diff_batch, diff_plan, &compiled).unwrap();
+        let diff_out = render_diff_lines(&diff_batch, false).join("");
+        assert!(diff_out.contains("- ssn: \"[redacted]\"\n"), "{diff_out}");
+        assert!(
+            diff_out.contains("~ ssn: \"[redacted]\" -> \"[redacted]\"\n"),
+            "{diff_out}"
+        );
+        assert!(diff_out.contains("  (no column changes)\n"), "{diff_out}");
+        assert!(!diff_out.contains("555-55-5555"));
+        assert!(!diff_out.contains("tax_id"));
+        assert!(!diff_out.contains("status"));
+
+        // Table output renders `-` for CHANGED when `mode = "remove"` empties `event.changed`.
+        let table_lines = render_table_lines(&diff_batch[2..3]);
+        assert!(table_lines[1].ends_with("  -\n"), "{:?}", table_lines[1]);
+
+        // Non-diff modes keep `changed: None` untouched (do not synthesize `changed` in JSON/table).
+        let json_plan = RedactionPlan {
+            apply_rules: true,
+            omit_payload: false,
+            for_diff: false,
+            rule_count: 2,
+        };
+        let mut json_batch = vec![null_changed_update];
+        prepare_events(&mut json_batch, json_plan, &compiled).unwrap();
+        assert!(json_batch[0].changed.is_none());
+    }
+
+    #[test]
+    fn prepare_events_fails_closed_on_non_object_payload() {
+        let valid_event = event_from_json(
+            r#"{
+                "event_id": "00000000-0000-4000-8000-000000000020",
+                "occurred_at": "2026-06-15T01:00:00.000000Z",
+                "source": "db",
+                "schema_name": "public",
+                "table_name": "invoice",
+                "op": "INSERT",
+                "record_id": {"id": 1},
+                "before": null,
+                "after": {"id": 1, "ssn": "111-11-1111"},
+                "changed": null,
+                "actor": null,
+                "context": null,
+                "actor_source": null,
+                "db_user": "postgres",
+                "schema_version": 1
+            }"#,
+        );
+        let bad_app_event = event_from_json(
+            r#"{
+                "event_id": "00000000-0000-4000-8000-000000000021",
+                "occurred_at": "2026-06-15T00:00:00.000000Z",
+                "source": "app",
+                "schema_name": null,
+                "table_name": null,
+                "op": "batch.run",
+                "record_id": null,
+                "before": null,
+                "after": ["secret_array_entry"],
+                "changed": null,
+                "actor": null,
+                "context": null,
+                "actor_source": null,
+                "db_user": "postgres",
+                "schema_version": 1
+            }"#,
+        );
+        let wildcard = CompiledRedaction::compile(&Redaction::new(vec![RedactionRule::for_all(
+            ["ssn"],
+            RedactionMode::Mask,
+        )]))
+        .unwrap();
+
+        let apply_plan = RedactionPlan {
+            apply_rules: true,
+            omit_payload: false,
+            for_diff: false,
+            rule_count: 1,
+        };
+        let mut bad_batch = vec![valid_event.clone(), bad_app_event.clone()];
+        let err = prepare_events(&mut bad_batch, apply_plan, &wildcard).unwrap_err();
+        assert_eq!(exit_code_for(&err), Exit::Internal);
+
+        // --omit-payload clears the non-object payload before redaction, succeeding safely.
+        let omit_plan = RedactionPlan {
+            apply_rules: true,
+            omit_payload: true,
+            for_diff: false,
+            rule_count: 1,
+        };
+        let mut omitted_bad = vec![valid_event, bad_app_event];
+        prepare_events(&mut omitted_bad, omit_plan, &wildcard).unwrap();
+        assert!(
+            omitted_bad
+                .iter()
+                .all(|ev| ev.before.is_none() && ev.after.is_none())
         );
     }
 }

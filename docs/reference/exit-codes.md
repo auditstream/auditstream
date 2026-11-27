@@ -11,7 +11,7 @@
 | `2` | Usage or config error | Invalid CLI arguments (clap), missing `--config` file, unknown config key or invalid config value type |
 | `3` | Database error | Postgres connection, permission, query or migration failure |
 | `4` | Output or cursor error | Failure reading or writing an output file, migration directory or cursor file |
-| `5` | Internal error | Unexpected internal failure or unimplemented command stub |
+| `5` | Internal error | Unexpected internal failure or fail-closed redaction error on a non-object or malformed event payload |
 | `101` | Panic | Uncaught Rust panic (standard Rust runtime exit status) |
 
 ## Error formatting
