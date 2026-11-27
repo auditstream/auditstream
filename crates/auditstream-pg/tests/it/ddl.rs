@@ -1468,6 +1468,7 @@ async fn log_event_rejects_control_chars_whitespace_and_padded_dml_and_round_tri
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn adversarial_dollar_quote_schema_names_install_and_execute_without_breakout() {
     let _lock = TestDb::cluster_lock().await.expect("cluster lock");
     let db = TestDb::new().await.expect("create TestDb");
@@ -1493,6 +1494,30 @@ async fn adversarial_dollar_quote_schema_names_install_and_execute_without_break
     // PG 19 removed non-standard string literals with SQLSTATE 0A000).
     let scs_off = crate::supports_non_standard_strings(&mut conn).await;
     for phase in ["install", "re-apply"] {
+        if phase == "re-apply" {
+            // Drift changes_default's leaf BRIN index before re-apply so `brin_autosummarize_sql`'s
+            // LOOP body (`LOCK TABLE ONLY` + `ALTER INDEX`) executes with the adversarial schema name.
+            let default_brin: String = sqlx::query_scalar(
+                "SELECT ic.relname::text \
+                   FROM pg_catalog.pg_index ix \
+                   JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid \
+                   JOIN pg_catalog.pg_am am ON am.oid = ic.relam \
+                   JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid \
+                   JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace \
+                  WHERE n.nspname = $1 AND t.relname = 'changes_default' AND am.amname = 'brin'",
+            )
+            .bind(schema)
+            .fetch_one(&mut conn)
+            .await
+            .expect("find adversarial changes_default BRIN index");
+            conn.execute(AssertSqlSafe(format!(
+                "ALTER INDEX {}.{} SET (autosummarize = off)",
+                quote_ident(schema),
+                quote_ident(&default_brin),
+            )))
+            .await
+            .expect("drift adversarial changes_default BRIN index");
+        }
         let mut tx = conn.begin().await.expect("begin tx");
         if scs_off {
             tx.execute("SET LOCAL standard_conforming_strings = off")
@@ -1503,6 +1528,32 @@ async fn adversarial_dollar_quote_schema_names_install_and_execute_without_break
             .await
             .unwrap_or_else(|err| panic!("adversarial schema {phase} failed: {err}"));
         tx.commit().await.expect("commit tx");
+    }
+
+    let adversarial_brin: Vec<(String, Option<Vec<String>>)> = sqlx::query_as(
+        "SELECT t.relname::text, ic.reloptions \
+           FROM pg_catalog.pg_index ix \
+           JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid \
+           JOIN pg_catalog.pg_am am ON am.oid = ic.relam \
+           JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid \
+           JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace \
+          WHERE n.nspname = $1 AND am.amname = 'brin' \
+          ORDER BY t.relname",
+    )
+    .bind(schema)
+    .fetch_all(&mut conn)
+    .await
+    .expect("query adversarial BRIN reloptions");
+    assert!(
+        adversarial_brin.len() >= 6,
+        "expected parent + default + 4 monthly BRIN indexes, got {adversarial_brin:?}"
+    );
+    for (tbl, opts) in &adversarial_brin {
+        assert!(
+            opts.as_ref()
+                .is_some_and(|v| v.iter().any(|o| o == "autosummarize=on")),
+            "adversarial schema {tbl} BRIN index must have autosummarize=on, got {opts:?}"
+        );
     }
 
     let schema_q = quote_ident(schema);
@@ -2107,6 +2158,342 @@ async fn lz4_toast_compression_sets_current_and_future_skips_historical_and_is_l
     .await
     .expect("read before compression");
     assert_eq!(before_comp, "p");
+
+    admin.close().await.expect("close admin");
+    conn.close().await.expect("close migrator");
+    drop(db);
+    let mut cleanup = PgConnection::connect(&admin_url)
+        .await
+        .expect("admin cleanup");
+    let _ = cleanup
+        .execute(AssertSqlSafe(format!(
+            "DROP ROLE IF EXISTS {}",
+            quote_ident(OWNER_ROLE)
+        )))
+        .await;
+    let _ = cleanup.close().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn brin_autosummarize_sets_fresh_and_drifted_leaf_indexes_skips_historical_and_is_lock_free_on_rerun()
+ {
+    type RelOptions = Option<Vec<String>>;
+
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let db = TestDb::non_superuser()
+        .await
+        .expect("create non-superuser TestDb");
+    let admin_url = db.admin_url().to_owned();
+    let migrator_role = db.role_name().expect("migrator role").to_owned();
+    let (base_admin, _) = admin_url.rsplit_once('/').expect("admin url slash");
+    let admin_db_url = format!("{base_admin}/{}", db.database_name());
+
+    {
+        let mut admin = PgConnection::connect(&admin_url)
+            .await
+            .expect("admin connect");
+        admin
+            .execute(AssertSqlSafe(format!(
+                "DO $$ BEGIN \
+                   DROP ROLE IF EXISTS {owner}; \
+                 EXCEPTION WHEN dependent_objects_still_exist THEN \
+                   IF pg_catalog.current_setting('server_version_num')::int >= 160000 THEN \
+                     EXECUTE 'GRANT {owner} TO {mig} WITH ADMIN OPTION, INHERIT FALSE, SET FALSE'; \
+                   END IF; \
+                 END $$",
+                owner = quote_ident(OWNER_ROLE),
+                mig = quote_ident(&migrator_role),
+            )))
+            .await
+            .expect("prepare owner role");
+        admin.close().await.expect("close admin");
+    }
+
+    let stmts = ddl::generate(&DdlOptions::default());
+    let mut conn = PgConnection::connect(db.url())
+        .await
+        .expect("migrator connect");
+
+    // 1. Fresh install as non-superuser migrator sets autosummarize=on on parent BRIN index
+    //    and every attached child partition BRIN index, and future partitions inherit it.
+    run_statements_tx(&mut conn, &stmts)
+        .await
+        .expect("non-superuser DDL setup must succeed");
+
+    let mut admin = PgConnection::connect(&admin_db_url)
+        .await
+        .expect("admin db connect");
+
+    let report = auditstream_pg::partitions::ensure_ahead(db.pool(), DEFAULT_SCHEMA, 4)
+        .await
+        .expect("ensure_ahead month +4");
+    assert_eq!(report.created.len(), 1);
+
+    let brin_opts: Vec<(String, String, Option<Vec<String>>)> = sqlx::query_as(
+        "SELECT tbl.relname::text, ic.relkind::text, ic.reloptions \
+           FROM pg_catalog.pg_index ix \
+           JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid \
+           JOIN pg_catalog.pg_am am ON am.oid = ic.relam \
+           JOIN pg_catalog.pg_class tbl ON tbl.oid = ix.indrelid \
+           JOIN pg_catalog.pg_namespace n ON n.oid = tbl.relnamespace \
+          WHERE n.nspname = 'auditstream' AND am.amname = 'brin' \
+          ORDER BY tbl.relname",
+    )
+    .fetch_all(&mut admin)
+    .await
+    .expect("query BRIN reloptions");
+    assert!(
+        brin_opts.len() >= 7,
+        "expected parent + default + 5 monthly BRIN indexes, got {brin_opts:?}"
+    );
+    for (tbl, relkind, opts) in &brin_opts {
+        assert!(
+            opts.as_ref()
+                .is_some_and(|v| v.iter().any(|o| o == "autosummarize=on")),
+            "expected autosummarize=on on {tbl} BRIN index (relkind={relkind}), got {opts:?}"
+        );
+    }
+
+    // 2. Seed a historical partition with reset BRIN reloptions, drift `changes_default` via
+    //    `RESET (autosummarize)` (`NULL` reloptions), drift the current UTC month's BRIN index
+    //    via explicit `SET (autosummarize = off)`, and set month +4 to PostgreSQL's boolean synonym
+    //    `SET (autosummarize = true)` to verify:
+    //    - historical partition and its BRIN index are never locked (even under an active
+    //      AccessExclusiveLock directly on the historical BRIN index OID) and remain untouched,
+    //    - both `NULL` and explicit `autosummarize=off` drift heal under `auditstream_owner` after
+    //      locking parent `changes`,
+    //    - PostgreSQL's boolean synonym `autosummarize=true` is treated as already enabled.
+    let current_part: String = sqlx::query_scalar(
+        "SELECT 'changes_' || pg_catalog.to_char(pg_catalog.date_trunc('month', pg_catalog.now() AT TIME ZONE 'UTC'), 'YYYY_MM')",
+    )
+    .fetch_one(&mut admin)
+    .await
+    .expect("read current UTC partition name");
+    let month4_part = report.created[0].partition_name();
+
+    admin
+        .execute(AssertSqlSafe(format!(
+            "CREATE TABLE auditstream.changes_2025_01 PARTITION OF auditstream.changes \
+               FOR VALUES FROM ('2025-01-01 00:00:00+00') TO ('2025-02-01 00:00:00+00'); \
+             ALTER TABLE auditstream.changes_2025_01 OWNER TO auditstream_owner; \
+             REVOKE ALL ON TABLE auditstream.changes_2025_01 FROM PUBLIC CASCADE; \
+             DO $$ \
+             DECLARE idx_name name; \
+             BEGIN \
+               SELECT ic.relname INTO idx_name \
+                 FROM pg_catalog.pg_index ix \
+                 JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid \
+                 JOIN pg_catalog.pg_am am ON am.oid = ic.relam \
+                 JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace \
+                WHERE n.nspname = 'auditstream' AND t.relname = 'changes_2025_01' AND am.amname = 'brin'; \
+               EXECUTE pg_catalog.format('ALTER INDEX auditstream.%I RESET (autosummarize)', idx_name); \
+               SELECT ic.relname INTO idx_name \
+                 FROM pg_catalog.pg_index ix \
+                 JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid \
+                 JOIN pg_catalog.pg_am am ON am.oid = ic.relam \
+                 JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace \
+                WHERE n.nspname = 'auditstream' AND t.relname = 'changes_default' AND am.amname = 'brin'; \
+               EXECUTE pg_catalog.format('ALTER INDEX auditstream.%I RESET (autosummarize)', idx_name); \
+               SELECT ic.relname INTO idx_name \
+                 FROM pg_catalog.pg_index ix \
+                 JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid \
+                 JOIN pg_catalog.pg_am am ON am.oid = ic.relam \
+                 JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace \
+                WHERE n.nspname = 'auditstream' AND t.relname = '{current_part}' AND am.amname = 'brin'; \
+               EXECUTE pg_catalog.format('ALTER INDEX auditstream.%I SET (autosummarize = off)', idx_name); \
+               SELECT ic.relname INTO idx_name \
+                 FROM pg_catalog.pg_index ix \
+                 JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid \
+                 JOIN pg_catalog.pg_am am ON am.oid = ic.relam \
+                 JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace \
+                WHERE n.nspname = 'auditstream' AND t.relname = '{month4_part}' AND am.amname = 'brin'; \
+               EXECUTE pg_catalog.format('ALTER INDEX auditstream.%I SET (autosummarize = true)', idx_name); \
+             END $$"
+        )))
+        .await
+        .expect("seed historical, drifted default/current, and synonym month+4 BRIN indexes");
+
+    let (hist_idx, default_idx, current_idx, month4_idx): (String, String, String, String) =
+        sqlx::query_as(
+            "SELECT \
+               (SELECT ic.relname::text FROM pg_catalog.pg_index ix \
+                  JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid \
+                  JOIN pg_catalog.pg_am am ON am.oid = ic.relam \
+                  JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid \
+                  JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace \
+                 WHERE n.nspname = 'auditstream' AND t.relname = 'changes_2025_01' AND am.amname = 'brin'), \
+               (SELECT ic.relname::text FROM pg_catalog.pg_index ix \
+                  JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid \
+                  JOIN pg_catalog.pg_am am ON am.oid = ic.relam \
+                  JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid \
+                  JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace \
+                 WHERE n.nspname = 'auditstream' AND t.relname = 'changes_default' AND am.amname = 'brin'), \
+               (SELECT ic.relname::text FROM pg_catalog.pg_index ix \
+                  JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid \
+                  JOIN pg_catalog.pg_am am ON am.oid = ic.relam \
+                  JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid \
+                  JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace \
+                 WHERE n.nspname = 'auditstream' AND t.relname = $1 AND am.amname = 'brin'), \
+               (SELECT ic.relname::text FROM pg_catalog.pg_index ix \
+                  JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid \
+                  JOIN pg_catalog.pg_am am ON am.oid = ic.relam \
+                  JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid \
+                  JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace \
+                 WHERE n.nspname = 'auditstream' AND t.relname = $2 AND am.amname = 'brin')",
+        )
+        .bind(&current_part)
+        .bind(&month4_part)
+        .fetch_one(&mut admin)
+        .await
+        .expect("resolve leaf BRIN index names");
+
+    // Hold AccessExclusiveLock directly on BOTH the historical heap table AND its BRIN index OID
+    // (because ALTER INDEX acquires AccessExclusiveLock on the index OID, not the heap table).
+    let mut hist_blocker = admin.begin().await.expect("begin historical blocker");
+    hist_blocker
+        .execute("LOCK TABLE auditstream.changes_2025_01 IN ACCESS EXCLUSIVE MODE")
+        .await
+        .expect("lock historical partition heap");
+    hist_blocker
+        .execute(AssertSqlSafe(format!(
+            "ALTER INDEX auditstream.{} RESET (autosummarize)",
+            quote_ident(&hist_idx),
+        )))
+        .await
+        .expect("lock historical BRIN index OID");
+
+    {
+        let mut heal_tx = conn.begin().await.expect("begin heal tx");
+        heal_tx
+            .execute("SET LOCAL lock_timeout = '500ms'")
+            .await
+            .expect("set lock_timeout");
+        run_statements(&mut heal_tx, &stmts)
+            .await
+            .expect("healing drifted BRIN indexes must not lock historical partition or its index");
+        let all_locks: Vec<String> = sqlx::query_scalar(
+            "SELECT c.relname || ': ' || l.mode FROM pg_catalog.pg_locks l \
+               JOIN pg_catalog.pg_class c ON c.oid = l.relation \
+              WHERE l.pid = pg_catalog.pg_backend_pid() \
+                AND c.relnamespace = 'auditstream'::pg_catalog.regnamespace \
+              ORDER BY 1",
+        )
+        .fetch_all(&mut *heal_tx)
+        .await
+        .expect("read heal locks");
+        assert!(
+            all_locks.contains(&"changes: AccessExclusiveLock".to_owned()),
+            "parent `changes` must be locked before leaf ALTER INDEX, got: {all_locks:?}"
+        );
+        assert!(
+            all_locks.contains(&format!("{default_idx}: AccessExclusiveLock")),
+            "drifted changes_default BRIN index `{default_idx}` must be altered, got: {all_locks:?}"
+        );
+        assert!(
+            all_locks.contains(&format!("{current_idx}: AccessExclusiveLock")),
+            "drifted current-month BRIN index `{current_idx}` must be altered, got: {all_locks:?}"
+        );
+        assert!(
+            !all_locks.iter().any(|entry| entry.starts_with(&month4_idx)),
+            "month +4 BRIN index using PG boolean synonym `autosummarize=true` must not be re-locked, got: {all_locks:?}"
+        );
+        assert!(
+            !all_locks
+                .iter()
+                .any(|entry| entry.starts_with("changes_2025_01")),
+            "historical partition/index must acquire zero locks of any mode, got: {all_locks:?}"
+        );
+        heal_tx.commit().await.expect("commit heal tx");
+    }
+    hist_blocker.rollback().await.expect("release blocker");
+
+    let (hist_opts, default_opts, current_opts, month4_opts): (
+        RelOptions,
+        RelOptions,
+        RelOptions,
+        RelOptions,
+    ) = sqlx::query_as(
+        "SELECT \
+           (SELECT c.reloptions FROM pg_catalog.pg_class c \
+              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'auditstream' AND c.relname = $1), \
+           (SELECT c.reloptions FROM pg_catalog.pg_class c \
+              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'auditstream' AND c.relname = $2), \
+           (SELECT c.reloptions FROM pg_catalog.pg_class c \
+              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'auditstream' AND c.relname = $3), \
+           (SELECT c.reloptions FROM pg_catalog.pg_class c \
+              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'auditstream' AND c.relname = $4)",
+    )
+    .bind(&hist_idx)
+    .bind(&default_idx)
+    .bind(&current_idx)
+    .bind(&month4_idx)
+    .fetch_one(&mut admin)
+    .await
+    .expect("read historical, default, current, and month+4 BRIN options");
+    assert!(
+        hist_opts.is_none(),
+        "historical partition BRIN index must remain untouched, got {hist_opts:?}"
+    );
+    assert!(
+        default_opts
+            .as_ref()
+            .is_some_and(|v| v.iter().any(|o| o == "autosummarize=on")),
+        "changes_default BRIN index must be healed from NULL to autosummarize=on, got {default_opts:?}"
+    );
+    assert!(
+        current_opts
+            .as_ref()
+            .is_some_and(|v| v.iter().any(|o| o == "autosummarize=on")),
+        "current-month BRIN index must be healed from autosummarize=off to autosummarize=on, got {current_opts:?}"
+    );
+    assert!(
+        month4_opts
+            .as_ref()
+            .is_some_and(|v| v.iter().any(|o| o == "autosummarize=true")),
+        "month+4 BRIN index with autosummarize=true must be preserved without churn, got {month4_opts:?}"
+    );
+
+    // 3. Re-running DDL a second time executes zero ALTER TABLE / ALTER INDEX and takes zero locks.
+    admin
+        .execute(
+            "CREATE FUNCTION reject_alter_index_on_rerun() RETURNS event_trigger LANGUAGE plpgsql \
+             AS $$ BEGIN RAISE EXCEPTION 'unexpected % on rerun', tg_tag; END $$; \
+             CREATE EVENT TRIGGER reject_alter_index_on_rerun ON ddl_command_start \
+             WHEN TAG IN ('ALTER TABLE', 'ALTER INDEX') EXECUTE FUNCTION reject_alter_index_on_rerun()",
+        )
+        .await
+        .expect("install event trigger");
+    {
+        let mut rerun_tx = conn.begin().await.expect("begin rerun tx");
+        run_statements(&mut rerun_tx, &stmts)
+            .await
+            .expect("second DDL run must execute zero ALTER TABLE / ALTER INDEX");
+        let blocking: Vec<String> = sqlx::query_scalar(
+            "SELECT c.relname || ': ' || l.mode FROM pg_catalog.pg_locks l \
+               JOIN pg_catalog.pg_class c ON c.oid = l.relation \
+              WHERE l.pid = pg_catalog.pg_backend_pid() \
+                AND c.relnamespace = 'auditstream'::pg_catalog.regnamespace \
+                AND l.mode IN ('ShareLock', 'ShareRowExclusiveLock', 'ExclusiveLock', 'AccessExclusiveLock') \
+              ORDER BY 1",
+        )
+        .fetch_all(&mut *rerun_tx)
+        .await
+        .expect("read rerun locks");
+        assert!(
+            blocking.is_empty(),
+            "second DDL run must hold zero blocking locks, got: {blocking:?}"
+        );
+        rerun_tx.commit().await.expect("commit rerun tx");
+    }
 
     admin.close().await.expect("close admin");
     conn.close().await.expect("close migrator");

@@ -433,7 +433,7 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c
                  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
                  WHERE n.nspname = 'auditstream' AND c.relname = 'changes_occurred_at_brin_idx') THEN
-    CREATE INDEX IF NOT EXISTS changes_occurred_at_brin_idx ON "auditstream".changes USING brin (occurred_at);
+    CREATE INDEX IF NOT EXISTS changes_occurred_at_brin_idx ON "auditstream".changes USING brin (occurred_at) WITH (autosummarize = on);
   END IF;
 END
 $$;
@@ -879,6 +879,118 @@ BEGIN
       );
     END IF;
   END LOOP;
+  IF switched_role THEN
+    SET LOCAL ROLE NONE;
+    IF prev_role <> current_user THEN
+      EXECUTE pg_catalog.format('SET LOCAL ROLE %I', prev_role);
+    END IF;
+  END IF;
+END
+$$;
+
+DO $$
+DECLARE
+  prev_role name := current_user;
+  switched_role boolean := false;
+  parent_locked boolean := false;
+  current_part text := 'changes_' || pg_catalog.to_char(
+    pg_catalog.date_trunc('month', pg_catalog.now() AT TIME ZONE 'UTC'),
+    'YYYY_MM'
+  );
+  idx_schema name;
+  idx_name name;
+BEGIN
+  FOR idx_schema, idx_name IN
+    WITH RECURSIVE parent AS (
+      SELECT c.oid, c.relnamespace
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = 'auditstream'
+         AND c.relname = 'changes'
+         AND c.relkind IN ('r', 'p')
+    ),
+    child_tree(relid, sort_group, depth) AS (
+      SELECT
+        child.oid,
+        CASE WHEN child.relname = 'changes_default' THEN 1 ELSE 2 END,
+        1
+        FROM parent p
+        JOIN pg_catalog.pg_inherits i ON i.inhparent = p.oid
+        JOIN pg_catalog.pg_class child ON child.oid = i.inhrelid
+        JOIN pg_catalog.pg_namespace cn ON cn.oid = child.relnamespace
+       WHERE cn.nspname = 'auditstream'
+         AND child.relispartition
+         AND child.relkind IN ('r', 'p')
+         AND (
+           child.relname = 'changes_default'
+           OR (
+             pg_catalog.regexp_like(
+               child.relname::text COLLATE pg_catalog."C",
+               '^changes_[0-9]{4}_(0[1-9]|1[0-2])$'
+             )
+             AND child.relname::text COLLATE pg_catalog."C" >= current_part COLLATE pg_catalog."C"
+           )
+         )
+      UNION ALL
+      SELECT sub.oid, ct.sort_group, ct.depth + 1
+        FROM child_tree ct
+        JOIN pg_catalog.pg_inherits i ON i.inhparent = ct.relid
+        JOIN pg_catalog.pg_class sub ON sub.oid = i.inhrelid
+       WHERE sub.relispartition
+         AND sub.relkind IN ('r', 'p')
+    ),
+    target_tables AS (
+      SELECT p.oid AS relid, 0 AS sort_group, 0 AS depth
+        FROM parent p
+      UNION ALL
+      SELECT ct.relid, ct.sort_group, ct.depth
+        FROM child_tree ct
+    ),
+    idx_tree(idx_oid) AS (
+      SELECT ic.oid
+        FROM parent p
+        JOIN pg_catalog.pg_index ix ON ix.indrelid = p.oid
+        JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid
+        JOIN pg_catalog.pg_am am ON am.oid = ic.relam
+       WHERE ic.relnamespace = p.relnamespace
+         AND ic.relname = 'changes_occurred_at_brin_idx'
+         AND am.amname = 'brin'
+      UNION ALL
+      SELECT i.inhrelid
+        FROM idx_tree it
+        JOIN pg_catalog.pg_inherits i ON i.inhparent = it.idx_oid
+    )
+    SELECT idx_ns.nspname, idx_c.relname
+      FROM idx_tree it
+      JOIN pg_catalog.pg_class idx_c ON idx_c.oid = it.idx_oid
+      JOIN pg_catalog.pg_namespace idx_ns ON idx_ns.oid = idx_c.relnamespace
+      JOIN pg_catalog.pg_am am ON am.oid = idx_c.relam
+      JOIN pg_catalog.pg_index ix ON ix.indexrelid = idx_c.oid
+      JOIN target_tables tt ON tt.relid = ix.indrelid
+     WHERE idx_c.relkind = 'i'
+       AND am.amname = 'brin'
+       AND NOT EXISTS (
+         SELECT 1
+           FROM pg_catalog.pg_options_to_table(idx_c.reloptions) AS opt
+          WHERE CASE
+                  WHEN opt.option_name COLLATE pg_catalog."C" = 'autosummarize' COLLATE pg_catalog."C"
+                  THEN opt.option_value::pg_catalog.bool
+                  ELSE false
+                END
+       )
+     ORDER BY tt.sort_group ASC, tt.depth ASC, idx_ns.nspname, idx_c.relname
+  LOOP
+    IF NOT switched_role AND prev_role <> 'auditstream_owner' THEN
+      EXECUTE pg_catalog.format('SET LOCAL ROLE %I', 'auditstream_owner');
+      switched_role := true;
+    END IF;
+    IF NOT parent_locked THEN
+      EXECUTE pg_catalog.format('LOCK TABLE ONLY %I.changes IN ACCESS EXCLUSIVE MODE', 'auditstream');
+      parent_locked := true;
+    END IF;
+    EXECUTE pg_catalog.format('ALTER INDEX %I.%I SET (autosummarize = on)', idx_schema, idx_name);
+  END LOOP;
+
   IF switched_role THEN
     SET LOCAL ROLE NONE;
     IF prev_role <> current_user THEN

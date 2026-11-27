@@ -232,9 +232,9 @@ fn validate_options(options: &MigrationOptions) -> Result<(), MigrationError> {
 /// The returned sequence matches the exact production composition emitted by [`write()`] and
 /// [`preview()`]: it sets the transaction guard and `lock_timeout` fallback, installs the history
 /// schema and functions, attaches capture triggers before enabling LZ4 TOAST compression (when
-/// supported) and creating future monthly partitions (avoiding lock-order deadlocks with
-/// concurrent writers), revokes any temporary `auditstream_owner` self-grant, and restores
-/// `lock_timeout`.
+/// supported), creating future monthly partitions, and reconciling leaf BRIN `autosummarize = on`
+/// options (avoiding lock-order deadlocks with concurrent writers), revokes any temporary
+/// `auditstream_owner` self-grant, and restores `lock_timeout`.
 ///
 /// Callers MUST execute the returned statements sequentially inside a single transaction
 /// (for example via `sqlx::Transaction`, a transactional migrator, or [`render_install_sql()`]);
@@ -438,8 +438,9 @@ fn compose_statements_inner(
     dropped_tables: &[(String, String)],
 ) -> Vec<String> {
     // Keep D2's temporary `auditstream_owner` self-grant active while D3 creates/alters functions,
-    // and run LZ4 TOAST compression and future monthly partition creation after triggers/drops so
-    // holding a lock on `changes` cannot deadlock with in-flight writers holding an audited table.
+    // and run LZ4 TOAST compression, future monthly partition creation, and leaf BRIN
+    // `autosummarize = on` reconciliation after triggers/drops so holding a lock on `changes`
+    // cannot deadlock with in-flight writers holding an audited table.
     let ddl_parts = ddl::generate_parts(ddl);
     let tables_sorted = canonicalize_tables(tables);
 
@@ -464,6 +465,7 @@ fn compose_statements_inner(
         .chain(drop_stmts)
         .chain(std::iter::once(ddl_parts.toast_compression))
         .chain(std::iter::once(ddl_parts.future_partitions))
+        .chain(std::iter::once(ddl_parts.brin_autosummarize))
         .chain(std::iter::once(ddl_parts.role_cleanup))
         .chain(std::iter::once(RESTORE_LOCK_TIMEOUT.to_owned()))
         .collect()
@@ -707,7 +709,8 @@ mod tests {
         );
 
         // Triggers and drops must run before LZ4 TOAST compression, future monthly partitions,
-        // and role cleanup (`audited_table -> changes` lock ordering).
+        // leaf BRIN `autosummarize = on` reconciliation, and role cleanup (`audited_table -> changes`
+        // lock ordering).
         let with_drops = compose_statements_inner(
             &DdlOptions::new(ddl::DEFAULT_SCHEMA, vec!["app_user".to_owned()]),
             &sample_tables(),
@@ -731,6 +734,10 @@ mod tests {
             .iter()
             .position(|s| *s == ddl_parts.future_partitions)
             .expect("future partitions statement");
+        let brin_idx = with_drops
+            .iter()
+            .position(|s| s.contains("SET (autosummarize = on)"))
+            .expect("BRIN autosummarize statement");
         let cleanup_idx = with_drops
             .iter()
             .position(|s| *s == ddl_parts.role_cleanup)
@@ -738,7 +745,15 @@ mod tests {
         assert!(last_trigger_idx < last_drop_idx);
         assert!(last_drop_idx < toast_idx);
         assert!(toast_idx < future_part_idx);
-        assert!(future_part_idx < cleanup_idx);
+        assert!(future_part_idx < brin_idx);
+        assert!(brin_idx < cleanup_idx);
+        assert!(
+            with_drops.iter().any(|s| {
+                s.contains("changes_occurred_at_brin_idx")
+                    && s.contains("USING brin (occurred_at) WITH (autosummarize = on)")
+            }),
+            "fresh BRIN index creation must set WITH (autosummarize = on)"
+        );
 
         // Capability check must precede role switch and ALTER TABLE in the LZ4 block.
         let toast_sql = &with_drops[toast_idx];

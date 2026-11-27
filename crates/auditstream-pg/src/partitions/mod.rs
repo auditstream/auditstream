@@ -408,6 +408,7 @@ async fn create_partition_with_savepoint(
     {
         Ok(_) => {
             sanitize_child_partition_acl(tx, schema, part_name).await?;
+            ensure_brin_autosummarize(tx, schema, part_name).await?;
             sqlx::query("RELEASE SAVEPOINT auditstream_create_part")
                 .execute(&mut **tx)
                 .await?;
@@ -864,6 +865,85 @@ async fn sanitize_child_partition_acl(
         sqlx::query(AssertSqlSafe(revoke_sql))
             .execute(&mut **tx)
             .await?;
+    }
+    Ok(())
+}
+
+/// Ensures any newly attached leaf BRIN index inherited from `{schema}.changes_occurred_at_brin_idx`
+/// has `autosummarize = on`.
+///
+/// Fresh installations already inherit `autosummarize = on` from the partitioned parent index so
+/// this query returns zero rows; upgraded installations whose parent BRIN index pre-dated
+/// `WITH (autosummarize = on)` (PostgreSQL rejects `ALTER INDEX ... SET (...)` on partitioned
+/// parent indexes) still receive `autosummarize = on` on every new monthly partition.
+async fn ensure_brin_autosummarize(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    schema: &str,
+    part_name: &str,
+) -> Result<(), sqlx::Error> {
+    let indexes: Vec<(String, String)> = sqlx::query_as(
+        "WITH RECURSIVE idx_tree(idx_oid) AS ( \
+           SELECT ic.oid \
+             FROM pg_catalog.pg_class parent \
+             JOIN pg_catalog.pg_namespace pn ON pn.oid = parent.relnamespace \
+             JOIN pg_catalog.pg_index ix ON ix.indrelid = parent.oid \
+             JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid \
+             JOIN pg_catalog.pg_am am ON am.oid = ic.relam \
+            WHERE pn.nspname = $1 \
+              AND parent.relname = 'changes' \
+              AND ic.relnamespace = parent.relnamespace \
+              AND ic.relname = 'changes_occurred_at_brin_idx' \
+              AND am.amname = 'brin' \
+           UNION ALL \
+           SELECT i.inhrelid \
+             FROM idx_tree it \
+             JOIN pg_catalog.pg_inherits i ON i.inhparent = it.idx_oid \
+         ) \
+         SELECT idx_ns.nspname::text, idx_c.relname::text \
+           FROM idx_tree it \
+           JOIN pg_catalog.pg_class idx_c ON idx_c.oid = it.idx_oid \
+           JOIN pg_catalog.pg_namespace idx_ns ON idx_ns.oid = idx_c.relnamespace \
+           JOIN pg_catalog.pg_am am ON am.oid = idx_c.relam \
+           JOIN pg_catalog.pg_index ix ON ix.indexrelid = idx_c.oid \
+           JOIN pg_catalog.pg_class tbl ON tbl.oid = ix.indrelid \
+           JOIN pg_catalog.pg_namespace tn ON tn.oid = tbl.relnamespace \
+          WHERE tn.nspname = $1 \
+            AND tbl.relname = $2 \
+            AND idx_c.relkind = 'i' \
+            AND am.amname = 'brin' \
+            AND NOT EXISTS ( \
+              SELECT 1 \
+                FROM pg_catalog.pg_options_to_table(idx_c.reloptions) AS opt \
+               WHERE CASE \
+                       WHEN opt.option_name COLLATE pg_catalog.\"C\" = 'autosummarize' COLLATE pg_catalog.\"C\" \
+                       THEN opt.option_value::pg_catalog.bool \
+                       ELSE false \
+                     END \
+            ) \
+          ORDER BY idx_ns.nspname, idx_c.relname",
+    )
+    .bind(schema)
+    .bind(part_name)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    if !indexes.is_empty() {
+        let lock_sql = format!(
+            "LOCK TABLE ONLY {}.changes IN ACCESS EXCLUSIVE MODE",
+            quote_ident(schema),
+        );
+        sqlx::query(AssertSqlSafe(lock_sql))
+            .execute(&mut **tx)
+            .await?;
+    }
+
+    for (idx_schema, idx_name) in indexes {
+        let sql = format!(
+            "ALTER INDEX {}.{} SET (autosummarize = on)",
+            quote_ident(&idx_schema),
+            quote_ident(&idx_name),
+        );
+        sqlx::query(AssertSqlSafe(sql)).execute(&mut **tx).await?;
     }
     Ok(())
 }

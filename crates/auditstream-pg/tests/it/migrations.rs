@@ -1767,6 +1767,51 @@ async fn lz4_upgrade_from_v0_1_0_preserves_lock_order_and_skips_historical_parti
         .expect("verify after LZ4 upgrade");
     assert!(report.findings.is_empty(), "{:?}", report.findings);
 
+    // Verify upgraded v0.1.0 DB also enabled BRIN autosummarize=on on changes_default and
+    // current/future monthly partitions (and on a later partition created by ensure_ahead),
+    // while leaving historical changes_2025_01 untouched.
+    let ensure_report = auditstream_pg::partitions::ensure_ahead(db.pool(), DEFAULT_SCHEMA, 4)
+        .await
+        .expect("ensure_ahead month +4 on upgraded v0.1.0 DB");
+    assert_eq!(ensure_report.created.len(), 1);
+    let brin_rows: Vec<(String, Option<Vec<String>>)> = sqlx::query_as(
+        "SELECT tbl.relname::text, ic.reloptions \
+           FROM pg_catalog.pg_index ix \
+           JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid \
+           JOIN pg_catalog.pg_am am ON am.oid = ic.relam \
+           JOIN pg_catalog.pg_class tbl ON tbl.oid = ix.indrelid \
+           JOIN pg_catalog.pg_namespace n ON n.oid = tbl.relnamespace \
+          WHERE n.nspname = 'auditstream' \
+            AND ic.relkind = 'i' \
+            AND am.amname = 'brin' \
+          ORDER BY tbl.relname",
+    )
+    .fetch_all(&mut admin)
+    .await
+    .expect("query leaf BRIN reloptions after v0.1.0 upgrade");
+    assert!(
+        brin_rows.len() >= 7,
+        "expected default + historical + 5 monthly leaf BRIN indexes, got {brin_rows:?}"
+    );
+    assert!(
+        brin_rows.iter().any(|(tbl, _)| tbl == "changes_2025_01"),
+        "expected historical partition BRIN row in {brin_rows:?}"
+    );
+    for (tbl, opts) in &brin_rows {
+        if tbl == "changes_2025_01" {
+            assert!(
+                opts.is_none(),
+                "historical partition {tbl} BRIN index must stay untouched, got {opts:?}"
+            );
+        } else {
+            assert!(
+                opts.as_ref()
+                    .is_some_and(|v| v.iter().any(|o| o == "autosummarize=on")),
+                "upgraded/future partition {tbl} BRIN index must have autosummarize=on, got {opts:?}"
+            );
+        }
+    }
+
     admin.close().await.expect("close admin");
     drop(db);
     let mut cleanup = PgConnection::connect(&admin_url)
