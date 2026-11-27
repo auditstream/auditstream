@@ -15,6 +15,7 @@ This index lists the architecture decisions recorded for Auditstream, starting w
 | 0007 | [Normative spec versioned separately](0007-normative-spec-versioned-separately.md) | accepted | 2026-11-24 |
 | 0008 | [History table lookup index shape](0008-history-lookup-index.md) | proposed | 2026-11-24 |
 | 0009 | [Do not ship an official React UI package or in-database partition sealing](0009-no-ui-package-or-in-db-partition-sealing.md) | accepted | 2026-11-24 |
+| 0010 | [Do not use GUC-based actor caching or statement-level `AFTER UPDATE` in `auditstream.capture()`](0010-no-guc-actor-caching-in-capture-trigger.md) | accepted | 2026-11-27 |
 
 ## How to add a decision
 

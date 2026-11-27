@@ -1404,3 +1404,140 @@ async fn comment_transport_hardening_resolves_line_comments_embedded_tags_and_lo
         assert_eq!(src.as_deref(), Some("comment"), "extra case {idx} source");
     }
 }
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn merge_and_subtransaction_rollback_capture_only_committed_dml_with_actor() {
+    let mut fx = CaptureFixture::kit_default().await;
+    let start_id = fx.seed_invoices_for_update_tests().await;
+
+    // 1. MERGE executing INSERT, real UPDATE, excluded-only no-op UPDATE, and DELETE in one
+    //    statement with a trailing SQL comment actor.
+    fx.exec_app(&format!(
+        "MERGE INTO invoice AS t \
+         USING (VALUES \
+           (1, 'merged', 111::numeric, 's1', 'upd'), \
+           (2, 'open',    50::numeric, 's2_rot', 'upd'), \
+           (3, 'gone',    10::numeric, 's3', 'del'), \
+           (4, 'fresh',   40::numeric, 's4', 'ins') \
+         ) AS s(id, status, total, password_hash, act) \
+         ON t.id = s.id \
+         WHEN MATCHED AND s.act = 'del' THEN DELETE \
+         WHEN MATCHED AND s.act = 'upd' THEN UPDATE SET status = s.status, total = s.total, password_hash = s.password_hash \
+         WHEN NOT MATCHED THEN INSERT (id, status, total, password_hash) VALUES (s.id, s.status, s.total, s.password_hash) \
+         {COMMENT_USER_42}"
+    ))
+    .await;
+
+    let merge_comment_rows = fx.kit_projection_since(start_id).await;
+    assert_eq!(
+        merge_comment_rows.len(),
+        3,
+        "MERGE must capture 1 INSERT + 1 real UPDATE + 1 DELETE and skip excluded-only UPDATE: {merge_comment_rows:?}"
+    );
+    assert_statement_set(
+        &merge_comment_rows,
+        &[
+            "invoice|INSERT|4|user|usr_42|comment|false",
+            "invoice|UPDATE|1|{total,status}|user|usr_42|comment|false",
+            "invoice|DELETE|3|user|usr_42|comment",
+        ],
+    );
+
+    // 2. MERGE with transaction-local set_config actor.
+    let merge_sc_start = fx.max_change_id().await;
+    let mut tx = fx.app_conn.begin().await.expect("begin merge sc tx");
+    sqlx::query(
+        "SELECT pg_catalog.set_config('auditstream.actor', '{\"type\":\"service\",\"id\":\"merge-worker\"}', true)",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("set_config merge-worker");
+    tx.execute(
+        "MERGE INTO invoice AS t \
+         USING (VALUES (4, 'settled', 45::numeric), (5, 'new5', 55::numeric)) AS s(id, status, total) \
+         ON t.id = s.id \
+         WHEN MATCHED THEN UPDATE SET status = s.status, total = s.total \
+         WHEN NOT MATCHED THEN INSERT (id, status, total, password_hash) VALUES (s.id, s.status, s.total, 's5')",
+    )
+    .await
+    .expect("merge with set_config");
+    tx.commit().await.expect("commit merge sc tx");
+
+    assert_statement_set(
+        &fx.kit_projection_since(merge_sc_start).await,
+        &[
+            "invoice|UPDATE|4|{total,status}|service|merge-worker|set_config|false",
+            "invoice|INSERT|5|service|merge-worker|set_config|false",
+        ],
+    );
+
+    // 3. PL/pgSQL BEGIN..EXCEPTION subtransaction rollback: DML inside the aborted inner block
+    //    must leave zero rows in `auditstream.changes`, while outer and recovery DML capture
+    //    cleanly with the exact outer actor (tested for both trailing comment and set_config).
+    let subtx_comment_start = fx.max_change_id().await;
+    fx.exec_app(&format!(
+        "DO $$ \
+         DECLARE dummy int; \
+         BEGIN \
+           INSERT INTO public.invoice VALUES (60, 'before_subtx', 1, 's60'); \
+           BEGIN \
+             INSERT INTO public.invoice VALUES (61, 'rolled_back', 2, 's61'); \
+             UPDATE public.invoice SET status = 'rolled_back_upd' WHERE id = 60; \
+             DELETE FROM public.invoice WHERE id = 5; \
+             dummy := 1 / 0; \
+           EXCEPTION WHEN division_by_zero THEN \
+             UPDATE public.invoice SET status = 'recovered' WHERE id = 60; \
+           END; \
+         END $$ {COMMENT_AI_AGENT}"
+    ))
+    .await;
+
+    assert_eq!(
+        fx.kit_projection_since(subtx_comment_start).await,
+        vec![
+            "invoice|INSERT|60|ai_agent|billing-agent|usr_42|comment|false",
+            "invoice|UPDATE|60|{status}|ai_agent|billing-agent|usr_42|comment|false",
+        ]
+    );
+
+    // Verify rolled-back writes truly did not take effect on `invoice` either.
+    let subtx_ids: Vec<i32> =
+        sqlx::query_scalar("SELECT id FROM public.invoice WHERE id IN (5, 60, 61) ORDER BY id ASC")
+            .fetch_all(&mut fx.app_conn)
+            .await
+            .expect("check surviving rows after subtx rollback");
+    assert_eq!(subtx_ids, vec![5, 60]);
+
+    // 4. Subtransaction rollback with `set_config` changed inside the aborted block: rolling back
+    //    the subtransaction must restore the outer `auditstream.actor` GUC too.
+    let subtx_sc_start = fx.max_change_id().await;
+    let mut tx = fx.app_conn.begin().await.expect("begin subtx sc");
+    sqlx::query(
+        "SELECT pg_catalog.set_config('auditstream.actor', '{\"type\":\"user\",\"id\":\"outer_usr\"}', true)",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("set outer actor");
+    tx.execute(
+        "DO $$ \
+         DECLARE dummy int; \
+         BEGIN \
+           BEGIN \
+             PERFORM pg_catalog.set_config('auditstream.actor', '{bad_json', true); \
+             UPDATE public.invoice SET status = 'aborted' WHERE id = 60; \
+             dummy := 1 / 0; \
+           EXCEPTION WHEN division_by_zero THEN \
+             UPDATE public.invoice SET status = 'after_subtx_sc' WHERE id = 60; \
+           END; \
+         END $$",
+    )
+    .await
+    .expect("run subtx sc block");
+    tx.commit().await.expect("commit subtx sc");
+
+    assert_eq!(
+        fx.kit_projection_since(subtx_sc_start).await,
+        vec!["invoice|UPDATE|60|{status}|user|outer_usr|set_config|false"]
+    );
+}
