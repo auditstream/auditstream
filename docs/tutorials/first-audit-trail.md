@@ -4,6 +4,8 @@ This tutorial takes you from an empty PostgreSQL container to a captured row cha
 You only need Docker, `psql`, and the `auditstream` CLI.
 No Node.js setup is required.
 
+> **Want a one-command preview first?** From the repository root with Docker installed, run `docker compose up --abort-on-container-exit --exit-code-from quickstart` (and clean up with `docker compose down -v`). See [`docker-compose.yml`](../../docker-compose.yml).
+
 ## Install the CLI
 
 Install the prebuilt `auditstream` v0.1.0 CLI through your preferred channel:

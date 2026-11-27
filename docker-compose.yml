@@ -1,0 +1,100 @@
+# Single-command local quickstart for Auditstream.
+#
+# Run:
+#   docker compose up --abort-on-container-exit --exit-code-from quickstart
+# Clean up:
+#   docker compose down -v
+#
+# Override AUDITSTREAM_PG_PORT if port 5432 is already in use on your host, or
+# AUDITSTREAM_IMAGE to test a different CLI container image tag.
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: auditstream_demo
+    ports:
+      - "127.0.0.1:${AUDITSTREAM_PG_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d auditstream_demo"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  quickstart:
+    pull_policy: build
+    build:
+      context: .
+      dockerfile_inline: |
+        ARG AUDITSTREAM_IMAGE=ghcr.io/auditstream/auditstream:0.1.0
+        FROM $${AUDITSTREAM_IMAGE} AS cli
+        FROM postgres:18-alpine
+        COPY --from=cli /usr/local/bin/auditstream /usr/local/bin/auditstream
+      args:
+        AUDITSTREAM_IMAGE: ${AUDITSTREAM_IMAGE:-ghcr.io/auditstream/auditstream:0.1.0}
+    user: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AUDITSTREAM_DATABASE_URL: postgres://postgres:postgres@postgres:5432/auditstream_demo
+    entrypoint: ["/bin/sh", "-eu", "-c"]
+    command:
+      - |
+        work_dir="$$(mktemp -d)"
+        trap 'rm -rf "$$work_dir"' EXIT
+        cd "$$work_dir"
+
+        echo "==> 1/5 Creating sample table public.invoice..."
+        psql "$$AUDITSTREAM_DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+        CREATE TABLE IF NOT EXISTS public.invoice (
+          id int PRIMARY KEY,
+          status text NOT NULL,
+          total numeric(12, 2) NOT NULL,
+          password_hash text
+        );
+        SQL
+
+        echo "==> 2/5 Generating idempotent Auditstream migration (excluding password_hash)..."
+        auditstream init \
+          --migrations sql \
+          --table public.invoice \
+          --exclude public.invoice.password_hash
+
+        echo "==> 3/5 Applying generated migration and running auditstream verify..."
+        psql "$$AUDITSTREAM_DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/*_auditstream.sql
+        auditstream verify
+
+        echo "==> 4/5 Recording sample writes with human and delegated AI agent actors..."
+        psql "$$AUDITSTREAM_DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+        DELETE FROM public.invoice WHERE id = 1;
+        -- {"type":"user","id":"usr_42","tenant":"org_acme"}
+        INSERT INTO public.invoice (id, status, total, password_hash)
+        VALUES (1, 'draft', 49.90, 'hash_initial')
+        /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzQyIiwidGVuYW50Ijoib3JnX2FjbWUifQ'*/;
+        -- Excluded-only column update: records 0 audit rows.
+        UPDATE public.invoice
+        SET password_hash = 'hash_rotated'
+        WHERE id = 1
+        /*auditstream='eyJ0eXBlIjoidXNlciIsImlkIjoidXNyXzQyIiwidGVuYW50Ijoib3JnX2FjbWUifQ'*/;
+        -- {"type":"ai_agent","id":"billing-agent","tenant":"org_acme","onBehalfOf":{"type":"user","id":"usr_42"}}
+        UPDATE public.invoice
+        SET status = 'approved', total = 75.00
+        WHERE id = 1
+        /*auditstream='eyJ0eXBlIjoiYWlfYWdlbnQiLCJpZCI6ImJpbGxpbmctYWdlbnQiLCJ0ZW5hbnQiOiJvcmdfYWNtZSIsIm9uQmVoYWxmT2YiOnsidHlwZSI6InVzZXIiLCJpZCI6InVzcl80MiJ9fQ'*/;
+        SQL
+
+        echo "==> 5/5 Inspecting captured history for public.invoice #1..."
+        if auditstream history --help | grep -q -- '--diff'; then
+          auditstream history --table public.invoice --record-id 1 --diff
+        else
+          auditstream history --table public.invoice --record-id 1
+        fi
+        echo ""
+        echo "==> Full JSON events (password_hash excluded):"
+        auditstream history --table public.invoice --record-id 1 --format json
+
+        echo ""
+        echo "Quickstart complete! Tear down with: docker compose down -v"

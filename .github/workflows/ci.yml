@@ -275,6 +275,191 @@ jobs:
           tool: cargo-deny
       - run: cargo deny check
 
+  setup-action:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Auditstream CLI via composite action
+        id: setup
+        uses: $/actions/setup
+        with:
+          version: "0.1.0"
+      - name: Prepare uppercase SHA-256 pin for round-trip action test
+        id: prep-pin
+        env:
+          INSTALLED_VERSION: ${{ steps.setup.outputs.version }}
+          INSTALLED_BIN: ${{ steps.setup.outputs.binary-path }}
+          INSTALLED_SHA256: ${{ steps.setup.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          test "$INSTALLED_VERSION" = "0.1.0"
+          test -x "$INSTALLED_BIN"
+          test "$(command -v auditstream)" = "$INSTALLED_BIN"
+          [[ "$INSTALLED_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          auditstream --version | grep -q "0.1.0"
+          upper_sha="$(printf '%s' "$INSTALLED_SHA256" | tr '[:lower:]' '[:upper:]')"
+          printf 'upper-sha256=%s\n' "$upper_sha" >> "$GITHUB_OUTPUT"
+      - name: Re-install via composite action with tag prefix and explicit sha256 pin
+        id: setup-pinned
+        uses: $/actions/setup
+        with:
+          version: "auditstream-v0.1.0"
+          sha256: ${{ steps.prep-pin.outputs.upper-sha256 }}
+      - name: Confirm composite action forwards and rejects invalid sha256 input
+        id: setup-bad-sha
+        continue-on-error: true
+        uses: $/actions/setup
+        with:
+          version: "0.1.0"
+          sha256: "not-a-hash"
+      - name: Verify pinned outputs, negative rejections, and live PostgreSQL verify
+        env:
+          AUDITSTREAM_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+          EXPECTED_SHA256: ${{ steps.setup.outputs.sha256 }}
+          PINNED_VERSION: ${{ steps.setup-pinned.outputs.version }}
+          PINNED_BIN: ${{ steps.setup-pinned.outputs.binary-path }}
+          PINNED_SHA256: ${{ steps.setup-pinned.outputs.sha256 }}
+          BAD_SHA_OUTCOME: ${{ steps.setup-bad-sha.outcome }}
+        run: |
+          set -euo pipefail
+          test "$PINNED_VERSION" = "0.1.0"
+          test "$PINNED_SHA256" = "$EXPECTED_SHA256"
+          test -x "$PINNED_BIN"
+          test "$(command -v auditstream)" = "$PINNED_BIN"
+          test "$BAD_SHA_OUTCOME" = "failure"
+
+          assert_install_rejects() {
+            local expected_err="$1"
+            shift
+            local err_out rc
+            set +e
+            err_out="$(env GITHUB_PATH="" GITHUB_OUTPUT="" "$@" bash actions/setup/install.sh 2>&1)"
+            rc=$?
+            set -e
+            if [ "$rc" -eq 0 ]; then
+              echo "FAIL: expected failure matching '${expected_err}', but install.sh exited 0" >&2
+              exit 1
+            fi
+            if ! printf '%s\n' "$err_out" | grep -Fq "$expected_err"; then
+              echo "FAIL: expected error containing '${expected_err}', got: ${err_out}" >&2
+              exit 1
+            fi
+          }
+
+          assert_install_rejects "must be a pinned SemVer release" INPUT_VERSION="latest"
+          assert_install_rejects "must be a pinned SemVer release" INPUT_VERSION="01.0.0"
+          assert_install_rejects "64-character hex digest" INPUT_VERSION="0.1.0" INPUT_SHA256="not-a-hash"
+          assert_install_rejects "SHA-256 checksum mismatch" INPUT_VERSION="0.1.0" \
+            INPUT_SHA256="0000000000000000000000000000000000000000000000000000000000000000"
+
+          # Offline negative tests for the default .sha256 sidecar verification branch (INPUT_SHA256="").
+          stub_dir="$(mktemp -d)"
+          work_dir=""
+          trap 'rm -rf "$stub_dir" "$work_dir"' EXIT
+          cat > "$stub_dir/curl" <<'STUB'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          out=""
+          url=""
+          while [ "$#" -gt 0 ]; do
+            case "$1" in
+              --output) out="$2"; shift 2 ;;
+              --proto|--proto-redir|--retry|--retry-delay|--connect-timeout|--max-time) shift 2 ;;
+              -*) shift ;;
+              *) url="$1"; shift ;;
+            esac
+          done
+          if [[ "$url" == *.sha256 ]]; then
+            printf '%s\n' "$STUB_SHA_CONTENT" > "$out"
+          else
+            printf 'dummy-archive-bytes' > "$out"
+          fi
+          STUB
+          chmod 0755 "$stub_dir/curl"
+          stub_path="${stub_dir}:${PATH}"
+
+          assert_install_rejects "SHA-256 checksum mismatch" PATH="$stub_path" RUNNER_OS="Linux" RUNNER_ARCH="X64" INPUT_VERSION="0.1.0" \
+            STUB_SHA_CONTENT="0000000000000000000000000000000000000000000000000000000000000000 *auditstream-x86_64-unknown-linux-musl.tar.xz"
+          assert_install_rejects "malformed checksum file" PATH="$stub_path" RUNNER_OS="Linux" RUNNER_ARCH="X64" INPUT_VERSION="0.1.0" \
+            STUB_SHA_CONTENT=$'0000000000000000000000000000000000000000000000000000000000000000 *a\n1111111111111111111111111111111111111111111111111111111111111111 *b'
+          assert_install_rejects "instead of 'auditstream-x86_64-unknown-linux-musl.tar.xz'" PATH="$stub_path" RUNNER_OS="Linux" RUNNER_ARCH="X64" INPUT_VERSION="0.1.0" \
+            STUB_SHA_CONTENT="0000000000000000000000000000000000000000000000000000000000000000 *other.tar.xz"
+
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq postgresql-client
+          fi
+
+          work_dir="$(mktemp -d)"
+          cd "$work_dir"
+
+          psql "$AUDITSTREAM_DATABASE_URL" -v ON_ERROR_STOP=1 -c \
+            "CREATE TABLE public.invoice (id int PRIMARY KEY, status text NOT NULL, password_hash text);"
+          auditstream init --migrations sql --table public.invoice --exclude public.invoice.password_hash
+          psql "$AUDITSTREAM_DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/*_auditstream.sql
+
+          report="$(auditstream verify --format json)"
+          printf '%s\n' "$report" | jq -e '.ok == true and (.findings | length) == 0' >/dev/null
+
+          psql "$AUDITSTREAM_DATABASE_URL" -v ON_ERROR_STOP=1 -c \
+            "ALTER TABLE public.invoice DISABLE TRIGGER auditstream_update;"
+          set +e
+          drift_report="$(auditstream verify --format json)"
+          drift_rc=$?
+          set -e
+          test "$drift_rc" -eq 1
+          printf '%s\n' "$drift_report" | jq -e '.ok == false and any(.findings[]; .kind == "disabled")' >/dev/null
+
+          psql "$AUDITSTREAM_DATABASE_URL" -v ON_ERROR_STOP=1 -c \
+            "ALTER TABLE public.invoice ENABLE TRIGGER auditstream_update;"
+          auditstream verify --format json | jq -e '.ok == true and (.findings | length) == 0' >/dev/null
+      - name: Verify docker-compose.yml quickstart end to end
+        id: quickstart
+        env:
+          AUDITSTREAM_PG_PORT: "55432"
+        run: |
+          set -euo pipefail
+          out_log="$(mktemp)"
+          trap 'rm -rf "$out_log"' EXIT
+          docker compose up --abort-on-container-exit --exit-code-from quickstart --no-color | tee "$out_log"
+
+          grep -Fq "ok: no findings" "$out_log"
+          events="$(sed -n 's/^.*quickstart-1[[:space:]]*| //p' "$out_log" | grep '^{' || true)"
+          test "$(printf '%s\n' "$events" | wc -l | tr -d '[:space:]')" -eq 2
+          printf '%s\n' "$events" | jq -se '
+            length == 2
+            and any(.[]; .op == "INSERT" and .actor.type == "user" and .actor.id == "usr_42" and .actor_source == "comment")
+            and any(.[]; .op == "UPDATE" and .actor.type == "ai_agent" and .actor.id == "billing-agent" and .actor.onBehalfOf.id == "usr_42" and .actor_source == "comment")
+          ' >/dev/null
+          if printf '%s\n' "$events" | grep -Eq 'password_hash|hash_initial|hash_rotated'; then
+            echo "FAIL: excluded password_hash leaked into quickstart history output" >&2
+            exit 1
+          fi
+      - name: Tear down docker-compose.yml quickstart
+        if: always() && (steps.quickstart.outcome == 'success' || steps.quickstart.outcome == 'failure' || steps.quickstart.outcome == 'cancelled')
+        run: docker compose down -v
+
   ci-ok:
     if: always()
     needs:
@@ -287,6 +472,7 @@ jobs:
       - docs
       - msrv
       - deny
+      - setup-action
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
