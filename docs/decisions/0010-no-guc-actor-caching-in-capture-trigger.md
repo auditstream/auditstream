@@ -12,8 +12,8 @@ In Auditstream's capture architecture ([ADR-0002](0002-capture-changes-with-gene
 
 Profiling bulk `UPDATE` workloads across PostgreSQL 15.20, 17.12, and 19.0 (`public.customers`, 7 columns, 200k rows, and 100k-row `UPDATE` micro-ablations) identified four per-row CPU bottlenecks in `auditstream.capture()`:
 
-1. A cross-function `SECURITY DEFINER` call from `capture()` into `auditstream.resolve_actor()` on every updated row (`1,202.4 ms` vs `581.6 ms` pure trigger overhead over 100k rows on PG 17, **-51.6%** when inlined).
-2. `pg_catalog.ltrim(raw_b64, <64 chars>)` for base64url alphabet validation, which scans up to 64 characters per input character (`683.9 ms` on PG 17 / `755.4 ms` on PG 19 vs `39.9 ms` / `40.4 ms` with DFA-cached `pg_catalog.textregexeq(raw_b64 COLLATE pg_catalog."C", '[^A-Za-z0-9_-]')`, **17.1x–18.7x faster**).
+1. A cross-function `SECURITY DEFINER` call from `capture()` into `auditstream.resolve_actor()` on every updated row (`1,202.4 ms` vs `581.6 ms` pure trigger overhead over 100k rows on PostgreSQL 17, **-51.6%** when inlined).
+2. `pg_catalog.ltrim(raw_b64, <64 chars>)` for base64url alphabet validation, which scans up to 64 characters per input character (`683.9 ms` on PostgreSQL 17 / `755.4 ms` on PostgreSQL 19 vs `39.9 ms` / `40.4 ms` with DFA-cached `pg_catalog.textregexeq(raw_b64 COLLATE pg_catalog."C", '[^A-Za-z0-9_-]')`, **17.1x–18.7x faster**).
 3. Unconditional `rtrim(...)` and `reverse(...)` scans over the trailing 4,096-character query tail even when the query ends with `'/'` or contains a single `'/'`.
 4. A separate SPI execution (`v_changed := ARRAY(SELECT ...)`) before `INSERT INTO auditstream.changes` on every updated row.
 
@@ -37,7 +37,7 @@ We need a durable decision on which optimizations belong in `auditstream.capture
 
 Chosen option: **Option 1 (Inline stateless fast-path in `capture()` + `COLLATE "C"` `textregexeq` + single-SPI `INSERT`)**.
 
-Across PostgreSQL 15.20, 17.12, and 19.0, Option 1 cuts 100k bulk `UPDATE` time by **15.2%–19.6%** (`4,296` / `4,111` / `4,307 ms` down to `3,642` / `3,339` / `3,464 ms` when triggers pass plain single-column / PostgreSQL `text[]` `TG_ARGV` arguments; **6.7%–11.1%+** with the unchanged `v0.1.x` JSON-array `'["id"]'` trigger arguments emitted by default, with additional savings from preserving the existing zero-SPI 1-element JSON-array fast path), cuts actor-less 100k bulk `UPDATE` time by **7.6%–12.6%** (`2,587` / `2,553` / `2,573 ms` down to `2,390` / `2,314` / `2,248 ms`), and lifts 16-client `pgbench` throughput (`synchronous_commit = off`, PG 19, 3x8s median) from `53,750.5 TPS` to **`54,911.0 TPS` (+2.2%)** — with zero schema changes, zero breaking changes, and zero `SHARE ROW EXCLUSIVE` locks on audited tables during `v0.1.x` function upgrades (`CREATE OR REPLACE FUNCTION` only).
+Across PostgreSQL 15.20, 17.12, and 19.0, Option 1 cuts 100k bulk `UPDATE` time by **15.2%–19.6%** (`4,296` / `4,111` / `4,307 ms` down to `3,642` / `3,339` / `3,464 ms` when triggers pass plain single-column / PostgreSQL `text[]` `TG_ARGV` arguments; **6.7%–11.1%+** with the unchanged `v0.1.x` JSON-array `'["id"]'` trigger arguments emitted by default, with additional savings from preserving the existing zero-SPI 1-element JSON-array fast path), cuts actor-less 100k bulk `UPDATE` time by **7.6%–12.6%** (`2,587` / `2,553` / `2,573 ms` down to `2,390` / `2,314` / `2,248 ms`), and lifts 16-client `pgbench` throughput (`synchronous_commit = off`, PostgreSQL 19, 3x8s median) from `53,750.5 TPS` to **`54,911.0 TPS` (+2.2%)** — with zero schema changes, zero breaking changes, and zero `SHARE ROW EXCLUSIVE` locks on audited tables during `v0.1.x` function upgrades (`CREATE OR REPLACE FUNCTION` only).
 
 ### Why GUC actor caching (`auditstream._ca_*`) is rejected
 

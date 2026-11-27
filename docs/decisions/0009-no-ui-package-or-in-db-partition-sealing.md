@@ -68,7 +68,7 @@ Chosen options: **Option A1 (no official `@auditstream/react` package)** and **O
 
 Measured on live PostgreSQL 17.12 and 19.0 (`fsync=on`, native built-in `pg_catalog.sha256`, lock-serialized `chain_head FOR UPDATE`):
 
-| Workload (`fsync=on`) | Unchained Auditstream (PG 17.12 / PG 19.0) | In-Trigger Row Hash Chain (PG 17.12 / PG 19.0) | Observed impact |
+| Workload (`fsync=on`) | Unchained Auditstream (PostgreSQL 17.12 / PostgreSQL 19.0) | In-Trigger Row Hash Chain (PostgreSQL 17.12 / PostgreSQL 19.0) | Observed impact |
 | --- | --- | --- | --- |
 | Single-row `UPDATE`, `c=128` | `24,576` / `25,060 TPS` (`p99 17.2` / `15.7 ms`) | `405` / `353 TPS` (`p99 1,615` / `1,715 ms`) | **`61×–71×` TPS collapse**, `94×–109×` worse `p99` (`98%–99%` `Lock:tuple` + `Lock:transactionid`) |
 | Lock-ordered 2-row tx (`lo <= hi`), `c=64` | `8,483` / `8,280 TPS` (`0` failures) | `55.9` / `56.1 TPS` (`456` / `555` failed txns at `c=64`) | **`148×–152×` TPS collapse** + **`575`–`668` failed txns** across `c=16` & `c=64` runs (`456`/`555` at `c=64`) from `40P01` lock-order deadlocks on deadlock-free SQL |
