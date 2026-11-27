@@ -84,7 +84,7 @@ fn print_usage() {
     println!("  ci [gate]  Run all local quality gates or one gate:");
     println!("             fmt, clippy, test, doctest, docs, msrv, deny");
     println!("  codegen    Regenerate schemas and artifacts");
-    println!("  bench      Run pgbench capture benchmarks");
+    println!("  bench      Run capture, export, and history benchmarks");
 }
 
 fn run_ci(args: &[String]) -> ExitCode {
