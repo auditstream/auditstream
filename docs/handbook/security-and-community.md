@@ -7,7 +7,7 @@ Each repository ships its own security, ownership, and community files so contri
 | `LICENSE` | MIT, per repository; GitHub cannot inherit it | Done |
 | `SECURITY.md` | Repo-specific supported versions, GitHub Private Vulnerability Reporting + `security@auditstream.dev`, 3 business day acknowledgment target, and verified reproducer rule for AI-found reports | Done |
 | `CODE_OF_CONDUCT.md` | Contributor Covenant 3.0, with Gabriel and Cleisson as enforcement contacts at `conduct@auditstream.dev` | Done |
-| `SUPPORT.md` | Questions go to GitHub Discussions, bugs to Issues, security reports to Private Vulnerability Reporting | Done |
+| `SUPPORT.md` | Questions go to GitHub Discussions, community chat to Discord (`auditstream.dev/discord`), bugs to Issues, security reports to Private Vulnerability Reporting | Done |
 | `.github/CODEOWNERS` | Per repository (GitHub cannot inherit `CODEOWNERS`); `* @auditstream/maintainers` (organization team with Gabriel and Cleisson) | Done |
 | `.github/VULNERABILITY_REPORT.yml` | Custom GitHub Private Vulnerability Reporting form tailored to engine/SQL/CLI reports | Done |
 

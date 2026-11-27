@@ -10,6 +10,10 @@ Start a thread in **[GitHub Discussions](https://github.com/auditstream/auditstr
 - Prisma, Drizzle, Next.js, Hono, Express, or plain SQL integration questions
 - Ideas, RFC feedback, and roadmap discussions
 
+## Community chat
+
+Join the **[Auditstream Discord](https://auditstream.dev/discord)** for quick questions and conversation with users and maintainers. Ask setup questions in the `#help` forum and follow releases in `#announcements`. Answers worth keeping move to GitHub Discussions, which stays the searchable record. Never post credentials, real database rows, or vulnerability details in Discord.
+
 ## Bugs and feature requests
 
 Open an issue using the structured templates on **[GitHub Issues](https://github.com/auditstream/auditstream/issues/new/choose)**:
