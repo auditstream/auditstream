@@ -21,6 +21,7 @@ Task-oriented recipes for integrating and operating Auditstream.
 - [Set the actor without an adapter](how-to/set-actor-without-adapter.md)
 - [Export incrementally to JSON Lines or CSV](how-to/export-incrementally.md)
 - [Isolate tenants with Row-Level Security (RLS)](how-to/multi-tenant-rls.md)
+- [Minimize PII and enforce retention under LGPD and GDPR](how-to/lgpd-and-gdpr-compliance.md)
 - [Run on Neon or Supabase](how-to/run-on-neon-and-supabase.md)
 - [Check triggers in CI with `verify`](how-to/verify-in-ci.md)
 
