@@ -6,6 +6,7 @@ on:
       - "crates/auditstream-pg/src/**"
       - "xtask/**"
       - "bench/capture/**"
+      - "bench/baselines/**"
       - ".github/workflows/nightly.yml"
   schedule:
     - cron: "37 3 * * *"
@@ -20,7 +21,7 @@ concurrency:
 jobs:
   bench:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     permissions:
       contents: read
     services:
@@ -55,7 +56,7 @@ jobs:
           sudo apt-get install -y -qq postgresql-client
           psql --version
           pgbench --version
-      - name: Run capture benchmark smoke check
+      - name: Run benchmark smoke check
         if: github.event_name == 'pull_request'
         run: |
           cargo xtask bench \
@@ -63,13 +64,23 @@ jobs:
             --clients 2 \
             --jobs 1 \
             --bulk-runs 1 \
+            --samples 1 \
+            --warmup-secs 0 \
+            --export-rows 1000 \
+            --history-runs 10 \
             --markdown-out bench-report.md \
             --json-out bench-report.json
           cat bench-report.md >> "$GITHUB_STEP_SUMMARY"
-      - name: Run capture benchmark suite
+      - name: Run full benchmark suite
         if: github.event_name != 'pull_request'
         run: |
           cargo xtask bench \
+            --duration 20 \
+            --samples 3 \
+            --warmup-secs 2 \
+            --bulk-runs 5 \
+            --export-rows 25000 \
+            --history-runs 50 \
             --markdown-out bench-report.md \
             --json-out bench-report.json
           cat bench-report.md >> "$GITHUB_STEP_SUMMARY"
