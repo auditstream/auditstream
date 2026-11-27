@@ -758,12 +758,16 @@ impl Config {
             .or(file.database_url.filter(|val| !val.is_empty()))
             .map(RedactedUrl::new);
 
-        let schema = cli
+        let cli_schema = cli
             .schema
             .clone()
-            .filter(|val| !val.is_empty())
-            .or(file.schema.filter(|val| !val.is_empty()))
+            .filter(|val| !(cli.schema_from_env && val.is_empty()));
+        let schema = cli_schema
+            .or(file.schema)
             .unwrap_or_else(|| DEFAULT_SCHEMA.to_owned());
+        auditstream_pg::ddl::validate_schema_name(&schema)
+            .map_err(|err| anyhow!(err))
+            .exit_code(Exit::Usage)?;
 
         let mut capture = CaptureConfig {
             tables: file.capture.tables,
@@ -1511,6 +1515,42 @@ mode = "remove"
                 err.to_string().contains(expected_msg),
                 "expected {expected_msg:?} in {err}"
             );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_schema_names_from_cli_flag_and_config_file_with_usage_exit() {
+        let dir = tempdir().unwrap();
+        let overlong = "a".repeat(64);
+        let invalid_schemas = [
+            "",
+            "   ",
+            "123audit",
+            "audit$$stream",
+            "audit$fn$stream",
+            "audit\"; DROP TABLE x;--",
+            "audit\nstream",
+            "audit.stream",
+            "pg_audit",
+            "PG_audit",
+            "information_schema",
+            "INFORMATION_SCHEMA",
+            overlong.as_str(),
+        ];
+
+        for bad in invalid_schemas {
+            let cli = Cli::try_parse_from(["auditstream", "--schema", bad, "status"]).unwrap();
+            let err = Config::load_with_fallback_env(&cli, dir.path(), None).unwrap_err();
+            assert_eq!(exit_code_for(&err), Exit::Usage, "flag schema={bad:?}");
+
+            fs::write(
+                dir.path().join("auditstream.toml"),
+                format!("schema = {}\n", serde_json::to_string(bad).unwrap()),
+            )
+            .unwrap();
+            let file_cli = Cli::try_parse_from(["auditstream", "status"]).unwrap();
+            let file_err = Config::load_with_fallback_env(&file_cli, dir.path(), None).unwrap_err();
+            assert_eq!(exit_code_for(&file_err), Exit::Usage, "file schema={bad:?}");
         }
     }
 }

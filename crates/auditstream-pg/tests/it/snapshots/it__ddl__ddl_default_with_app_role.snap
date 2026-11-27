@@ -473,9 +473,18 @@ DECLARE
   v_event_id uuid;
 BEGIN
   IF action IS NULL
-     OR pg_catalog.char_length(pg_catalog.btrim(action)) < 1
+     OR pg_catalog.char_length(action) < 1
      OR pg_catalog.char_length(action) > 64
-     OR pg_catalog.upper(pg_catalog.btrim(action)) IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE') THEN
+     OR pg_catalog.regexp_like(action COLLATE pg_catalog."C", E'[\\x01-\\x1f\\x7f\\u0080-\\u009f]')
+     OR pg_catalog.btrim(
+          action,
+          E' \t\n\r\f\x0b\u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000'
+        ) COLLATE pg_catalog."C" <> action COLLATE pg_catalog."C"
+     OR pg_catalog.translate(
+          action,
+          'abcdefghijklmnopqrstuvwxyz',
+          'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        ) COLLATE pg_catalog."C" IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE') THEN
     RAISE EXCEPTION 'auditstream.log_event: invalid action %', action
       USING ERRCODE = '22023';
   END IF;

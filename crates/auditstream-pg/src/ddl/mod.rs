@@ -11,6 +11,9 @@
 /// Default audit schema name from `spec/history-table.md`.
 pub const DEFAULT_SCHEMA: &str = "auditstream";
 
+/// Maximum UTF-8 byte length of a PostgreSQL identifier (`NAMEDATALEN - 1`).
+pub const MAX_IDENTIFIER_BYTES: usize = 63;
+
 /// NOLOGIN role owning all Auditstream database objects.
 pub const OWNER_ROLE: &str = "auditstream_owner";
 
@@ -24,21 +27,83 @@ pub(crate) const TX_GUARD_SETTING: &str = "auditstream._migration_tx";
 /// Transaction-local PostgreSQL setting storing the caller's role before entering `auditstream_owner`.
 const PREV_ROLE_SETTING: &str = "auditstream._prev_role";
 
-/// Selects a dollar-quote tag for `CREATE OR REPLACE FUNCTION` bodies that does not appear inside
-/// `avoid` (such as a quoted custom schema identifier containing `$fn$`).
-pub(crate) fn dollar_tag(avoid: &str) -> &'static str {
+/// Validates an Auditstream schema name for CLI configuration and migration generation.
+///
+/// Enforces safe PostgreSQL identifier rules:
+/// - non-empty and at most [`MAX_IDENTIFIER_BYTES`] (63) bytes, avoiding silent catalog truncation
+/// - starts with an ASCII letter or underscore (`[A-Za-z_]`)
+/// - remaining characters are ASCII letters, digits, or underscores (`[A-Za-z0-9_]`),
+///   excluding `$`, quotes, whitespace, punctuation, and control characters
+/// - does not start with PostgreSQL's reserved `pg_` system schema prefix (case-insensitive)
+/// - is not PostgreSQL's built-in `information_schema` (case-insensitive)
+///
+/// # Errors
+///
+/// Returns a human-readable validation error message when `schema` violates any rule above.
+pub fn validate_schema_name(schema: &str) -> Result<(), String> {
+    if schema.is_empty() {
+        return Err("audit schema name must not be empty".to_owned());
+    }
+    if schema.len() > MAX_IDENTIFIER_BYTES {
+        return Err(format!(
+            "audit schema name length {} exceeds PostgreSQL's {MAX_IDENTIFIER_BYTES}-byte identifier limit",
+            schema.len()
+        ));
+    }
+    let bytes = schema.as_bytes();
+    if !(bytes[0].is_ascii_alphabetic() || bytes[0] == b'_') {
+        return Err(format!(
+            "invalid audit schema name {schema:?}: must start with an ASCII letter or underscore"
+        ));
+    }
+    if !bytes[1..]
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+    {
+        return Err(format!(
+            "invalid audit schema name {schema:?}: must contain only ASCII letters, digits, and underscores"
+        ));
+    }
+    if schema
+        .get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("pg_"))
+    {
+        return Err(format!(
+            "invalid audit schema name {schema:?}: prefix `pg_` is reserved by PostgreSQL"
+        ));
+    }
+    if schema.eq_ignore_ascii_case("information_schema") {
+        return Err(format!(
+            "invalid audit schema name {schema:?}: `information_schema` is reserved by PostgreSQL"
+        ));
+    }
+    Ok(())
+}
+
+/// Selects a PostgreSQL dollar-quote tag (`$tag$`) for `CREATE OR REPLACE FUNCTION` bodies
+/// that does not appear anywhere inside any string in `avoids`.
+pub(crate) fn dollar_tag_avoiding(avoids: &[&str]) -> String {
+    let collides = |tag: &str| avoids.iter().any(|text| text.contains(tag));
     for candidate in [
         "$fn$",
         "$auditfn$",
         "$auditstream_fn$",
         "$asfn$",
         "$auditstream_body$",
+        "$auditstream_fn_body$",
     ] {
-        if !avoid.contains(candidate) {
-            return candidate;
+        if !collides(candidate) {
+            return candidate.to_owned();
         }
     }
-    "$auditstream_fn_body$"
+    let mut suffix: u64 = 1;
+    loop {
+        let candidate = format!("$auditstream_fn_{suffix}$");
+        if !collides(&candidate) {
+            return candidate;
+        }
+        suffix = suffix.saturating_add(1);
+    }
 }
 
 /// Marks the enclosing transaction for standalone [`generate`] and [`crate::triggers::generate`]
@@ -261,8 +326,16 @@ pub fn quote_ident(ident: &str) -> String {
 }
 
 /// Quotes a PostgreSQL string literal with single quotes, doubling embedded `'` characters.
+///
+/// When `value` contains backslashes (`\`), emits a PostgreSQL `E'...'` escape string with
+/// doubled `\` and `'` (matching PostgreSQL's own `quote_literal()`) so the literal remains safe
+/// even if a session runs with `standard_conforming_strings = off`.
 pub fn quote_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+    if value.contains('\\') {
+        format!("E'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+    } else {
+        format!("'{}'", value.replace('\'', "''"))
+    }
 }
 
 /// Structured parts of [`generate`] so migration composers can interleave trigger statements
@@ -1003,35 +1076,46 @@ END"
 }
 
 pub(crate) fn do_block(body: &str) -> String {
-    // A quoted schema identifier can itself contain the normal dollar delimiter.
-    if body.contains("$$") {
-        format!("DO {}", quote_literal(body))
-    } else {
-        format!("DO $$\n{body}\n$$")
+    // A quoted schema identifier or role name can itself contain `$$` or any fixed tag.
+    // Pick a collision-free dollar-quote delimiter dynamically so `DO` blocks can never
+    // terminate early and stay immune to `standard_conforming_strings = off`.
+    if !body.contains("$$") {
+        return format!("DO $$\n{body}\n$$");
+    }
+    for candidate in ["$do$", "$audit_do$", "$auditstream_do$"] {
+        if !body.contains(candidate) {
+            return format!("DO {candidate}\n{body}\n{candidate}");
+        }
+    }
+    let mut suffix: u64 = 1;
+    loop {
+        let candidate = format!("$auditstream_do_{suffix}$");
+        if !body.contains(&candidate) {
+            return format!("DO {candidate}\n{body}\n{candidate}");
+        }
+        suffix = suffix.saturating_add(1);
     }
 }
 
 fn log_event_sql(schema_q: &str) -> String {
-    let tag = dollar_tag(schema_q);
-    format!(
-        "CREATE OR REPLACE FUNCTION {schema_q}.log_event(\n  \
-  action text,\n  \
-  target jsonb DEFAULT NULL,\n  \
-  data jsonb DEFAULT NULL\n\
-)\n\
-RETURNS uuid\n\
-LANGUAGE plpgsql\n\
-SECURITY DEFINER\n\
-SET search_path = pg_catalog, pg_temp\n\
-AS {tag}\n\
-DECLARE\n  \
+    let body = format!(
+        "DECLARE\n  \
   resolved record;\n  \
   v_event_id uuid;\n\
 BEGIN\n  \
   IF action IS NULL\n     \
-     OR pg_catalog.char_length(pg_catalog.btrim(action)) < 1\n     \
+     OR pg_catalog.char_length(action) < 1\n     \
      OR pg_catalog.char_length(action) > 64\n     \
-     OR pg_catalog.upper(pg_catalog.btrim(action)) IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE') THEN\n    \
+     OR pg_catalog.regexp_like(action COLLATE pg_catalog.\"C\", E'[\\\\x01-\\\\x1f\\\\x7f\\\\u0080-\\\\u009f]')\n     \
+     OR pg_catalog.btrim(\n          \
+          action,\n          \
+          E' \\t\\n\\r\\f\\x0b\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000'\n        \
+        ) COLLATE pg_catalog.\"C\" <> action COLLATE pg_catalog.\"C\"\n     \
+     OR pg_catalog.translate(\n          \
+          action,\n          \
+          'abcdefghijklmnopqrstuvwxyz',\n          \
+          'ABCDEFGHIJKLMNOPQRSTUVWXYZ'\n        \
+        ) COLLATE pg_catalog.\"C\" IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE') THEN\n    \
     RAISE EXCEPTION 'auditstream.log_event: invalid action %', action\n      \
       USING ERRCODE = '22023';\n  \
   END IF;\n\n  \
@@ -1072,7 +1156,21 @@ BEGIN\n  \
   )\n  \
   RETURNING event_id INTO v_event_id;\n\n  \
   RETURN v_event_id;\n\
-END\n\
+END"
+    );
+    let tag = dollar_tag_avoiding(&[schema_q, &body]);
+    format!(
+        "CREATE OR REPLACE FUNCTION {schema_q}.log_event(\n  \
+  action text,\n  \
+  target jsonb DEFAULT NULL,\n  \
+  data jsonb DEFAULT NULL\n\
+)\n\
+RETURNS uuid\n\
+LANGUAGE plpgsql\n\
+SECURITY DEFINER\n\
+SET search_path = pg_catalog, pg_temp\n\
+AS {tag}\n\
+{body}\n\
 {tag}"
     )
 }
@@ -1091,6 +1189,114 @@ mod tests {
         assert!(
             log_event.contains("AS $auditfn$"),
             "expected fallback tag $auditfn$, got: {log_event}"
+        );
+
+        // Exhausting every fixed fallback tag plus `_1` exercises the dynamic retry loop (`_2`).
+        let all_fixed_fn = "$fn$$auditfn$$auditstream_fn$$asfn$$auditstream_body$$auditstream_fn_body$$auditstream_fn_1$";
+        let stmts_all = generate(&DdlOptions::new(all_fixed_fn, vec![]));
+        let log_event_all = stmts_all
+            .iter()
+            .find(|s| s.starts_with("CREATE OR REPLACE FUNCTION "))
+            .expect("log_event emitted");
+        assert!(
+            log_event_all.contains("AS $auditstream_fn_2$\n")
+                && log_event_all.ends_with("\n$auditstream_fn_2$"),
+            "expected dynamic tag $auditstream_fn_2$, got: {log_event_all}"
+        );
+        assert_eq!(
+            log_event_all.matches("$auditstream_fn_2$").count(),
+            2,
+            "dollar tag must appear only as opening and closing delimiters"
+        );
+    }
+
+    #[test]
+    fn do_block_uses_collision_free_dollar_quotes_even_when_all_fixed_tags_appear() {
+        let simple = do_block("BEGIN NULL; END");
+        assert_eq!(simple, "DO $$\nBEGIN NULL; END\n$$");
+
+        let with_empty_tag = do_block("BEGIN PERFORM '$$'; END");
+        assert_eq!(with_empty_tag, "DO $do$\nBEGIN PERFORM '$$'; END\n$do$");
+
+        let all_fixed_do =
+            "BEGIN PERFORM '$$$do$$audit_do$$auditstream_do$$auditstream_do_1$'; END";
+        let wrapped = do_block(all_fixed_do);
+        assert!(
+            wrapped.starts_with("DO $auditstream_do_2$\n")
+                && wrapped.ends_with("\n$auditstream_do_2$"),
+            "expected dynamic $auditstream_do_2$ tag, got: {wrapped}"
+        );
+        assert_eq!(wrapped.matches("$auditstream_do_2$").count(), 2);
+
+        // Adversarial app_roles with `$$` and `$do$` cannot break out of harden_ddl_acls_sql.
+        let stmts = generate(&DdlOptions::new(
+            DEFAULT_SCHEMA,
+            vec!["evil$$$do$$audit_do$$auditstream_do$role".to_owned()],
+        ));
+        let acl_stmt = stmts
+            .iter()
+            .find(|s| s.contains("allowed_roles text[]"))
+            .expect("harden_ddl_acls_sql emitted");
+        assert!(
+            acl_stmt.starts_with("DO $auditstream_do_1$\n")
+                && acl_stmt.ends_with("\n$auditstream_do_1$"),
+            "expected dynamic tag on harden_ddl_acls_sql, got: {acl_stmt}"
+        );
+        assert_eq!(acl_stmt.matches("$auditstream_do_1$").count(), 2);
+    }
+
+    #[test]
+    fn validate_schema_name_accepts_safe_identifiers_and_rejects_breakouts() {
+        for valid in [
+            "a",
+            "pg",
+            "auditstream",
+            "custom_audit",
+            "_audit_2",
+            "AuditStream_V2",
+            &"a".repeat(MAX_IDENTIFIER_BYTES),
+        ] {
+            assert!(
+                validate_schema_name(valid).is_ok(),
+                "expected valid schema {valid:?}"
+            );
+        }
+
+        for invalid in [
+            "",
+            " ",
+            "123audit",
+            "audit-stream",
+            "audit.stream",
+            "audit$$stream",
+            "audit$fn$stream",
+            "audit\"stream",
+            "audit'stream",
+            "audit; DROP TABLE x;--",
+            "audit\nstream",
+            "audit\0stream",
+            "pg_audit",
+            "PG_audit",
+            "pg_catalog",
+            "information_schema",
+            "INFORMATION_SCHEMA",
+            &"a".repeat(MAX_IDENTIFIER_BYTES + 1),
+        ] {
+            assert!(
+                validate_schema_name(invalid).is_err(),
+                "expected invalid schema {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quote_literal_escapes_backslashes_with_e_string_for_standard_conforming_strings_off() {
+        assert_eq!(quote_literal("auditstream"), "'auditstream'");
+        assert_eq!(quote_literal("it's"), "'it''s'");
+        assert_eq!(quote_literal(r"a\b"), r"E'a\\b'");
+        assert_eq!(
+            quote_literal(r"t\'); DROP TABLE x;--"),
+            r"E't\\''); DROP TABLE x;--'"
         );
     }
 

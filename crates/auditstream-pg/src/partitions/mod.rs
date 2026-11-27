@@ -4,9 +4,9 @@
 //! so captured history rows never land in `{schema}.changes_default`.
 //!
 //! Partition creation runs inside a single transaction serialized by a schema-scoped
-//! transaction advisory lock (`pg_advisory_xact_lock`), uses `SET LOCAL lock_timeout`
-//! (default `'5s'`) so long transactions cannot stall application writes behind an
-//! `ACCESS EXCLUSIVE` wait queue, writes explicit UTC `+00` partition bounds immune to
+//! transaction advisory lock (`pg_advisory_xact_lock`), applies `lock_timeout` via parameterized
+//! transaction-local `pg_catalog.set_config('lock_timeout', $1, true)` (default `'5s'`) so long
+//! transactions cannot stall application writes behind an `ACCESS EXCLUSIVE` wait queue, writes explicit UTC `+00` partition bounds immune to
 //! session `TimeZone`, and sets every partition owner to `auditstream_owner`.
 
 use std::collections::HashSet;
@@ -320,11 +320,8 @@ pub async fn ensure_ahead_with_options(
         });
     }
 
-    let lock_timeout_sql = format!(
-        "SET LOCAL lock_timeout = {}",
-        quote_literal(&options.lock_timeout)
-    );
-    sqlx::query(AssertSqlSafe(lock_timeout_sql))
+    sqlx::query("SELECT pg_catalog.set_config('lock_timeout', $1, true)")
+        .bind(&options.lock_timeout)
         .execute(&mut *tx)
         .await?;
 

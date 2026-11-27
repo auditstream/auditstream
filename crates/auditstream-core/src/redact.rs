@@ -331,6 +331,14 @@ fn validate_action_target(rule_index: usize, action: &str) -> Result<RuleTarget<
             reason: "must not be empty or whitespace-only",
         });
     }
+    if action.chars().any(char::is_control) {
+        return Err(RedactError::InvalidTarget {
+            rule_index,
+            field: "action",
+            target: action.to_owned(),
+            reason: "must not contain control characters",
+        });
+    }
     if action != action.trim() {
         return Err(RedactError::InvalidTarget {
             rule_index,
@@ -340,10 +348,28 @@ fn validate_action_target(rule_index: usize, action: &str) -> Result<RuleTarget<
         });
     }
     if action == "*" {
-        Ok(RuleTarget::AppAll)
-    } else {
-        Ok(RuleTarget::AppAction(action))
+        return Ok(RuleTarget::AppAll);
     }
+    if action.chars().count() > crate::op::MAX_ACTION_CHARS {
+        return Err(RedactError::InvalidTarget {
+            rule_index,
+            field: "action",
+            target: action.to_owned(),
+            reason: "must not exceed 64 characters",
+        });
+    }
+    if matches!(
+        action.to_ascii_uppercase().as_str(),
+        "INSERT" | "UPDATE" | "DELETE" | "TRUNCATE"
+    ) {
+        return Err(RedactError::InvalidTarget {
+            rule_index,
+            field: "action",
+            target: action.to_owned(),
+            reason: "must not be a reserved SQL DML operation (use `table` for database events)",
+        });
+    }
+    Ok(RuleTarget::AppAction(action))
 }
 
 /// Ordered collection of [`RedactionRule`]s deserializable from configuration (such as

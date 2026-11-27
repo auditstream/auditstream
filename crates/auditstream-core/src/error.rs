@@ -60,10 +60,19 @@ pub enum CoreError {
     },
 
     /// Application event action collided with a reserved SQL DML operation name.
-    #[error("event action '{action}' is reserved for database capture operations")]
+    #[error("event action {action:?} is reserved for database capture operations")]
     ReservedAction {
         /// The rejected action name.
         action: String,
+    },
+
+    /// Application event action contained control characters or leading/trailing whitespace.
+    #[error("invalid event action {action:?}: {reason}")]
+    InvalidAction {
+        /// The rejected action name.
+        action: String,
+        /// Human-readable validation failure reason.
+        reason: &'static str,
     },
 
     /// Underlying JSON serialization or deserialization failed.

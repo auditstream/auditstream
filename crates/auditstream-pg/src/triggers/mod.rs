@@ -19,7 +19,7 @@
 //! keeping length bounds explicit in SQL without hitting PostgreSQL's 255 quantifier cap.
 
 use crate::ddl::{
-    DEFAULT_SCHEMA, OWNER_ROLE, do_block, dollar_tag, enter_owner_role_sql, quote_ident,
+    DEFAULT_SCHEMA, OWNER_ROLE, do_block, dollar_tag_avoiding, enter_owner_role_sql, quote_ident,
     quote_literal, restore_prev_role_sql, role_grant_cleanup_sql, role_grant_setup_sql,
     tx_begin_guard_sql,
 };
@@ -449,19 +449,7 @@ END"
 
 #[allow(clippy::too_many_lines)]
 fn resolve_actor_sql(schema_q: &str) -> String {
-    let tag = dollar_tag(schema_q);
-    format!(
-        r"CREATE OR REPLACE FUNCTION {schema_q}.resolve_actor(
-  OUT actor jsonb,
-  OUT context jsonb,
-  OUT actor_source text
-)
-LANGUAGE plpgsql
-STABLE
-SECURITY DEFINER
-SET search_path = pg_catalog, pg_temp
-AS {tag}
-DECLARE
+    const BODY: &str = r"DECLARE
   raw_setting text;
   q_tail text;
   q_len integer;
@@ -730,7 +718,8 @@ BEGIN
     IF pg_catalog.jsonb_exists(claims, 'sub')
        AND pg_catalog.jsonb_typeof(claims->'sub') IS DISTINCT FROM 'null' THEN
       IF pg_catalog.jsonb_typeof(claims->'sub') IS DISTINCT FROM 'string'
-         OR pg_catalog.length(claims->>'sub') = 0 THEN
+         OR pg_catalog.length(claims->>'sub') = 0
+         OR 21 + pg_catalog.octet_length((claims->'sub')::text) > 512 THEN
         actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;
       END IF;
       actor := pg_catalog.jsonb_build_object('type', 'user', 'id', claims->>'sub');
@@ -743,22 +732,28 @@ BEGIN
   actor := NULL;
   context := NULL;
   actor_source := NULL;
-END
+END";
+    let tag = dollar_tag_avoiding(&[schema_q, BODY]);
+    format!(
+        "CREATE OR REPLACE FUNCTION {schema_q}.resolve_actor(\n  \
+  OUT actor jsonb,\n  \
+  OUT context jsonb,\n  \
+  OUT actor_source text\n\
+)\n\
+LANGUAGE plpgsql\n\
+STABLE\n\
+SECURITY DEFINER\n\
+SET search_path = pg_catalog, pg_temp\n\
+AS {tag}\n\
+{BODY}\n\
 {tag}"
     )
 }
 
 #[allow(clippy::too_many_lines)]
 fn capture_function_sql(schema_q: &str) -> String {
-    let tag = dollar_tag(schema_q);
-    format!(
-        "CREATE OR REPLACE FUNCTION {schema_q}.capture()\n\
-RETURNS trigger\n\
-LANGUAGE plpgsql\n\
-SECURITY DEFINER\n\
-SET search_path = pg_catalog, pg_temp\n\
-AS {tag}\n\
-DECLARE\n  \
+    let body = format!(
+        "DECLARE\n  \
   resolved record;\n  \
   pk_json jsonb;\n  \
   pk_len integer;\n  \
@@ -1009,7 +1004,17 @@ BEGIN\n  \
     RETURN NULL;\n  \
   END IF;\n\n  \
   RETURN NULL;\n\
-END\n\
+END"
+    );
+    let tag = dollar_tag_avoiding(&[schema_q, &body]);
+    format!(
+        "CREATE OR REPLACE FUNCTION {schema_q}.capture()\n\
+RETURNS trigger\n\
+LANGUAGE plpgsql\n\
+SECURITY DEFINER\n\
+SET search_path = pg_catalog, pg_temp\n\
+AS {tag}\n\
+{body}\n\
 {tag}"
     )
 }

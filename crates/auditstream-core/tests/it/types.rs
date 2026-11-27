@@ -339,6 +339,138 @@ fn op_maps_dml_variants_and_app_actions_in_both_directions() {
         Op::app("invoice.exported").expect("valid app action"),
         Op::App("invoice.exported".to_owned())
     );
+    assert_eq!(
+        Op::app("invoice exported").expect("internal space allowed"),
+        Op::App("invoice exported".to_owned())
+    );
+}
+
+#[test]
+fn op_rejects_control_characters_whitespace_only_padded_dml_and_edge_whitespace() {
+    assert!(matches!(Op::app("\n\t\r"), Err(CoreError::EmptyAction)));
+    assert!(matches!(
+        Op::app("\u{00A0}\u{3000}"),
+        Err(CoreError::EmptyAction)
+    ));
+    assert!(matches!(
+        Op::app("\tINSERT"),
+        Err(CoreError::ReservedAction { .. })
+    ));
+    assert!(matches!(
+        Op::app("\u{00A0}delete\n"),
+        Err(CoreError::ReservedAction { .. })
+    ));
+    for control_action in [
+        "invoice\nexported",
+        "invoice\rexported",
+        "invoice\texported",
+        "invoice\x0bexported",
+        "invoice\x0cexported",
+        "invoice\x01exported",
+        "invoice\x1fexported",
+        "invoice\x7fexported",
+        "invoice\u{0085}exported",
+        "invoice\u{009B}exported",
+    ] {
+        assert!(
+            matches!(
+                Op::app(control_action),
+                Err(CoreError::InvalidAction {
+                    reason: "must not contain control characters",
+                    ..
+                })
+            ),
+            "expected control-char InvalidAction for {control_action:?}"
+        );
+        assert!(
+            Op::from_str(control_action).is_err(),
+            "Op::from_str must reject {control_action:?}"
+        );
+    }
+    for padded_action in [
+        " invoice.exported",
+        "invoice.exported ",
+        " invoice.exported ",
+        "\u{00A0}invoice.exported",
+        "invoice.exported\u{2003}",
+        "invoice.exported\u{3000}",
+        "\u{2028}invoice.exported",
+        "invoice.exported\u{2029}",
+    ] {
+        assert!(
+            matches!(
+                Op::app(padded_action),
+                Err(CoreError::InvalidAction {
+                    reason: "must not have leading or trailing whitespace",
+                    ..
+                })
+            ),
+            "expected whitespace InvalidAction for {padded_action:?}"
+        );
+        assert!(
+            Op::from_str(padded_action).is_err(),
+            "Op::from_str must reject {padded_action:?}"
+        );
+    }
+}
+
+#[test]
+fn op_control_and_whitespace_sets_match_postgres_log_event_and_event_schema_across_all_unicode() {
+    // Exact character sets used by `auditstream.log_event()` in PostgreSQL and `event.schema.json`.
+    const PG_TRIM_WHITESPACE: &[char] = &[
+        ' ', '\t', '\n', '\r', '\x0c', '\x0b', '\u{0085}', '\u{00A0}', '\u{1680}', '\u{2000}',
+        '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}', '\u{2006}', '\u{2007}',
+        '\u{2008}', '\u{2009}', '\u{200A}', '\u{2028}', '\u{2029}', '\u{202F}', '\u{205F}',
+        '\u{3000}',
+    ];
+
+    for ch in '\u{0000}'..=char::MAX {
+        let pg_is_control = matches!(ch, '\u{0000}'..='\u{001F}' | '\u{007F}'..='\u{009F}');
+        assert_eq!(
+            ch.is_control(),
+            pg_is_control,
+            "control parity mismatch for U+{:04X}",
+            u32::from(ch)
+        );
+        let pg_is_whitespace = PG_TRIM_WHITESPACE.contains(&ch);
+        assert_eq!(
+            ch.is_whitespace(),
+            pg_is_whitespace,
+            "whitespace parity mismatch for U+{:04X}",
+            u32::from(ch)
+        );
+    }
+
+    let validator = load_schema("schemas/event.schema.json");
+    let base_raw =
+        fs::read_to_string(spec_dir().join("schemas/examples/event/valid/app-event.json"))
+            .expect("read app-event.json");
+    let base: Value = serde_json::from_str(&base_raw).expect("parse app-event.json");
+    for bad_op in [
+        " ",
+        "\n",
+        "\t",
+        "\u{00A0}",
+        " invoice.exported",
+        "invoice.exported ",
+        "\u{00A0}invoice.exported",
+        "invoice.exported\u{3000}",
+        "invoice\nexported",
+        "invoice\texported",
+        "invoice\x7fexported",
+        "invoice\u{0085}exported",
+        "invoice\u{009B}exported",
+    ] {
+        let mut invalid = base.clone();
+        invalid["op"] = serde_json::json!(bad_op);
+        assert!(
+            !validator.is_valid(&invalid),
+            "event.schema.json must reject op={bad_op:?}"
+        );
+    }
+    let mut valid_space = base;
+    valid_space["op"] = serde_json::json!("invoice exported");
+    assert!(validator.is_valid(&valid_space));
 }
 
 #[test]

@@ -64,7 +64,7 @@ SELECT auditstream.log_event(
 ) RETURNS uuid;
 ```
 
-- `action` must be non-NULL, 1 to 64 characters long, and not `INSERT`, `UPDATE`, `DELETE`, or `TRUNCATE`.
+- `action` must be non-NULL, 1 to 64 characters long, contain no control characters (`Cc`), have no leading or trailing ASCII or Unicode whitespace (`White_Space`), and not match `INSERT`, `UPDATE`, `DELETE`, or `TRUNCATE` (ASCII case-insensitively).
 - Invalid actions raise PostgreSQL error `22023` (`invalid_parameter_value`).
 - Rows written by `log_event` set `source = 'app'`, `op = action`, `record_id = target`, and `after = data`.
 - `log_event` resolves `actor`, `context`, and `actor_source` using `auditstream.resolve_actor()`, and returns the generated `event_id`.

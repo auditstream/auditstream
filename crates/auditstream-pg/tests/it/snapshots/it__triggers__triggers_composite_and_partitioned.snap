@@ -427,7 +427,8 @@ BEGIN
     IF pg_catalog.jsonb_exists(claims, 'sub')
        AND pg_catalog.jsonb_typeof(claims->'sub') IS DISTINCT FROM 'null' THEN
       IF pg_catalog.jsonb_typeof(claims->'sub') IS DISTINCT FROM 'string'
-         OR pg_catalog.length(claims->>'sub') = 0 THEN
+         OR pg_catalog.length(claims->>'sub') = 0
+         OR 21 + pg_catalog.octet_length((claims->'sub')::text) > 512 THEN
         actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;
       END IF;
       actor := pg_catalog.jsonb_build_object('type', 'user', 'id', claims->>'sub');

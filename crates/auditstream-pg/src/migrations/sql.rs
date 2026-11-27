@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use super::{
     Manifest, MigrationError, MigrationOptions, PlannedMigration, PreviewOutcome, WriteOutcome,
     header_comment, next_unique_timestamp, parse_manifest_from_file, plan_migration, preview_with,
+    reject_symlink, write_new_file,
 };
 
 pub(crate) fn preview(options: &MigrationOptions) -> Result<PreviewOutcome, MigrationError> {
@@ -32,10 +33,11 @@ pub(crate) fn write(options: &MigrationOptions) -> Result<WriteOutcome, Migratio
         options
             .out_dir
             .join(format!("{ts}_auditstream.sql"))
-            .exists()
+            .symlink_metadata()
+            .is_ok()
     });
     let file_path = options.out_dir.join(format!("{ts}_auditstream.sql"));
-    fs::write(&file_path, rendered)?;
+    write_new_file(&file_path, &rendered)?;
 
     Ok(WriteOutcome::Written {
         files: vec![file_path],
@@ -75,18 +77,22 @@ fn find_newest_sql_migration(
     for entry in fs::read_dir(out_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_file() {
+        if !path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("sql"))
+        {
+            continue;
+        }
+        let Some(meta) = reject_symlink(&path)? else {
+            continue;
+        };
+        if !meta.is_file() {
             continue;
         }
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("sql"))
-        {
-            files.push((name, path));
-        }
+        files.push((name, path));
     }
 
     files.sort_by(|a, b| a.0.cmp(&b.0));

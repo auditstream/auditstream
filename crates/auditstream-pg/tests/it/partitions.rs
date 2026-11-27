@@ -276,6 +276,86 @@ async fn lock_timeout_returns_retryable_error_and_leaves_no_partial_partition() 
 }
 
 #[tokio::test]
+async fn malicious_lock_timeout_is_rejected_by_parameterized_set_config_without_sql_execution() {
+    let db = TestDb::new().await.expect("create TestDb");
+    install_ddl(&db).await;
+
+    // Use `standard_conforming_strings = off` (on PG <= 18; PG 19 removed non-standard string
+    // literals) with a `\'` breakout payload so any unparameterized `'...'` interpolation of
+    // `SET LOCAL lock_timeout = ...` would break out of the string literal.
+    let scs_off = {
+        let mut probe = db.pool().acquire().await.expect("acquire probe conn");
+        crate::supports_non_standard_strings(&mut probe).await
+    };
+    let mut pool_opts = PgPoolOptions::new().max_connections(2);
+    if scs_off {
+        pool_opts = pool_opts.after_connect(|conn, _meta| {
+            Box::pin(async move {
+                conn.execute("SET standard_conforming_strings = off")
+                    .await?;
+                Ok(())
+            })
+        });
+    }
+    let pool = pool_opts
+        .connect(db.url())
+        .await
+        .expect("connect test pool");
+
+    let opts = EnsureOptions::new(DEFAULT_SCHEMA, 5)
+        .with_lock_timeout(r"100ms\'; CREATE TABLE public.lock_timeout_pwned (id int); --");
+    let err = partitions::ensure_ahead_with_options(&pool, &opts)
+        .await
+        .expect_err("malicious lock_timeout must be rejected by PostgreSQL");
+    let PartitionError::Database(db_err) = err else {
+        panic!("expected PartitionError::Database, got: {err:?}");
+    };
+    assert_eq!(
+        db_err
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("22023"),
+        "expected SQLSTATE 22023 (invalid_parameter_value), got: {db_err}"
+    );
+
+    let pwned_exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.lock_timeout_pwned') IS NOT NULL")
+            .fetch_one(db.pool())
+            .await
+            .expect("check injected table absent");
+    assert!(!pwned_exists, "injected SQL must never execute");
+    pool.close().await;
+
+    // Prove `ensure_ahead_with_options` genuinely binds `lock_timeout` via parameterized
+    // `pg_catalog.set_config('lock_timeout', $1, true)` (prepared on the session), rather than
+    // interpolating `SET LOCAL lock_timeout = ...`.
+    let single_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(db.url())
+        .await
+        .expect("connect single-connection pool");
+    let ok_opts = EnsureOptions::new(DEFAULT_SCHEMA, 5).with_lock_timeout("5s");
+    partitions::ensure_ahead_with_options(&single_pool, &ok_opts)
+        .await
+        .expect("ensure_ahead with valid lock_timeout succeeds");
+    let prepared: Vec<String> = sqlx::query_scalar(
+        "SELECT statement FROM pg_catalog.pg_prepared_statements \
+         WHERE statement LIKE '%set_config(%lock_timeout%'",
+    )
+    .fetch_all(&single_pool)
+    .await
+    .expect("inspect prepared statements");
+    assert!(
+        prepared
+            .iter()
+            .any(|s| s.contains("pg_catalog.set_config('lock_timeout', $1, true)")),
+        "expected parameterized set_config('lock_timeout', $1, true) in pg_prepared_statements, got: {prepared:?}"
+    );
+    single_pool.close().await;
+}
+
+#[tokio::test]
 async fn history_stats_reports_missing_clean_contiguous_gap_and_default_rows() {
     let db = TestDb::new().await.expect("create TestDb");
 

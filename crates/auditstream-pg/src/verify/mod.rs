@@ -2981,6 +2981,7 @@ mod tests {
 
     #[test]
     fn expected_function_bodies_extract_cleanly_from_generator() {
+        let all_fixed_plus_one = "$fn$$auditfn$$auditstream_fn$$asfn$$auditstream_body$$auditstream_fn_body$$auditstream_fn_1$";
         for schema in [
             DEFAULT_SCHEMA,
             "x.capture(",
@@ -2988,6 +2989,7 @@ mod tests {
             "x.log_event(",
             "audit\nstream",
             "x\nAS $fn$",
+            all_fixed_plus_one,
         ] {
             let bodies = ExpectedFunctionBodies::from_generator(schema);
             assert!(
@@ -2999,6 +3001,25 @@ mod tests {
                 "schema {schema:?}"
             );
             assert!(bodies.log_event.contains("v_event_id"), "schema {schema:?}");
+        }
+
+        // Verify triggers::generate picks dynamic `$auditstream_fn_2$` without premature collision.
+        let trig_stmts = triggers::generate(&TriggerOptions::new(all_fixed_plus_one, Vec::new()));
+        for fn_name in ["resolve_actor(", "capture("] {
+            let stmt = trig_stmts
+                .iter()
+                .find(|s| s.starts_with("CREATE OR REPLACE FUNCTION ") && s.contains(fn_name))
+                .unwrap_or_else(|| panic!("missing {fn_name}"));
+            assert!(
+                stmt.contains("\nAS $auditstream_fn_2$\n")
+                    && stmt.ends_with("\n$auditstream_fn_2$"),
+                "{fn_name} must use dynamic $auditstream_fn_2$ tag, got: {stmt}"
+            );
+            assert_eq!(
+                stmt.matches("$auditstream_fn_2$").count(),
+                2,
+                "{fn_name} enclosing dollar tag must appear only at open and close"
+            );
         }
     }
 

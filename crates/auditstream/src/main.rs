@@ -14,7 +14,6 @@ use std::process::ExitCode;
 use auditstream_core as _;
 use auditstream_export as _;
 use auditstream_pg as _;
-use clap::Parser;
 use tokio as _;
 
 use crate::cli::{Cli, LogFormat};
@@ -70,7 +69,7 @@ fn emit_fatal_error(log_format: LogFormat, err: &anyhow::Error, code: Exit) {
 }
 
 fn main() -> ExitCode {
-    let cli = match Cli::try_parse() {
+    let cli = match Cli::try_parse_with_sources() {
         Ok(cli) => cli,
         Err(err) => {
             let raw_args: Vec<OsString> = env::args_os().collect();
