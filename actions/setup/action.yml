@@ -1,0 +1,41 @@
+name: Setup Auditstream CLI
+description: >-
+  Install a pinned Auditstream CLI release binary with SHA-256 checksum
+  verification and add it to PATH.
+author: Auditstream
+
+inputs:
+  version:
+    description: >-
+      Pinned Auditstream CLI release version to install (for example `0.1.0`
+      or `auditstream-v0.1.0`). Unpinned `latest` is rejected.
+    required: true
+  sha256:
+    description: >-
+      Optional expected 64-character hex SHA-256 checksum for the platform
+      archive (Linux runners download `auditstream-<arch>-unknown-linux-musl.tar.xz`).
+      When omitted, verified against the release `.sha256` file.
+    required: false
+    default: ""
+
+outputs:
+  version:
+    description: Normalized Auditstream CLI version installed (for example `0.1.0`).
+    value: ${{ steps.install.outputs.version }}
+  binary-path:
+    description: Absolute path to the installed `auditstream` binary.
+    value: ${{ steps.install.outputs.binary-path }}
+  sha256:
+    description: Verified SHA-256 hex digest of the downloaded release archive.
+    value: ${{ steps.install.outputs.sha256 }}
+
+runs:
+  using: composite
+  steps:
+    - name: Download, verify, and install auditstream
+      id: install
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_SHA256: ${{ inputs.sha256 }}
+      run: bash "${GITHUB_ACTION_PATH}/install.sh"

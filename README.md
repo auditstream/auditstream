@@ -52,7 +52,20 @@ docker run --rm ghcr.io/auditstream/auditstream:0.1.0 --help
 
 ## Quick start
 
-Run these six commands from an empty directory with Docker, `psql`, and `auditstream` installed:
+### Single-command Docker Compose starter
+
+With only Docker installed, clone this repository and run one command to boot PostgreSQL, create a sample `public.invoice` table, run `auditstream init` and `auditstream verify`, write sample human and delegated AI agent changes (skipping excluded `password_hash`), and inspect the captured history:
+
+```sh
+docker compose up --abort-on-container-exit --exit-code-from quickstart
+docker compose down -v
+```
+
+If port `5432` is already in use locally, prefix with `AUDITSTREAM_PG_PORT=55432`.
+
+### Manual 6-command walkthrough
+
+Or run these six commands from an empty directory with Docker, `psql`, and `auditstream` installed:
 
 ```sh
 docker run -d --rm --name as-readme -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:18

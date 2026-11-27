@@ -79,12 +79,14 @@ See [Exit codes](../exit-codes.md) for the full table.
 
 ## GitHub Actions example
 
-Gate deployments or run a nightly drift and partition check (configure `sslmode=verify-full` in `AUDITSTREAM_DATABASE_URL` for non-loopback hosts):
+Install a pinned CLI binary with SHA-256 verification using the reusable subpath action, then run `verify` with a least-privilege `SELECT`-only role (`v0.1.1+`) and `sslmode=verify-full` (see [Check triggers in CI with `verify`](../../how-to/verify-in-ci.md)):
 
 ```yaml
+- uses: auditstream/auditstream/actions/setup@auditstream-v0.1.1 # pin to a release tag (>= auditstream-v0.1.1) or full commit SHA
+  with:
+    version: "0.1.1"
 - name: Verify Auditstream triggers and partitions
   env:
-    AUDITSTREAM_DATABASE_URL: ${{ secrets.AUDITSTREAM_DATABASE_URL }}
-  run: |
-    auditstream verify --fix --format text
+    AUDITSTREAM_DATABASE_URL: ${{ secrets.AUDITSTREAM_VERIFY_URL }}
+  run: auditstream verify --format json
 ```
