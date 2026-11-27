@@ -62,6 +62,10 @@ pub(crate) struct Args {
     /// Minimum finding severity that causes verification to fail (`error` or `warning`).
     #[arg(long, value_enum, default_value_t = FailOn::Error)]
     pub(crate) fail_on: FailOn,
+
+    /// Application PostgreSQL role checked for RLS bypasses when RLS is enabled on `changes` (repeatable).
+    #[arg(long, value_name = "ROLE")]
+    pub(crate) app_role: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -211,10 +215,13 @@ async fn run_async(args: &Args, config: &Config) -> anyhow::Result<()> {
     };
 
     let unmatched_excludes = unmatched_configured_excludes(&excludes_by_table, &specs);
-    let d7_report = verify::check_with_options(&pool, &VerifyOptions::new(&config.schema, specs))
-        .await
-        .map_err(|err| anyhow!("failed to run auditstream verification: {err}"))
-        .exit_code(Exit::Database)?;
+    let d7_report = verify::check_with_options(
+        &pool,
+        &VerifyOptions::new(&config.schema, specs).with_app_roles(config.capture.app_roles.clone()),
+    )
+    .await
+    .map_err(|err| anyhow!("failed to run auditstream verification: {err}"))
+    .exit_code(Exit::Database)?;
 
     let history_stats = partitions::history_stats(&pool, &config.schema)
         .await
@@ -332,8 +339,12 @@ fn kind_rank(kind: &str) -> u8 {
         "unsafe_privileges" => 6,
         "invalid_ownership" => 7,
         "tampered_history" => 8,
-        "insufficient_partitions" => 9,
-        _ => 10,
+        "forced_rls" => 9,
+        "rls_without_select_policy" => 10,
+        "rls_hides_default_partition" => 11,
+        "rls_bypassed_by_app_role" => 12,
+        "insufficient_partitions" => 13,
+        _ => 14,
     }
 }
 
@@ -396,9 +407,31 @@ fn convert_finding(finding: &Finding) -> VerifyFinding {
                 "Inspect and drop unexpected helper function overloads from the audit schema."
                     .to_owned()
             } else {
-                "Inspect and remove unexpected triggers, rewrite rules, or Row-Level Security from the history table and its partitions."
+                "Inspect and remove unexpected triggers, rewrite rules, or child-partition Row-Level Security policies from the history table and its partitions."
                     .to_owned()
             },
+        ),
+        FindingKind::ForcedRls => (
+            "forced_rls",
+            format!(
+                "Run `ALTER TABLE {} NO FORCE ROW LEVEL SECURITY` so `auditstream_owner` trigger writes and partition maintenance are not blocked.",
+                finding.object
+            ),
+        ),
+        FindingKind::RlsWithoutSelectPolicy => (
+            "rls_without_select_policy",
+            "Create at least one PERMISSIVE SELECT policy on the history table (for example a tenant-scoped policy for app roles and a PERMISSIVE USING (true) policy for `auditstream_exporter`), or disable RLS if unintended."
+                .to_owned(),
+        ),
+        FindingKind::RlsHidesDefaultPartition => (
+            "rls_hides_default_partition",
+            "Run `auditstream verify` as a role with an exclusively unobstructed PERMISSIVE USING (true) SELECT policy on the history table (such as `auditstream_exporter` or `auditstream_verify`), and scope tenant PERMISSIVE policies to specific application roles rather than `PUBLIC`, so `changes_default` can be inspected reliably."
+                .to_owned(),
+        ),
+        FindingKind::RlsBypassedByAppRole => (
+            "rls_bypassed_by_app_role",
+            "Use a dedicated NOSUPERUSER NOBYPASSRLS application role that is not a member of `auditstream_owner` so Row-Level Security policies are enforced on application sessions."
+                .to_owned(),
         ),
         _ => (
             "unknown",
@@ -554,6 +587,71 @@ mod tests {
         });
         assert_eq!(invalid_ex.kind, "invalid_exclusion");
         assert!(invalid_ex.hint.contains("non-existent"));
+
+        for (kind, severity, expected_severity, expected_kind, hint_needle) in [
+            (
+                FindingKind::ForcedRls,
+                Severity::Error,
+                "error",
+                "forced_rls",
+                "NO FORCE ROW LEVEL SECURITY",
+            ),
+            (
+                FindingKind::RlsWithoutSelectPolicy,
+                Severity::Error,
+                "error",
+                "rls_without_select_policy",
+                "PERMISSIVE SELECT",
+            ),
+            (
+                FindingKind::RlsHidesDefaultPartition,
+                Severity::Warning,
+                "warning",
+                "rls_hides_default_partition",
+                "PERMISSIVE USING (true)",
+            ),
+            (
+                FindingKind::RlsBypassedByAppRole,
+                Severity::Warning,
+                "warning",
+                "rls_bypassed_by_app_role",
+                "NOSUPERUSER NOBYPASSRLS",
+            ),
+        ] {
+            let mapped = convert_finding(&Finding {
+                kind,
+                severity,
+                table: Some("auditstream.changes".to_owned()),
+                object: "auditstream.changes".to_owned(),
+                detail: "rls finding".to_owned(),
+            });
+            assert_eq!(mapped.severity, expected_severity);
+            assert_eq!(mapped.kind, expected_kind);
+            assert!(
+                mapped.hint.contains(hint_needle),
+                "expected {hint_needle:?} in {:?}",
+                mapped.hint
+            );
+        }
+
+        // Verify deterministic `kind_rank` ordering across RLS, partition, and unknown kinds.
+        let ordered = [
+            "tampered_history",
+            "forced_rls",
+            "rls_without_select_policy",
+            "rls_hides_default_partition",
+            "rls_bypassed_by_app_role",
+            "insufficient_partitions",
+            "future_unknown_kind",
+        ];
+        for pair in ordered.windows(2) {
+            assert!(
+                super::kind_rank(pair[0]) < super::kind_rank(pair[1]),
+                "expected {} < {}",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 
     #[test]

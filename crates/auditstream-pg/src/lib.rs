@@ -5,6 +5,7 @@ pub mod introspect;
 pub mod migrations;
 pub mod partitions;
 pub mod reader;
+pub(crate) mod rls;
 pub mod triggers;
 pub mod verify;
 

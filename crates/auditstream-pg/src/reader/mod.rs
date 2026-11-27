@@ -27,6 +27,7 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use crate::ddl::{DEFAULT_SCHEMA, quote_ident};
+pub use crate::rls::ExportRlsStatus;
 
 #[derive(Debug)]
 struct RowDecodeError(String);
@@ -794,6 +795,51 @@ impl Default for HistoryQuery {
     }
 }
 
+/// Inspects Row-Level Security posture on the parent `{audit_schema}.changes` table for the
+/// connected PostgreSQL role.
+///
+/// Always checks `pg_catalog.row_security_active` against the **parent** `{audit_schema}.changes`
+/// relation (never a child partition) and evaluates both `PERMISSIVE` and `RESTRICTIVE`
+/// `SELECT`/`ALL` policies applicable to `current_user` (including `PUBLIC` and inherited role
+/// memberships).
+///
+/// # Errors
+///
+/// Returns [`SourceError::Backend`] if acquiring a connection or querying PostgreSQL catalogs fails.
+pub async fn check_export_rls(
+    pool: &PgPool,
+    audit_schema: &str,
+) -> Result<ExportRlsStatus, SourceError> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|err| SourceError::backend("failed to acquire database connection", err))?;
+    let inspection = crate::rls::inspect_parent_rls_on_conn(&mut conn, audit_schema)
+        .await
+        .map_err(|err| SourceError::backend("failed to inspect Row-Level Security posture", err))?;
+    Ok(inspection.status)
+}
+
+/// Fail-closed Row-Level Security guard for unfiltered exports of `{audit_schema}.changes`.
+///
+/// Succeeds when RLS is inactive for the connected role (`row_security_active = false`), when
+/// `{audit_schema}.changes` does not exist yet (allowing callers to surface the standard missing
+/// relation error), or when the active role has at least one applicable `PERMISSIVE` `SELECT`/`ALL`
+/// policy with `USING (true)` and zero applicable `RESTRICTIVE` `SELECT`/`ALL` policies with a
+/// non-`'true'` `USING` expression.
+///
+/// # Errors
+///
+/// Returns [`SourceError::RlsFiltered`] when active RLS can silently omit rows during export, or
+/// [`SourceError::Backend`] if querying PostgreSQL catalogs fails.
+pub async fn ensure_export_rls_safe(pool: &PgPool, audit_schema: &str) -> Result<(), SourceError> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|err| SourceError::backend("failed to acquire database connection", err))?;
+    crate::rls::ensure_export_rls_safe_on_conn(&mut conn, audit_schema).await
+}
+
 /// Commit-safe PostgreSQL implementation of [`EventSource`] backed by an `xid8` snapshot
 /// window over `{schema}.changes`.
 ///
@@ -802,6 +848,11 @@ impl Default for HistoryQuery {
 /// (returning it as soon as the window drains, errors, or receives `next_batch(0)`). Avoid
 /// pointing exports at a heterogeneous multi-replica load balancer whose replicas have diverging
 /// `pg_snapshot_xmin()` horizons.
+///
+/// By default, [`PgEventSource`] fails closed with [`SourceError::RlsFiltered`] whenever
+/// Row-Level Security is active on `{schema}.changes` without an unobstructed
+/// `PERMISSIVE USING (true)` `SELECT` policy for `current_user`. Call
+/// [`Self::allow_rls_filtered`] to opt into an intentional per-tenant RLS-filtered export.
 #[derive(Debug)]
 pub struct PgEventSource {
     pool: PgPool,
@@ -813,6 +864,7 @@ pub struct PgEventSource {
     acked_anchor: Option<BoundaryAnchor>,
     last_snapshot_xmin: Option<u64>,
     filter: ExportFilter,
+    allow_rls_filtered: bool,
 }
 
 fn promote_acked_anchors(
@@ -899,12 +951,31 @@ impl PgEventSource {
             acked_anchor: None,
             last_snapshot_xmin: None,
             filter,
+            allow_rls_filtered: false,
         }
     }
 
     /// Creates a [`PgEventSource`] targeting the default `"auditstream"` schema with no filters.
     pub fn with_default_schema(pool: PgPool, start_cursor: Cursor) -> Self {
         Self::new(pool, DEFAULT_SCHEMA, start_cursor, ExportFilter::default())
+    }
+
+    /// Explicitly allows exporting while Row-Level Security filters rows on
+    /// `{audit_schema}.changes` (for intentional per-tenant exports).
+    ///
+    /// By default (`false`), [`EventSource::next_batch`] fails closed with
+    /// [`SourceError::RlsFiltered`] when RLS is active without an unobstructed
+    /// `PERMISSIVE USING (true)` `SELECT` policy.
+    #[must_use]
+    pub fn allow_rls_filtered(mut self, allow: bool) -> Self {
+        self.allow_rls_filtered = allow;
+        self
+    }
+
+    /// Returns whether RLS-filtered exports are explicitly allowed on this reader.
+    #[must_use]
+    pub fn is_rls_filtered_allowed(&self) -> bool {
+        self.allow_rls_filtered
     }
 
     /// Returns the highest acknowledged cursor recorded by [`EventSource::ack`].
@@ -945,6 +1016,97 @@ impl PgEventSource {
         let (xmin, in_recovery) = fetch_snapshot_status(&mut conn).await?;
         self.last_snapshot_xmin = Some(xmin);
         Ok((conn, xmin, in_recovery))
+    }
+
+    async fn fetch_batch_rows(
+        &self,
+        conn: &mut PgConnection,
+        xmin: u64,
+        limit_i64: i64,
+    ) -> Result<Vec<ChangeRow>, SourceError> {
+        let mut qb = Self::build_window_query_sql(
+            &self.audit_schema,
+            self.position,
+            &self.filter,
+            xmin,
+            limit_i64,
+        );
+        qb.build_query_as()
+            .fetch_all(conn)
+            .await
+            .map_err(|err| SourceError::backend("failed to query history batch", err))
+    }
+
+    async fn fetch_guarded_batch_and_tail(
+        &self,
+        conn: &mut PgConnection,
+        xmin: u64,
+        max: usize,
+        limit_i64: i64,
+    ) -> Result<(Vec<ChangeRow>, bool, Option<BoundaryAnchor>), SourceError> {
+        if self.allow_rls_filtered {
+            let mut rows = self.fetch_batch_rows(conn, xmin, limit_i64).await?;
+            let has_more = rows.len() > max;
+            rows.truncate(max);
+            let tail = self
+                .resolve_tail_for_batch(conn, &rows, has_more, xmin)
+                .await?;
+            return Ok((rows, has_more, tail));
+        }
+
+        // Run each guarded batch inside a short `READ COMMITTED, READ ONLY` transaction
+        // (PgBouncer-compatible, immune to `default_transaction_isolation = repeatable read`):
+        // 1) fail closed before touching `{schema}.changes` (never evaluating hostile policies),
+        // 2) execute the scan (acquiring `AccessShareLock` on `{schema}.changes` until commit,
+        //    blocking concurrent `ALTER TABLE ... ENABLE RLS` / `CREATE POLICY`),
+        // 3) re-check RLS posture on a fresh `READ COMMITTED` snapshot before committing while
+        //    holding `AccessShareLock` so a policy committed between steps 1 and 2 can never
+        //    silently drop rows or advance the cursor.
+        let mut tx = conn
+            .begin()
+            .await
+            .map_err(|err| SourceError::backend("failed to begin guarded export batch", err))?;
+        (&mut *tx)
+            .execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY")
+            .await
+            .map_err(|err| SourceError::backend("failed to set read-only export batch", err))?;
+        crate::rls::ensure_export_rls_safe_on_conn(&mut tx, &self.audit_schema).await?;
+
+        let mut rows = self.fetch_batch_rows(&mut tx, xmin, limit_i64).await?;
+        let has_more = rows.len() > max;
+        rows.truncate(max);
+        let tail = self
+            .resolve_tail_for_batch(&mut tx, &rows, has_more, xmin)
+            .await?;
+
+        crate::rls::ensure_export_rls_safe_on_conn(&mut tx, &self.audit_schema).await?;
+        tx.commit()
+            .await
+            .map_err(|err| SourceError::backend("failed to commit guarded export batch", err))?;
+        Ok((rows, has_more, tail))
+    }
+
+    async fn resolve_tail_for_batch(
+        &self,
+        conn: &mut PgConnection,
+        rows: &[ChangeRow],
+        has_more: bool,
+        xmin: u64,
+    ) -> Result<Option<BoundaryAnchor>, SourceError> {
+        if has_more || !self.has_active_filter() {
+            return Ok(None);
+        }
+        let after = match rows.last() {
+            Some(last) => {
+                let row_xact = last.xact_id.parse::<u64>().map_err(|err| {
+                    SourceError::decode(format!("invalid xact_id `{}`", last.xact_id), err)
+                })?;
+                validate_decoded_row_key(row_xact, last.id)?;
+                Cursor::new(row_xact, last.id)
+            }
+            None => self.position,
+        };
+        self.latest_row_in_window_after(conn, after, xmin).await
     }
 
     async fn latest_row_in_window_after(
@@ -1056,20 +1218,6 @@ impl PgEventSource {
         qb.push_bind(limit);
         qb
     }
-
-    async fn resolve_filtered_tail_anchor(
-        &self,
-        conn: &mut PgConnection,
-        after: Cursor,
-        xmin: u64,
-        fallback: Option<BoundaryAnchor>,
-    ) -> Result<Option<BoundaryAnchor>, SourceError> {
-        if !self.has_active_filter() {
-            return Ok(fallback);
-        }
-        let tail = self.latest_row_in_window_after(conn, after, xmin).await?;
-        Ok(tail.or(fallback))
-    }
 }
 
 fn latest_row_in_window_sql(audit_schema: &str) -> String {
@@ -1106,24 +1254,12 @@ impl EventSource for PgEventSource {
         }
 
         let limit_i64 = i64::try_from(max).unwrap_or(i64::MAX - 1).saturating_add(1);
-        let mut qb = Self::build_window_query_sql(
-            &self.audit_schema,
-            self.position,
-            &self.filter,
-            xmin,
-            limit_i64,
-        );
-        let mut rows: Vec<ChangeRow> = qb
-            .build_query_as()
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(|err| SourceError::backend("failed to query history batch", err))?;
+        let (rows, has_more, tail_anchor) = self
+            .fetch_guarded_batch_and_tail(&mut conn, xmin, max, limit_i64)
+            .await?;
 
         if rows.is_empty() {
-            let skipped_anchor = self
-                .resolve_filtered_tail_anchor(&mut conn, self.position, xmin, None)
-                .await?;
-            return Ok(skipped_anchor.map(|anchor| {
+            return Ok(tail_anchor.map(|anchor| {
                 let next_cursor = Cursor::new(xmin, 0);
                 self.position = next_cursor;
                 self.pending_anchors.push_back((next_cursor, anchor));
@@ -1131,22 +1267,15 @@ impl EventSource for PgEventSource {
             }));
         }
 
-        let has_more = rows.len() > max;
-        rows.truncate(max);
+        let (events, last_row_cursor, last_row_anchor) = decode_batch_rows(rows, self.position)?;
 
-        let (events, last_row_cursor, mut last_row_anchor) =
-            decode_batch_rows(rows, self.position)?;
-
-        let next_cursor = if has_more {
+        let (next_cursor, final_anchor) = if has_more {
             self.active_window = Some((xmin, conn));
-            last_row_cursor
+            (last_row_cursor, last_row_anchor)
         } else {
-            last_row_anchor = self
-                .resolve_filtered_tail_anchor(&mut conn, last_row_cursor, xmin, last_row_anchor)
-                .await?;
-            Cursor::new(xmin, 0)
+            (Cursor::new(xmin, 0), tail_anchor.or(last_row_anchor))
         };
-        if let Some(anchor) = last_row_anchor {
+        if let Some(anchor) = final_anchor {
             self.pending_anchors.push_back((next_cursor, anchor));
         }
         self.position = next_cursor;

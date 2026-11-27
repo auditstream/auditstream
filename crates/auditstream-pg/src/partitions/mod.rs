@@ -154,6 +154,11 @@ pub enum PartitionError {
         lock_timeout: String,
     },
 
+    /// Active Row-Level Security on `{schema}.changes` prevents inspecting `changes_default`
+    /// reliably (could silently return `0` or evaluate non-trivial/hostile policies).
+    #[error("row-level security prevents reliable partition inspection: {0}")]
+    RlsFiltered(String),
+
     /// A PostgreSQL connection or query error occurred.
     #[error("partition maintenance failed: {0}")]
     Database(#[from] sqlx::Error),
@@ -429,12 +434,25 @@ async fn create_partition_with_savepoint(
 ///
 /// # Errors
 ///
-/// Returns [`PartitionError::Database`] if querying PostgreSQL catalogs or `changes_default` fails.
+/// Returns [`PartitionError::RlsFiltered`] when Row-Level Security is active on
+/// `{schema}.changes` without exclusively unobstructed `SELECT` visibility (so `default_row_count`
+/// cannot be measured reliably without risking a false `0` or evaluating hostile policies), or
+/// [`PartitionError::Database`] if querying PostgreSQL catalogs or `changes_default` fails.
 pub async fn coverage(pool: &PgPool, schema: &str) -> Result<PartitionCoverage, PartitionError> {
     let mut tx = pool.begin().await?;
     sqlx::query("SET TRANSACTION READ ONLY")
         .execute(&mut *tx)
         .await?;
+
+    let rls = crate::rls::inspect_parent_rls_on_conn(&mut tx, schema).await?;
+    if !rls.status.safe_for_catalog_probe() {
+        tx.commit().await?;
+        return Err(PartitionError::RlsFiltered(format!(
+            "Row-Level Security is active on `{schema}.changes` for role `{}` without exclusively \
+             unobstructed SELECT visibility; `changes_default` row count cannot be inspected reliably",
+            rls.status.current_role
+        )));
+    }
 
     let current_month = fetch_db_utc_month(&mut tx).await?;
     let mut monthly_partitions = fetch_existing_monthly_partitions(&mut tx, schema).await?;
@@ -520,18 +538,15 @@ pub struct HistoryTableStats {
     pub months_covered_ahead: u32,
     /// Whether an attached `DEFAULT` partition of `{schema}.changes` holds at least one row
     /// (`false` when no `DEFAULT` partition is attached or when probing is skipped because any
-    /// foreign partition or unexpected Row-Level Security exists on the history partition tree).
+    /// foreign partition exists on the history partition tree or Row-Level Security is active on
+    /// `{schema}.changes` without exclusively unobstructed `SELECT` visibility for the connected
+    /// role).
     pub default_has_rows: bool,
     /// Catalog row estimate summed across all regular descendant partitions (`GREATEST(reltuples, 0)`).
     pub estimated_rows: i64,
     /// Total relation size (heap + indexes + TOAST) in bytes summed across all regular descendant
     /// partitions.
     pub total_size_bytes: i64,
-}
-
-#[derive(Debug, FromRow)]
-struct HistoryParentStatRow {
-    has_rls: bool,
 }
 
 #[derive(Debug, FromRow)]
@@ -543,7 +558,6 @@ struct HistoryChildStatRow {
     schema_name: String,
     relname: String,
     relkind: String,
-    has_rls: bool,
     est_rows: i64,
     total_bytes: i64,
 }
@@ -563,24 +577,8 @@ pub async fn history_stats(
         .execute(&mut *tx)
         .await?;
 
-    let parent: Option<HistoryParentStatRow> = sqlx::query_as(
-        "SELECT \
-           ( \
-             c.relrowsecurity \
-             OR c.relforcerowsecurity \
-             OR EXISTS (SELECT 1 FROM pg_catalog.pg_policy pol WHERE pol.polrelid = c.oid) \
-           ) AS has_rls \
-         FROM pg_catalog.pg_class c \
-         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-        WHERE n.nspname = $1 \
-          AND c.relname = 'changes' \
-          AND c.relkind IN ('r', 'p')",
-    )
-    .bind(schema)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    let Some(parent) = parent else {
+    let rls = crate::rls::inspect_parent_rls_on_conn(&mut tx, schema).await?;
+    if !rls.status.table_exists {
         tx.commit().await?;
         return Ok(HistoryTableStats {
             exists: false,
@@ -591,20 +589,18 @@ pub async fn history_stats(
             estimated_rows: 0,
             total_size_bytes: 0,
         });
-    };
+    }
 
     let current_month = fetch_db_utc_month(&mut tx).await?;
     let children = fetch_history_child_stats(&mut tx, schema).await?;
 
     let mut monthly_partitions = Vec::new();
     let mut default_leaf_oids: Vec<i64> = Vec::new();
-    let mut any_child_has_rls = false;
     let mut any_child_is_foreign = false;
     let mut estimated_rows: i64 = 0;
     let mut total_size_bytes: i64 = 0;
 
     for child in &children {
-        any_child_has_rls |= child.has_rls;
         any_child_is_foreign |= child.relkind == "f";
         estimated_rows = estimated_rows.saturating_add(child.est_rows);
         total_size_bytes = total_size_bytes.saturating_add(child.total_bytes);
@@ -636,9 +632,10 @@ pub async fn history_stats(
 
     // Query through parent `{schema}.changes` filtered by constant DEFAULT leaf OID(s) so
     // PostgreSQL checks SELECT only on the parent table while child partitions stay zero-grant.
-    // Skip when any foreign partition or unexpected RLS exists anywhere on the history partition
-    // tree so untrusted FDW hooks or RLS policies are never invoked.
-    let default_has_rows = if !parent.has_rls && !any_child_has_rls && !any_child_is_foreign {
+    // Skip when any foreign partition exists or when RLS is active on the parent without
+    // unrestricted `SELECT` visibility so untrusted FDW hooks or filtering/hostile RLS policies
+    // are never invoked.
+    let default_has_rows = if rls.status.safe_for_catalog_probe() && !any_child_is_foreign {
         probe_default_has_rows(&mut tx, schema, &default_leaf_oids).await?
     } else {
         false
@@ -716,11 +713,6 @@ async fn fetch_history_child_stats(
            cn.nspname::text AS schema_name, \
            c.relname::text AS relname, \
            c.relkind::text AS relkind, \
-           ( \
-             c.relrowsecurity \
-             OR c.relforcerowsecurity \
-             OR EXISTS (SELECT 1 FROM pg_catalog.pg_policy pol WHERE pol.polrelid = c.oid) \
-           ) AS has_rls, \
            CASE \
              WHEN c.relkind = 'r' THEN GREATEST(c.reltuples::bigint, 0) \
              ELSE 0::bigint \

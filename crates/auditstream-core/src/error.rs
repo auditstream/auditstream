@@ -98,6 +98,10 @@ pub enum SourceError {
     #[error("invalid export cursor: {0}")]
     InvalidCursor(String),
 
+    /// Active Row-Level Security on the audit history table can silently filter exported rows.
+    #[error("row-level security blocks unfiltered export: {0}")]
+    RlsFiltered(String),
+
     /// A stored row could not be decoded into a domain [`Event`](crate::Event).
     #[error("failed to decode event row: {message}")]
     Decode {

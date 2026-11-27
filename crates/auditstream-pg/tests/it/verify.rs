@@ -1115,10 +1115,12 @@ async fn history_tampering_triggers_fk_rules_and_rls_on_parent_and_child_partiti
     .await
     .expect("install stealth rewrite rules");
 
-    // 3. Unexpected RLS flags/policy on parent `changes` and child `changes_default`.
+    // 3. Forced RLS on parent `changes` and child `changes_default` (plus unexpected child RLS
+    //    policy on `changes_default` and zero PERMISSIVE SELECT policies on parent `changes`).
     db.execute_batch(
         "ALTER TABLE auditstream.changes ENABLE ROW LEVEL SECURITY; \
          ALTER TABLE auditstream.changes FORCE ROW LEVEL SECURITY; \
+         ALTER TABLE auditstream.changes_default FORCE ROW LEVEL SECURITY; \
          CREATE POLICY stealth_child_pol ON auditstream.changes_default FOR ALL USING (false);",
     )
     .await
@@ -1128,10 +1130,6 @@ async fn history_tampering_triggers_fk_rules_and_rls_on_parent_and_child_partiti
         .await
         .expect("verify tampered history");
     assert!(report.has_errors());
-    assert!(
-        report.default_partition.is_none(),
-        "default_partition row count must be skipped when unexpected RLS is active"
-    );
 
     let parent_trig_matches = report
         .findings
@@ -1155,34 +1153,56 @@ async fn history_tampering_triggers_fk_rules_and_rls_on_parent_and_child_partiti
         report.findings
     );
 
-    for (object, needle) in [
+    for (kind, object, needle) in [
         (
+            FindingKind::TamperedHistory,
             "auditstream.changes.stealth_parent_drop",
             "unexpected trigger",
         ),
         (
+            FindingKind::TamperedHistory,
             "auditstream.changes_default.stealth_child_drop",
             "unexpected trigger",
         ),
         (
+            FindingKind::TamperedHistory,
             "auditstream.changes.stealth_parent_rule",
             "unexpected rewrite rule",
         ),
         (
+            FindingKind::TamperedHistory,
             "auditstream.changes_default.stealth_child_rule",
             "unexpected rewrite rule",
         ),
-        ("auditstream.changes", "FORCE ROW LEVEL SECURITY"),
-        ("auditstream.changes_default", "1 RLS policy/policies"),
+        (
+            FindingKind::ForcedRls,
+            "auditstream.changes",
+            "FORCE ROW LEVEL SECURITY",
+        ),
+        (
+            FindingKind::ForcedRls,
+            "auditstream.changes_default",
+            "FORCE ROW LEVEL SECURITY",
+        ),
+        (
+            FindingKind::RlsWithoutSelectPolicy,
+            "auditstream.changes",
+            "zero PERMISSIVE SELECT policies",
+        ),
+        (
+            FindingKind::TamperedHistory,
+            "auditstream.changes_default",
+            "1 RLS policy/policies",
+        ),
     ] {
         assert!(
             report.findings.iter().any(|f| {
-                f.kind == FindingKind::TamperedHistory
+                f.kind == kind
                     && f.severity == Severity::Error
                     && f.object == object
                     && f.detail.contains(needle)
             }),
-            "expected TamperedHistory for {object} containing {needle:?}, got: {:?}",
+            "expected {kind:?} for {object} containing {needle:?}, got: {:?}",
             report.findings
         );
     }
@@ -1461,4 +1481,486 @@ async fn non_superuser_install_passes_verify() {
         .await;
     let _ = admin.execute("DROP ROLE IF EXISTS auditstream_owner").await;
     let _ = admin.close().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn rls_safety_checks_detect_forced_missing_select_hidden_default_and_bypassed_app_roles() {
+    use auditstream_pg::ddl::quote_ident;
+    use auditstream_pg::partitions::{self, PartitionError};
+
+    let _lock = TestDb::cluster_lock().await.expect("acquire cluster lock");
+    let mut db = TestDb::new().await.expect("create TestDb");
+    create_invoice_table(&db).await;
+
+    let suffix = db.database_name().to_owned();
+    let app_role = format!("rls_app_{suffix}");
+    let exporter_role = format!("rls_exp_{suffix}");
+    let bypass_role = format!("rls_byp_{suffix}");
+    let set_bypass_role = format!("rls_sbp_{suffix}");
+    let super_role = format!("rls_sup_{suffix}");
+    let member_role = format!("rls_mem_{suffix}");
+    for role in [
+        &app_role,
+        &exporter_role,
+        &bypass_role,
+        &set_bypass_role,
+        &super_role,
+        &member_role,
+    ] {
+        db.track_role(role);
+    }
+
+    let app_pw = uuid::Uuid::new_v4().simple().to_string();
+    let exp_pw = uuid::Uuid::new_v4().simple().to_string();
+    let app_q = quote_ident(&app_role);
+    let exp_q = quote_ident(&exporter_role);
+    let byp_q = quote_ident(&bypass_role);
+    let set_byp_q = quote_ident(&set_bypass_role);
+    let sup_q = quote_ident(&super_role);
+    let mem_q = quote_ident(&member_role);
+
+    db.execute_batch(&format!(
+        "CREATE ROLE {app_q} LOGIN PASSWORD '{app_pw}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS; \
+         CREATE ROLE {exp_q} LOGIN PASSWORD '{exp_pw}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS; \
+         CREATE ROLE {byp_q} NOLOGIN NOSUPERUSER BYPASSRLS; \
+         CREATE ROLE {set_byp_q} NOLOGIN NOSUPERUSER NOBYPASSRLS; \
+         CREATE ROLE {sup_q} NOLOGIN SUPERUSER; \
+         CREATE ROLE {mem_q} NOLOGIN NOSUPERUSER NOBYPASSRLS; \
+         GRANT {byp_q} TO {set_byp_q};"
+    ))
+    .await
+    .expect("create RLS test roles");
+
+    let specs = vec![invoice_spec(vec!["password_hash"])];
+    let stmts = migrations::install_statements(
+        &DdlOptions::new(DEFAULT_SCHEMA, vec![app_role.clone()]),
+        &specs,
+    )
+    .expect("compose install statements");
+    db.execute_statements(&stmts)
+        .await
+        .expect("install capture DDL and triggers");
+
+    db.execute_batch(&format!(
+        "GRANT USAGE ON SCHEMA public TO {app_q}; \
+         GRANT SELECT, INSERT, UPDATE, DELETE ON public.invoice TO {app_q}; \
+         GRANT USAGE ON SCHEMA auditstream TO {exp_q}; \
+         GRANT SELECT ON auditstream.changes TO {exp_q};"
+    ))
+    .await
+    .expect("grant invoice and exporter privileges");
+
+    let base = db.url();
+    let (scheme, rest) = base.split_once("://").expect("valid postgres URL");
+    let (_, host_and_db) = rest.split_once('@').expect("URL has credentials");
+    let app_pool =
+        auditstream_pg::connect(&format!("{scheme}://{app_role}:{app_pw}@{host_and_db}"))
+            .await
+            .expect("connect app_pool");
+    let exp_pool = auditstream_pg::connect(&format!(
+        "{scheme}://{exporter_role}:{exp_pw}@{host_and_db}"
+    ))
+    .await
+    .expect("connect exp_pool");
+
+    // 1. FORCE RLS on parent `changes` breaks app_user DML writes with 42501 and triggers ForcedRls.
+    db.execute_batch(
+        "ALTER TABLE auditstream.changes ENABLE ROW LEVEL SECURITY; \
+         ALTER TABLE auditstream.changes FORCE ROW LEVEL SECURITY;",
+    )
+    .await
+    .expect("enable and force RLS on parent changes");
+
+    let write_err = sqlx::query("INSERT INTO public.invoice (id, status) VALUES (1, 'open')")
+        .execute(&app_pool)
+        .await
+        .expect_err("FORCE RLS on changes must abort app_user writes");
+    assert_eq!(
+        write_err
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("42501"),
+        "expected SQLSTATE 42501 under FORCE RLS, got: {write_err}"
+    );
+
+    let forced_parent = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify forced parent RLS");
+    assert!(
+        forced_parent.findings.iter().any(|f| {
+            f.kind == FindingKind::ForcedRls
+                && f.severity == Severity::Error
+                && f.object == "auditstream.changes"
+        }),
+        "expected ForcedRls on parent changes, got: {:?}",
+        forced_parent.findings
+    );
+    assert!(
+        forced_parent.findings.iter().any(|f| {
+            f.kind == FindingKind::RlsWithoutSelectPolicy
+                && f.severity == Severity::Error
+                && f.object == "auditstream.changes"
+        }),
+        "expected RlsWithoutSelectPolicy with 0 policies, got: {:?}",
+        forced_parent.findings
+    );
+
+    // 2. Remove FORCE on parent (confirming live non-superuser DML capture now succeeds under
+    //    non-forced RLS!), enable FORCE on `changes_default` AND a monthly partition -> exactly 2
+    //    ForcedRls findings (one per child partition).
+    let monthly_part: String = sqlx::query_scalar(
+        "SELECT child.relname \
+           FROM pg_catalog.pg_inherits i \
+           JOIN pg_catalog.pg_class parent ON parent.oid = i.inhparent \
+           JOIN pg_catalog.pg_namespace pn ON pn.oid = parent.relnamespace \
+           JOIN pg_catalog.pg_class child ON child.oid = i.inhrelid \
+          WHERE pn.nspname = 'auditstream' \
+            AND parent.relname = 'changes' \
+            AND child.relname ~ '^changes_[0-9]{4}_[0-9]{2}$' \
+          ORDER BY child.relname ASC LIMIT 1",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("find attached monthly partition");
+
+    db.execute("ALTER TABLE auditstream.changes NO FORCE ROW LEVEL SECURITY")
+        .await
+        .expect("clear parent FORCE RLS");
+    sqlx::query("INSERT INTO public.invoice (id, status) VALUES (1, 'open')")
+        .execute(&app_pool)
+        .await
+        .expect("non-superuser app_user DML capture must succeed under non-forced ENABLE RLS");
+
+    db.execute_batch(&format!(
+        "ALTER TABLE auditstream.changes_default FORCE ROW LEVEL SECURITY; \
+         ALTER TABLE auditstream.{} FORCE ROW LEVEL SECURITY;",
+        quote_ident(&monthly_part)
+    ))
+    .await
+    .expect("force RLS on child partitions");
+
+    let forced_children = verify::check(db.pool(), &specs)
+        .await
+        .expect("verify forced child partitions");
+    let forced_count = forced_children
+        .findings
+        .iter()
+        .filter(|f| f.kind == FindingKind::ForcedRls)
+        .count();
+    assert_eq!(
+        forced_count, 2,
+        "expected exactly 2 child ForcedRls findings after clearing parent FORCE, got: {:?}",
+        forced_children.findings
+    );
+    for child_obj in [
+        "auditstream.changes_default".to_owned(),
+        format!("auditstream.{monthly_part}"),
+    ] {
+        assert!(
+            forced_children.findings.iter().any(|f| {
+                f.kind == FindingKind::ForcedRls
+                    && f.severity == Severity::Error
+                    && f.object == child_obj
+            }),
+            "expected ForcedRls on {child_obj}, got: {:?}",
+            forced_children.findings
+        );
+    }
+
+    // Clear child FORCE flags and verify INSERT-only, WITH-CHECK-only, and RESTRICTIVE-only
+    // policies still trigger RlsWithoutSelectPolicy on `auditstream.changes`.
+    db.execute_batch(&format!(
+        "ALTER TABLE auditstream.changes_default NO FORCE ROW LEVEL SECURITY; \
+         ALTER TABLE auditstream.{} NO FORCE ROW LEVEL SECURITY;",
+        quote_ident(&monthly_part)
+    ))
+    .await
+    .expect("clear child FORCE RLS");
+
+    for (label, policy_sql) in [
+        (
+            "INSERT-only",
+            "CREATE POLICY p_ins ON auditstream.changes FOR INSERT TO PUBLIC WITH CHECK (true)",
+        ),
+        (
+            "FOR ALL WITH CHECK only (NULL USING)",
+            "CREATE POLICY p_wc ON auditstream.changes FOR ALL TO PUBLIC WITH CHECK (true)",
+        ),
+        (
+            "RESTRICTIVE-only",
+            "CREATE POLICY p_rest ON auditstream.changes AS RESTRICTIVE FOR SELECT TO PUBLIC USING (true)",
+        ),
+    ] {
+        db.execute(policy_sql)
+            .await
+            .expect("create non-permissive-select policy");
+        let rep = verify::check(db.pool(), &specs)
+            .await
+            .expect("verify RlsWithoutSelectPolicy");
+        assert!(
+            rep.findings.iter().any(|f| {
+                f.kind == FindingKind::RlsWithoutSelectPolicy
+                    && f.severity == Severity::Error
+                    && f.object == "auditstream.changes"
+            }),
+            "expected RlsWithoutSelectPolicy on auditstream.changes for {label}, got: {:?}",
+            rep.findings
+        );
+    }
+    db.execute_batch(
+        "DROP POLICY p_ins ON auditstream.changes; \
+         DROP POLICY p_wc ON auditstream.changes; \
+         DROP POLICY p_rest ON auditstream.changes;",
+    )
+    .await
+    .expect("drop test policies");
+
+    // 3. Multi-tenant RLS with tenant-scoped app_user + unobstructed PERMISSIVE USING (true)
+    //    auditstream_exporter (no BYPASSRLS!), plus 2 stranded rows in `changes_default`.
+    db.execute_batch(&format!(
+        "CREATE POLICY tenant_read ON auditstream.changes FOR SELECT TO {app_q} \
+           USING (actor->>'tenant' = pg_catalog.current_setting('app.tenant', true)); \
+         CREATE POLICY exporter_read ON auditstream.changes FOR SELECT TO {exp_q} USING (true); \
+         INSERT INTO auditstream.changes (occurred_at, source, op, actor, db_user, schema_version) VALUES \
+           ('2020-01-10T00:00:00Z'::timestamptz, 'app', 'seed.a', '{{\"type\":\"user\",\"id\":\"u1\",\"tenant\":\"t1\"}}', 'postgres', 1), \
+           ('2020-01-11T00:00:00Z'::timestamptz, 'app', 'seed.b', '{{\"type\":\"user\",\"id\":\"u2\",\"tenant\":\"t2\"}}', 'postgres', 1);"
+    ))
+    .await
+    .expect("create multi-tenant RLS policies and seed changes_default");
+
+    // Confirm live PG behavior: row_security_active is false on changes_default, true on parent changes!
+    let (default_rsa, parent_rsa): (bool, bool) = sqlx::query_as(
+        "SELECT \
+           pg_catalog.row_security_active('auditstream.changes_default'::regclass), \
+           pg_catalog.row_security_active('auditstream.changes'::regclass)",
+    )
+    .fetch_one(&app_pool)
+    .await
+    .expect("probe row_security_active");
+    assert!(
+        !default_rsa,
+        "child partition row_security_active must be false"
+    );
+    assert!(
+        parent_rsa,
+        "parent changes row_security_active must be true for app_user"
+    );
+
+    // App user (tenant-filtered) sees RlsHidesDefaultPartition warning, skips default_partition
+    // probe, and `partitions::coverage` fails closed with `PartitionError::RlsFiltered` instead
+    // of silently returning `default_row_count = 0`.
+    let app_rep = verify::check(&app_pool, &specs)
+        .await
+        .expect("verify as tenant-filtered app_user");
+    assert!(
+        !app_rep.has_errors(),
+        "unexpected errors: {:?}",
+        app_rep.findings
+    );
+    assert!(
+        app_rep.default_partition.is_none(),
+        "default_partition must be None when RLS hides rows from verifying role"
+    );
+    assert!(
+        app_rep.findings.iter().any(|f| {
+            f.kind == FindingKind::RlsHidesDefaultPartition
+                && f.severity == Severity::Warning
+                && f.object == "auditstream.changes_default"
+                && f.detail.contains(&app_role)
+        }),
+        "expected RlsHidesDefaultPartition warning for app_user, got: {:?}",
+        app_rep.findings
+    );
+    let app_stats = partitions::history_stats(&app_pool, DEFAULT_SCHEMA)
+        .await
+        .expect("history_stats as app_user");
+    assert!(!app_stats.default_has_rows);
+    let cov_err = partitions::coverage(&app_pool, DEFAULT_SCHEMA)
+        .await
+        .expect_err("partitions::coverage must fail closed under tenant-filtered RLS");
+    assert!(
+        matches!(cov_err, PartitionError::RlsFiltered(_)),
+        "expected PartitionError::RlsFiltered, got: {cov_err:?}"
+    );
+
+    // Non-superuser NOBYPASSRLS exporter with exclusively unobstructed PERMISSIVE USING (true)
+    // sees BOTH rows in `verify`, `history_stats`, and `coverage`!
+    let exp_rep = verify::check(&exp_pool, &specs)
+        .await
+        .expect("verify as auditstream_exporter");
+    assert!(
+        !exp_rep
+            .findings
+            .iter()
+            .any(|f| f.kind == FindingKind::RlsHidesDefaultPartition),
+        "unobstructed exporter must not emit RlsHidesDefaultPartition: {:?}",
+        exp_rep.findings
+    );
+    assert_eq!(
+        exp_rep
+            .default_partition
+            .as_ref()
+            .expect("exporter must inspect default_partition")
+            .row_count,
+        2
+    );
+    assert!(
+        exp_rep
+            .findings
+            .iter()
+            .any(|f| f.kind == FindingKind::DefaultPartitionRows),
+        "exporter must catch stranded default rows under RLS: {:?}",
+        exp_rep.findings
+    );
+    let exp_stats = partitions::history_stats(&exp_pool, DEFAULT_SCHEMA)
+        .await
+        .expect("history_stats as exporter");
+    assert!(exp_stats.default_has_rows);
+    let exp_cov = partitions::coverage(&exp_pool, DEFAULT_SCHEMA)
+        .await
+        .expect("coverage as exporter");
+    assert_eq!(exp_cov.default_row_count, 2);
+
+    // A hostile sibling `TO PUBLIC` PERMISSIVE policy (`1 / 0 = 1`) alongside `exporter_read`
+    // (`USING (true)`) must NOT crash `verify`, `history_stats`, or `coverage` with division by zero!
+    db.execute(
+        "CREATE POLICY a_public_trap ON auditstream.changes FOR SELECT TO PUBLIC USING (1 / 0 = 1)",
+    )
+    .await
+    .expect("install sibling hostile PUBLIC policy");
+    let trap_rep = verify::check(&exp_pool, &specs)
+        .await
+        .expect("verify must not crash on hostile sibling PUBLIC policy");
+    assert!(trap_rep.default_partition.is_none());
+    assert!(
+        trap_rep.findings.iter().any(|f| {
+            f.kind == FindingKind::RlsHidesDefaultPartition
+                && f.detail
+                    .contains("non-trivial sibling PERMISSIVE SELECT policy")
+        }),
+        "hostile sibling PUBLIC policy must skip default probe with sibling-policy RlsHidesDefaultPartition detail: {:?}",
+        trap_rep.findings
+    );
+    let trap_stats = partitions::history_stats(&exp_pool, DEFAULT_SCHEMA)
+        .await
+        .expect("history_stats must not crash on hostile sibling PUBLIC policy");
+    assert!(!trap_stats.default_has_rows);
+    assert!(matches!(
+        partitions::coverage(&exp_pool, DEFAULT_SCHEMA).await,
+        Err(PartitionError::RlsFiltered(_))
+    ));
+    db.execute("DROP POLICY a_public_trap ON auditstream.changes")
+        .await
+        .expect("drop hostile sibling PUBLIC policy");
+
+    // Adding a PUBLIC RESTRICTIVE policy blocks even the exporter from inspecting changes_default reliably.
+    db.execute(
+        "CREATE POLICY rest_all ON auditstream.changes AS RESTRICTIVE FOR ALL TO PUBLIC \
+         USING (actor->>'tenant' = 't1')",
+    )
+    .await
+    .expect("add PUBLIC RESTRICTIVE FOR ALL policy");
+    let exp_blocked = verify::check(&exp_pool, &specs)
+        .await
+        .expect("verify as exporter with PUBLIC RESTRICTIVE policy");
+    assert!(exp_blocked.default_partition.is_none());
+    assert!(
+        exp_blocked
+            .findings
+            .iter()
+            .any(|f| f.kind == FindingKind::RlsHidesDefaultPartition
+                && f.severity == Severity::Warning),
+        "RESTRICTIVE FOR ALL policy must trigger RlsHidesDefaultPartition even with PERMISSIVE USING (true): {:?}",
+        exp_blocked.findings
+    );
+
+    // Clean up restrictive policy & default rows -> clean multi-tenant RLS passes with 0 findings!
+    db.execute_batch(
+        "DROP POLICY rest_all ON auditstream.changes; \
+         DELETE FROM auditstream.changes WHERE occurred_at < '2021-01-01'::timestamptz;",
+    )
+    .await
+    .expect("clean restrictive policy and seeded default rows");
+    let clean_exp = verify::check_with_options(
+        &exp_pool,
+        &verify::VerifyOptions::new(DEFAULT_SCHEMA, specs.clone())
+            .with_app_roles(vec![app_role.clone()]),
+    )
+    .await
+    .expect("clean verify as exporter with safe app_role");
+    assert!(
+        clean_exp.is_clean(),
+        "valid multi-tenant RLS with NOSUPERUSER NOBYPASSRLS app_role must verify cleanly, got: {:?}",
+        clean_exp.findings
+    );
+
+    // 4. RlsBypassedByAppRole checks SUPERUSER, BYPASSRLS, transitive SET-able BYPASSRLS
+    //    membership, and auditstream_owner membership inside an uncommitted transaction.
+    //    On PG 16+, also confirm `GRANT <bypass_role> TO <app_role> WITH SET FALSE` does NOT
+    //    falsely trigger `RlsBypassedByAppRole` (since `BYPASSRLS` is never inherited).
+    let pg_version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+        .fetch_one(db.pool())
+        .await
+        .expect("read server_version_num");
+    let mut tx = db.pool().begin().await.expect("begin bypass tx");
+    tx.execute(AssertSqlSafe(format!("GRANT auditstream_owner TO {mem_q}")))
+        .await
+        .expect("grant auditstream_owner to member_role");
+    if pg_version >= 160_000 {
+        tx.execute(AssertSqlSafe(format!(
+            "GRANT {byp_q} TO {app_q} WITH INHERIT TRUE, SET FALSE"
+        )))
+        .await
+        .expect("grant BYPASSRLS role WITH SET FALSE to app_role");
+    }
+    let bypass_rep = verify::check_in_transaction(
+        &mut tx,
+        &verify::VerifyOptions::new(DEFAULT_SCHEMA, specs).with_app_roles(vec![
+            app_role.clone(),
+            bypass_role.clone(),
+            set_bypass_role.clone(),
+            super_role.clone(),
+            member_role.clone(),
+            "nonexistent_ghost_role".to_owned(),
+        ]),
+    )
+    .await
+    .expect("verify RlsBypassedByAppRole");
+    tx.rollback().await.expect("rollback bypass tx");
+
+    let bypass_findings: Vec<&verify::Finding> = bypass_rep
+        .findings
+        .iter()
+        .filter(|f| f.kind == FindingKind::RlsBypassedByAppRole)
+        .collect();
+    assert_eq!(
+        bypass_findings.len(),
+        4,
+        "expected exactly 4 RlsBypassedByAppRole findings (excluding safe app_role and nonexistent_ghost_role), got: {bypass_findings:?}"
+    );
+    assert!(
+        !bypass_findings.iter().any(|f| f.object == app_role),
+        "safe app_role (even with PG 16+ SET FALSE BYPASSRLS grant) must not be flagged: {bypass_findings:?}"
+    );
+    for (role, exact_reasons) in [
+        (&bypass_role, "(BYPASSRLS)"),
+        (&set_bypass_role, "(member of BYPASSRLS role)"),
+        (&super_role, "(SUPERUSER)"),
+        (&member_role, "(member of auditstream_owner)"),
+    ] {
+        assert!(
+            bypass_findings.iter().any(|f| {
+                f.severity == Severity::Warning
+                    && f.table.as_deref() == Some("auditstream.changes")
+                    && f.object == *role
+                    && f.detail.ends_with(exact_reasons)
+            }),
+            "expected RlsBypassedByAppRole for {role} ending with {exact_reasons:?}, got: {bypass_findings:?}"
+        );
+    }
+
+    app_pool.close().await;
+    exp_pool.close().await;
 }

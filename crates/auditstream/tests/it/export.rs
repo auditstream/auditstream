@@ -1379,3 +1379,251 @@ async fn export_stats_json_stall_detection_failover_anchor_and_future_cursor_gua
         output_with_tail
     );
 }
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn export_cli_rls_guard_fails_closed_and_supports_allow_rls_filtered() {
+    use auditstream_pg::ddl::quote_ident;
+
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let mut db = TestDb::new().await.expect("create TestDb");
+    db.execute_statements(&ddl::generate(&DdlOptions::new(DEFAULT_SCHEMA, vec![])))
+        .await
+        .expect("install history schema");
+
+    let suffix = db.database_name().to_owned();
+    let app_role = format!("ecli_app_{suffix}");
+    let exp_role = format!("ecli_exp_{suffix}");
+    db.track_role(&app_role);
+    db.track_role(&exp_role);
+
+    let app_pw = uuid::Uuid::new_v4().simple().to_string();
+    let exp_pw = uuid::Uuid::new_v4().simple().to_string();
+    let app_q = quote_ident(&app_role);
+    let exp_q = quote_ident(&exp_role);
+
+    db.execute_batch(&format!(
+        "CREATE ROLE {app_q} LOGIN PASSWORD '{app_pw}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS; \
+         CREATE ROLE {exp_q} LOGIN PASSWORD '{exp_pw}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS; \
+         ALTER ROLE {app_q} SET app.tenant = 'tenant_a'; \
+         GRANT USAGE ON SCHEMA auditstream TO {app_q}, {exp_q}; \
+         GRANT SELECT ON auditstream.changes TO {app_q}, {exp_q}; \
+         INSERT INTO auditstream.changes (occurred_at, source, op, actor, db_user, schema_version) VALUES \
+           ('2020-01-01T00:00:00Z', 'app', 'a.one', '{{\"type\":\"user\",\"id\":\"u1\",\"tenant\":\"tenant_a\"}}', '{app_role}', 1), \
+           ('2020-01-02T00:00:00Z', 'app', 'a.two', '{{\"type\":\"user\",\"id\":\"u2\",\"tenant\":\"tenant_a\"}}', '{app_role}', 1), \
+           ('2020-01-03T00:00:00Z', 'app', 'b.one', '{{\"type\":\"user\",\"id\":\"u3\",\"tenant\":\"tenant_b\"}}', '{app_role}', 1), \
+           ('2020-01-04T00:00:00Z', 'app', 'b.two', '{{\"type\":\"user\",\"id\":\"u4\",\"tenant\":\"tenant_b\"}}', '{app_role}', 1); \
+         ALTER TABLE auditstream.changes ENABLE ROW LEVEL SECURITY;"
+    ))
+    .await
+    .expect("set up RLS roles and seed 4 multi-tenant events");
+
+    let base = db.url();
+    let (scheme, rest) = base.split_once("://").expect("valid postgres URL");
+    let (_, host_and_db) = rest.split_once('@').expect("URL has credentials");
+    let app_url = format!("{scheme}://{app_role}:{app_pw}@{host_and_db}");
+    let exp_url = format!("{scheme}://{exp_role}:{exp_pw}@{host_and_db}");
+
+    let dir = tempdir().expect("tempdir");
+    let blocked_cursor = dir.path().join("blocked.cursor");
+    let blocked_lock = dir.path().join("blocked.cursor.lock");
+    let blocked_output = dir.path().join("blocked.jsonl");
+
+    // 1. 0 policies -> fails closed (exit 3), creates neither cursor, lock, nor output file.
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", &exp_url)
+        .args([
+            "export",
+            "--cursor-file",
+            "blocked.cursor",
+            "--output",
+            "blocked.jsonl",
+        ])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("auditstream_exporter"))
+        .stderr(predicate::str::contains("BYPASSRLS"))
+        .stderr(predicate::str::contains("--allow-rls-filtered"));
+    assert!(
+        !blocked_cursor.exists(),
+        "cursor must not be created when RLS blocks"
+    );
+    assert!(
+        !blocked_lock.exists(),
+        "cursor lock must not be created when RLS blocks"
+    );
+    assert!(
+        !blocked_output.exists(),
+        "output must not be created when RLS blocks"
+    );
+
+    // 2. Add tenant-filtered policy for app_user + PERMISSIVE USING (true) for exporter.
+    db.execute_batch(&format!(
+        "CREATE POLICY tenant_read ON auditstream.changes FOR SELECT TO {app_q} \
+           USING (actor->>'tenant' = pg_catalog.current_setting('app.tenant', true)); \
+         CREATE POLICY exporter_read ON auditstream.changes FOR SELECT TO {exp_q} USING (true);"
+    ))
+    .await
+    .expect("create tenant_read and exporter_read policies");
+
+    // app_user without --allow-rls-filtered fails closed (exit 3).
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", &app_url)
+        .args([
+            "export",
+            "--cursor-file",
+            "blocked.cursor",
+            "--output",
+            "blocked.jsonl",
+        ])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("PERMISSIVE USING (true)"));
+    assert!(!blocked_cursor.exists());
+    assert!(!blocked_lock.exists());
+    assert!(!blocked_output.exists());
+
+    // app_user WITH --allow-rls-filtered succeeds and exports ONLY tenant_a's 2 events!
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let tenant_events = loop {
+        let out = auditstream_cmd()
+            .current_dir(dir.path())
+            .env("AUDITSTREAM_DATABASE_URL", &app_url)
+            .args([
+                "export",
+                "--allow-rls-filtered",
+                "--cursor-file",
+                "tenant_a.cursor",
+                "--output",
+                "tenant_a.jsonl",
+            ])
+            .output()
+            .expect("run --allow-rls-filtered export");
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let events =
+            json_events(&fs::read(dir.path().join("tenant_a.jsonl")).expect("read tenant_a"));
+        if events.len() >= 2 {
+            assert_eq!(events.len(), 2);
+            break events;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for tenant_a export"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert!(
+        tenant_events
+            .iter()
+            .all(|e| e["actor"]["tenant"] == "tenant_a")
+    );
+    let saved_tenant_cursor =
+        fs::read(dir.path().join("tenant_a.cursor")).expect("read tenant_a cursor");
+    let saved_tenant_output =
+        fs::read(dir.path().join("tenant_a.jsonl")).expect("read tenant_a output");
+
+    // Resuming a `--allow-rls-filtered` cursor WITHOUT `--allow-rls-filtered` (even as exporter)
+    // is rejected with exit code 2 without touching cursor or output.
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", &exp_url)
+        .args([
+            "export",
+            "--cursor-file",
+            "tenant_a.cursor",
+            "--output",
+            "tenant_a.jsonl",
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("--allow-rls-filtered"));
+    assert_eq!(
+        fs::read(dir.path().join("tenant_a.cursor")).expect("tenant_a cursor untouched"),
+        saved_tenant_cursor
+    );
+    assert_eq!(
+        fs::read(dir.path().join("tenant_a.jsonl")).expect("tenant_a output untouched"),
+        saved_tenant_output
+    );
+
+    // 3. Dedicated NOSUPERUSER NOBYPASSRLS exporter with unobstructed PERMISSIVE USING (true)
+    //    exports ALL 4 events across both tenants!
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let exp_events = loop {
+        let out = auditstream_cmd()
+            .current_dir(dir.path())
+            .env("AUDITSTREAM_DATABASE_URL", &exp_url)
+            .args([
+                "export",
+                "--cursor-file",
+                "full.cursor",
+                "--output",
+                "full.jsonl",
+            ])
+            .output()
+            .expect("run exporter export");
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let events = json_events(&fs::read(dir.path().join("full.jsonl")).expect("read full"));
+        if events.len() >= 4 {
+            assert_eq!(events.len(), 4);
+            break events;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for full exporter export"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    let exp_tenants: BTreeSet<&str> = exp_events
+        .iter()
+        .map(|e| e["actor"]["tenant"].as_str().expect("tenant"))
+        .collect();
+    assert_eq!(exp_tenants, BTreeSet::from(["tenant_a", "tenant_b"]));
+    let saved_cursor = fs::read(dir.path().join("full.cursor")).expect("read full cursor");
+    let saved_output = fs::read(dir.path().join("full.jsonl")).expect("read full output");
+
+    // 4. Adding a PUBLIC RESTRICTIVE policy causes even the exporter with PERMISSIVE USING (true)
+    //    to fail closed (exit 3) BEFORE touching existing cursor or output!
+    db.execute(
+        "CREATE POLICY tenant_restrict ON auditstream.changes AS RESTRICTIVE FOR SELECT TO PUBLIC \
+         USING (actor->>'tenant' = 'tenant_a')",
+    )
+    .await
+    .expect("add PUBLIC RESTRICTIVE policy");
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_DATABASE_URL", &exp_url)
+        .args([
+            "export",
+            "--cursor-file",
+            "full.cursor",
+            "--output",
+            "full.jsonl",
+        ])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("tenant_restrict"))
+        .stderr(predicate::str::contains("RESTRICTIVE"));
+    assert_eq!(
+        fs::read(dir.path().join("full.cursor")).expect("cursor intact"),
+        saved_cursor
+    );
+    assert_eq!(
+        fs::read(dir.path().join("full.jsonl")).expect("output intact"),
+        saved_output
+    );
+}

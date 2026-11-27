@@ -9,9 +9,12 @@
 //! exclusions (primary key or renamed/dropped columns), unsafe ownership, privileges, role
 //! attributes/memberships (including recursive PG 16+ indirect `ADMIN` chains),
 //! `session_replication_role` parameter grants or `replica` overrides, history tampering
-//! (triggers including internal RI triggers, rewrite rules, unexpected Row-Level Security on
-//! `changes` or its partitions, or unexpected helper function overloads), partitioned tables whose
-//! direct partition writes bypass statement triggers, and rows stranded in `changes_default`.
+//! (triggers including internal RI triggers, rewrite rules, unexpected child-partition Row-Level
+//! Security policies, or unexpected helper function overloads), Row-Level Security safety checks
+//! (`FORCE ROW LEVEL SECURITY` on parent or child partitions, RLS enabled without any
+//! `PERMISSIVE` `SELECT` policy, active RLS hiding `changes_default` row counts from the
+//! verifying role, and configured `app_roles` bypassing RLS), partitioned tables whose direct
+//! partition writes bypass statement triggers, and rows stranded in `changes_default`.
 //!
 //! Every catalog inspection runs inside a `READ ONLY` transaction (`SET TRANSACTION READ ONLY`),
 //! so [`check`] and [`check_with_options`] can never mutate the database they inspect.
@@ -102,10 +105,26 @@ pub enum FindingKind {
     /// An Auditstream schema, table, child partition, identity sequence, or function is not
     /// owned by `auditstream_owner`.
     InvalidOwnership,
-    /// An unexpected trigger (including internal RI triggers), rewrite rule, or Row-Level Security
-    /// setting/policy is attached to `{audit_schema}.changes` or one of its child partitions, or
-    /// an unexpected helper function overload exists in `{audit_schema}`.
+    /// An unexpected trigger (including internal RI triggers), rewrite rule, or child-partition
+    /// Row-Level Security policy is attached to `{audit_schema}.changes` or one of its child
+    /// partitions, or an unexpected helper function overload exists in `{audit_schema}`.
     TamperedHistory,
+    /// `FORCE ROW LEVEL SECURITY` (`relforcerowsecurity = true`) is enabled on
+    /// `{audit_schema}.changes` or an attached child partition, breaking `auditstream_owner`
+    /// `SECURITY DEFINER` trigger writes and partition maintenance.
+    ForcedRls,
+    /// Row-Level Security (`relrowsecurity = true`) is enabled on `{audit_schema}.changes` with
+    /// zero `PERMISSIVE` policies covering `SELECT` (`polcmd IN ('*', 'r')` with a non-null
+    /// `USING` expression), causing non-owner reads to silently return 0 rows.
+    RlsWithoutSelectPolicy,
+    /// Row-Level Security is active on `{audit_schema}.changes` (`row_security_active = true`)
+    /// and the verifying role lacks unrestricted `SELECT` visibility, so `changes_default` row
+    /// counts cannot be inspected reliably.
+    RlsHidesDefaultPartition,
+    /// Row-Level Security is enabled on `{audit_schema}.changes`, but a configured `app_roles`
+    /// member has `SUPERUSER`, `BYPASSRLS`, or membership in `auditstream_owner` (or the history
+    /// table owner) and silently bypasses RLS policies.
+    RlsBypassedByAppRole,
 }
 
 /// Single drift finding returned by [`check`] and [`check_with_options`].
@@ -142,8 +161,9 @@ pub struct VerifyReport {
     /// Findings sorted deterministically (`Error` before `Warning`, then `table`, `object`, `kind`, `detail`).
     pub findings: Vec<Finding>,
     /// Inspection stats for the attached `DEFAULT` partition of `{audit_schema}.changes`, when
-    /// one is attached and safe to probe (omitted when missing/detached or when any foreign
-    /// partition or unexpected Row-Level Security is detected on the history partition tree).
+    /// one is attached and safe to probe (omitted when missing/detached, when any foreign
+    /// partition exists on the history partition tree, or when Row-Level Security is active on
+    /// `{audit_schema}.changes` without unrestricted `SELECT` visibility for the verifying role).
     pub default_partition: Option<DefaultPartitionStatus>,
 }
 
@@ -182,6 +202,10 @@ pub struct VerifyOptions {
     pub audit_schema: String,
     /// Expected audited table trigger specifications.
     pub tables: Vec<TableTriggerSpec>,
+    /// Configured application PostgreSQL roles checked for Row-Level Security bypasses
+    /// (`SUPERUSER`, `BYPASSRLS`, or membership in `auditstream_owner`) when RLS is enabled on
+    /// `{audit_schema}.changes`.
+    pub app_roles: Vec<String>,
 }
 
 impl Default for VerifyOptions {
@@ -189,6 +213,7 @@ impl Default for VerifyOptions {
         Self {
             audit_schema: DEFAULT_SCHEMA.to_owned(),
             tables: Vec::new(),
+            app_roles: Vec::new(),
         }
     }
 }
@@ -199,7 +224,16 @@ impl VerifyOptions {
         Self {
             audit_schema: audit_schema.into(),
             tables,
+            app_roles: Vec::new(),
         }
+    }
+
+    /// Configures application PostgreSQL roles to inspect for Row-Level Security bypasses when
+    /// RLS is enabled on `{audit_schema}.changes`.
+    #[must_use]
+    pub fn with_app_roles(mut self, app_roles: Vec<String>) -> Self {
+        self.app_roles = app_roles;
+        self
     }
 }
 
@@ -371,13 +405,15 @@ async fn run_checks(
     let default_partition = if history_exists {
         let history_has_foreign =
             check_history_security(tx, &options.audit_schema, &mut findings).await?;
-        let history_has_rls =
-            check_history_tampering(tx, &options.audit_schema, &mut findings).await?;
+        let rls_hidden_by =
+            check_history_tampering(tx, &options.audit_schema, &options.app_roles, &mut findings)
+                .await?;
         check_history_indexes(tx, &options.audit_schema, &mut findings).await?;
         check_default_partition(
             tx,
             &options.audit_schema,
-            history_has_rls || history_has_foreign,
+            history_has_foreign,
+            rls_hidden_by.as_ref(),
             &mut findings,
         )
         .await?
@@ -611,9 +647,23 @@ struct HistoryTamperRow {
 struct HistoryRlsRow {
     schema_name: String,
     table_name: String,
+    is_parent: bool,
+    relowner: i64,
     relrowsecurity: bool,
     relforcerowsecurity: bool,
     policy_count: i64,
+}
+
+#[derive(Debug, Clone, FromRow)]
+#[allow(clippy::struct_excessive_bools)]
+struct AppRoleBypassRow {
+    rolname: String,
+    rolsuper: bool,
+    rolbypassrls: bool,
+    can_set_superuser: bool,
+    can_set_bypassrls: bool,
+    in_auditstream_owner: bool,
+    in_table_owner: bool,
 }
 
 #[derive(Debug, FromRow)]
@@ -1390,10 +1440,11 @@ async fn check_identity_sequences_security(
 async fn check_history_tampering(
     tx: &mut Transaction<'_, Postgres>,
     audit_schema: &str,
+    app_roles: &[String],
     findings: &mut Vec<Finding>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<Option<crate::rls::ExportRlsStatus>, sqlx::Error> {
     check_history_triggers_and_rules(tx, audit_schema, findings).await?;
-    check_history_rls(tx, audit_schema, findings).await
+    check_history_rls(tx, audit_schema, app_roles, findings).await
 }
 
 async fn check_history_triggers_and_rules(
@@ -1453,15 +1504,61 @@ async fn check_history_triggers_and_rules(
     Ok(())
 }
 
+/// Scans history-tree RLS metadata, emitting [`FindingKind::ForcedRls`] on parent/child relations
+/// with `FORCE ROW LEVEL SECURITY` and [`FindingKind::TamperedHistory`] on child partitions that
+/// carry explicit `pg_policy` entries. Bare non-forced child `ENABLE ROW LEVEL SECURITY` (with 0
+/// policies) is intentionally permitted as optional defense-in-depth against direct child queries.
+fn collect_history_rls_row_findings(
+    audit_schema: &str,
+    rows: &[HistoryRlsRow],
+    findings: &mut Vec<Finding>,
+) -> Option<i64> {
+    let mut parent_rls_owner = None;
+    for row in rows {
+        let fq_rel = format!("{}.{}", row.schema_name, row.table_name);
+        if row.relforcerowsecurity {
+            let label = if row.is_parent { "table" } else { "partition" };
+            findings.push(Finding {
+                kind: FindingKind::ForcedRls,
+                severity: Severity::Error,
+                table: Some(fq_rel.clone()),
+                object: fq_rel.clone(),
+                detail: format!(
+                    "FORCE ROW LEVEL SECURITY is enabled on history {label} `{fq_rel}` (breaks `{OWNER_ROLE}` trigger writes and partition maintenance)"
+                ),
+            });
+        }
+        if !row.is_parent && row.policy_count > 0 {
+            findings.push(Finding {
+                kind: FindingKind::TamperedHistory,
+                severity: Severity::Error,
+                table: Some(fq_rel.clone()),
+                object: fq_rel,
+                detail: format!(
+                    "unexpected Row-Level Security policy on history partition `{}.{}` ({} RLS policy/policies); attach RLS policies only to `{audit_schema}.changes`",
+                    row.schema_name, row.table_name, row.policy_count
+                ),
+            });
+        }
+        if row.is_parent && row.relrowsecurity {
+            parent_rls_owner = Some(row.relowner);
+        }
+    }
+    parent_rls_owner
+}
+
 async fn check_history_rls(
     tx: &mut Transaction<'_, Postgres>,
     audit_schema: &str,
+    app_roles: &[String],
     findings: &mut Vec<Finding>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<Option<crate::rls::ExportRlsStatus>, sqlx::Error> {
     let rows: Vec<HistoryRlsRow> = sqlx::query_as(with_history_tree!(
         "SELECT \
            cn.nspname AS schema_name, \
            c.relname AS table_name, \
+           (cn.nspname = $1 AND c.relname = 'changes') AS is_parent, \
+           c.relowner::bigint AS relowner, \
            c.relrowsecurity, \
            c.relforcerowsecurity, \
            (SELECT pg_catalog.count(*)::bigint FROM pg_catalog.pg_policy pol WHERE pol.polrelid = c.oid) AS policy_count \
@@ -1471,37 +1568,137 @@ async fn check_history_rls(
         WHERE c.relrowsecurity \
            OR c.relforcerowsecurity \
            OR EXISTS (SELECT 1 FROM pg_catalog.pg_policy pol WHERE pol.polrelid = c.oid) \
-        ORDER BY cn.nspname, c.relname"
+        ORDER BY is_parent DESC, cn.nspname, c.relname"
     ))
     .bind(audit_schema)
     .fetch_all(&mut **tx)
     .await?;
 
-    let has_rls = !rows.is_empty();
-    for row in rows {
-        let fq_rel = format!("{}.{}", row.schema_name, row.table_name);
-        let mut flags = Vec::new();
-        if row.relrowsecurity {
-            flags.push("ENABLE ROW LEVEL SECURITY".to_owned());
-        }
-        if row.relforcerowsecurity {
-            flags.push("FORCE ROW LEVEL SECURITY".to_owned());
-        }
-        if row.policy_count > 0 {
-            flags.push(format!("{} RLS policy/policies", row.policy_count));
-        }
+    let Some(table_owner_oid) = collect_history_rls_row_findings(audit_schema, &rows, findings)
+    else {
+        return Ok(None);
+    };
+
+    let inspection = crate::rls::inspect_parent_rls_on_conn(tx, audit_schema).await?;
+    let parent_fq = format!("{audit_schema}.changes");
+    if !inspection.has_any_permissive_select_policy {
         findings.push(Finding {
-            kind: FindingKind::TamperedHistory,
+            kind: FindingKind::RlsWithoutSelectPolicy,
             severity: Severity::Error,
-            table: Some(fq_rel.clone()),
-            object: fq_rel.clone(),
+            table: Some(parent_fq.clone()),
+            object: parent_fq.clone(),
             detail: format!(
-                "unexpected Row-Level Security on history table `{fq_rel}` ({})",
-                flags.join(", ")
+                "Row-Level Security is enabled on `{parent_fq}` with zero PERMISSIVE SELECT policies (non-owner reads silently return 0 rows)"
             ),
         });
     }
-    Ok(has_rls)
+
+    check_rls_bypassed_by_app_roles(tx, &parent_fq, table_owner_oid, app_roles, findings).await?;
+
+    Ok((!inspection.status.safe_for_catalog_probe()).then_some(inspection.status))
+}
+
+async fn check_rls_bypassed_by_app_roles(
+    tx: &mut Transaction<'_, Postgres>,
+    parent_fq: &str,
+    table_owner_oid: i64,
+    app_roles: &[String],
+    findings: &mut Vec<Finding>,
+) -> Result<(), sqlx::Error> {
+    let roles: Vec<&str> = app_roles
+        .iter()
+        .map(String::as_str)
+        .filter(|role| !role.is_empty())
+        .collect();
+    if roles.is_empty() {
+        return Ok(());
+    }
+
+    let server_version_num: i32 =
+        sqlx::query_scalar("SELECT pg_catalog.current_setting('server_version_num')::int")
+            .fetch_one(&mut **tx)
+            .await?;
+    // `SUPERUSER` and `BYPASSRLS` are never inherited in PostgreSQL; a role can only use them via
+    // `SET ROLE` (`'SET'` privilege on PG 16+, `'MEMBER'` on PG 15).
+    let set_role_priv = if server_version_num >= 160_000 {
+        "SET"
+    } else {
+        "MEMBER"
+    };
+
+    let rows: Vec<AppRoleBypassRow> = sqlx::query_as(
+        "SELECT \
+           r.rolname::text AS rolname, \
+           r.rolsuper, \
+           r.rolbypassrls, \
+           (NOT r.rolsuper AND EXISTS ( \
+             SELECT 1 FROM pg_catalog.pg_roles g \
+              WHERE g.oid <> r.oid \
+                AND g.rolsuper \
+                AND pg_catalog.pg_has_role(r.oid, g.oid, $4) \
+           )) AS can_set_superuser, \
+           (NOT r.rolsuper AND EXISTS ( \
+             SELECT 1 FROM pg_catalog.pg_roles g \
+              WHERE g.oid <> r.oid \
+                AND g.rolbypassrls \
+                AND pg_catalog.pg_has_role(r.oid, g.oid, $4) \
+           )) AS can_set_bypassrls, \
+           (NOT r.rolsuper AND COALESCE( \
+             (SELECT pg_catalog.pg_has_role(r.oid, o.oid, 'MEMBER') \
+                FROM pg_catalog.pg_roles o \
+               WHERE o.rolname = $2), \
+             false \
+           )) AS in_auditstream_owner, \
+           (NOT r.rolsuper AND pg_catalog.pg_has_role(r.oid, $3::pg_catalog.oid, 'MEMBER')) \
+             AS in_table_owner \
+         FROM pg_catalog.pg_roles r \
+        WHERE r.rolname = ANY($1) \
+        ORDER BY r.rolname ASC",
+    )
+    .bind(&roles)
+    .bind(OWNER_ROLE)
+    .bind(table_owner_oid)
+    .bind(set_role_priv)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    for row in rows {
+        let reasons = rls_bypass_reasons(&row);
+        if !reasons.is_empty() {
+            findings.push(Finding {
+                kind: FindingKind::RlsBypassedByAppRole,
+                severity: Severity::Warning,
+                table: Some(parent_fq.to_owned()),
+                object: row.rolname.clone(),
+                detail: format!(
+                    "configured app role `{}` bypasses Row-Level Security on `{parent_fq}` ({})",
+                    row.rolname,
+                    reasons.join(", ")
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn rls_bypass_reasons(row: &AppRoleBypassRow) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if row.rolsuper {
+        reasons.push("SUPERUSER");
+    } else if row.can_set_superuser {
+        reasons.push("member of SUPERUSER role");
+    }
+    if row.rolbypassrls {
+        reasons.push("BYPASSRLS");
+    } else if row.can_set_bypassrls {
+        reasons.push("member of BYPASSRLS role");
+    }
+    if row.in_auditstream_owner {
+        reasons.push("member of auditstream_owner");
+    } else if row.in_table_owner {
+        reasons.push("member of history table owner");
+    }
+    reasons
 }
 
 async fn check_history_indexes(
@@ -2095,7 +2292,8 @@ struct DefaultPartitionRow {
 async fn check_default_partition(
     tx: &mut Transaction<'_, Postgres>,
     audit_schema: &str,
-    skip_data_probe: bool,
+    history_has_foreign: bool,
+    rls_hidden_by: Option<&crate::rls::ExportRlsStatus>,
     findings: &mut Vec<Finding>,
 ) -> Result<Option<DefaultPartitionStatus>, sqlx::Error> {
     let attached: Option<AttachedDefaultPartitionRow> = sqlx::query_as(
@@ -2138,12 +2336,36 @@ async fn check_default_partition(
         });
     }
 
+    // When RLS is active on the parent `{audit_schema}.changes` table without exclusively
+    // unobstructed SELECT visibility, report explicitly and skip probing `changes_default` so
+    // filtered/hostile/sibling RLS policies are never evaluated and hidden rows are never
+    // misreported as count 0.
+    if let Some(rls_status) = rls_hidden_by {
+        let detail = if rls_status.allows_unfiltered_export() {
+            format!(
+                "Row-Level Security is active on `{audit_schema}.changes` for role `{}` and a non-trivial sibling PERMISSIVE SELECT policy (for example targeting PUBLIC) also applies alongside USING (true); skipping `{attached_object}` row-count probe to avoid evaluating arbitrary policy expressions",
+                rls_status.current_role
+            )
+        } else {
+            format!(
+                "Row-Level Security is active on `{audit_schema}.changes` for role `{}` without unrestricted SELECT visibility; `{attached_object}` row counts cannot be inspected reliably",
+                rls_status.current_role
+            )
+        };
+        findings.push(Finding {
+            kind: FindingKind::RlsHidesDefaultPartition,
+            severity: Severity::Warning,
+            table: Some(attached_object.clone()),
+            object: attached_object.clone(),
+            detail,
+        });
+        return Ok(None);
+    }
+
     // Non-regular child partitions (`relkind <> 'r'`) are already reported across the full
     // partition tree by `check_child_partitions_security`. Skip querying `{schema}.changes`
-    // whenever any foreign partition or unexpected Row-Level Security exists anywhere in the
-    // history tree (PostgreSQL plans every partition on `tableoid` predicates, so probing would
-    // invoke untrusted FDW hooks or RLS policies).
-    if skip_data_probe {
+    // whenever any foreign partition exists so untrusted FDW hooks are never invoked.
+    if history_has_foreign {
         return Ok(None);
     }
 
@@ -3336,6 +3558,52 @@ mod tests {
         assert_eq!(
             missing_excluded_columns(&excluded, &live),
             vec!["old_a", "old_b"]
+        );
+    }
+
+    #[test]
+    fn rls_bypass_reasons_and_verify_options_default_cover_all_branches() {
+        let default_opts = VerifyOptions::default();
+        assert_eq!(default_opts.audit_schema, DEFAULT_SCHEMA);
+        assert_eq!(default_opts.tables, Vec::new());
+        assert_eq!(default_opts.app_roles, Vec::<String>::new());
+
+        let safe = AppRoleBypassRow {
+            rolname: "app_user".to_owned(),
+            rolsuper: false,
+            rolbypassrls: false,
+            can_set_superuser: false,
+            can_set_bypassrls: false,
+            in_auditstream_owner: false,
+            in_table_owner: false,
+        };
+        assert_eq!(rls_bypass_reasons(&safe), Vec::<&str>::new());
+
+        let direct = AppRoleBypassRow {
+            rolsuper: true,
+            rolbypassrls: true,
+            in_auditstream_owner: true,
+            in_table_owner: true,
+            ..safe.clone()
+        };
+        assert_eq!(
+            rls_bypass_reasons(&direct),
+            vec!["SUPERUSER", "BYPASSRLS", "member of auditstream_owner"]
+        );
+
+        let indirect = AppRoleBypassRow {
+            can_set_superuser: true,
+            can_set_bypassrls: true,
+            in_table_owner: true,
+            ..safe
+        };
+        assert_eq!(
+            rls_bypass_reasons(&indirect),
+            vec![
+                "member of SUPERUSER role",
+                "member of BYPASSRLS role",
+                "member of history table owner"
+            ]
         );
     }
 }
