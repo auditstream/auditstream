@@ -2,7 +2,8 @@
 
 use std::path::PathBuf;
 
-use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use clap::parser::ValueSource;
+use clap::{ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
 use crate::commands;
 
@@ -42,6 +43,10 @@ pub(crate) struct Cli {
     #[arg(long, global = true, env = "AUDITSTREAM_SCHEMA", value_name = "SCHEMA")]
     pub(crate) schema: Option<String>,
 
+    /// Whether `schema` originated from the `AUDITSTREAM_SCHEMA` environment variable.
+    #[arg(skip)]
+    pub(crate) schema_from_env: bool,
+
     /// Increase log verbosity (`-v` info, `-vv` debug).
     #[arg(short, long, global = true, action = ArgAction::Count)]
     pub(crate) verbose: u8,
@@ -63,6 +68,17 @@ pub(crate) struct Cli {
     /// Subcommand to execute.
     #[command(subcommand)]
     pub(crate) command: Command,
+}
+
+impl Cli {
+    /// Parses CLI arguments and records whether `--schema` came from `AUDITSTREAM_SCHEMA`.
+    pub(crate) fn try_parse_with_sources() -> Result<Self, clap::Error> {
+        let matches = Self::command().try_get_matches()?;
+        let schema_from_env = matches.value_source("schema") == Some(ValueSource::EnvVariable);
+        let mut cli = Self::from_arg_matches(&matches)?;
+        cli.schema_from_env = schema_from_env;
+        Ok(cli)
+    }
 }
 
 /// Top-level CLI subcommands.

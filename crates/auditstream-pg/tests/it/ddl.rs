@@ -1354,3 +1354,362 @@ async fn pg16_group_admin_and_createrole_self_grant_preserve_memberships() {
         .await;
     let _ = admin.close().await;
 }
+
+#[tokio::test]
+async fn log_event_rejects_control_chars_whitespace_and_padded_dml_and_round_trips_through_reader()
+{
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let db = TestDb::new().await.expect("create TestDb");
+    let mut conn = PgConnection::connect(db.url()).await.expect("connect");
+
+    let mut stmts = ddl::generate(&DdlOptions::default());
+    stmts.extend(triggers::generate(&TriggerOptions::default()));
+    run_statements_tx(&mut conn, &stmts)
+        .await
+        .expect("install DDL and triggers");
+
+    // Every poison-pill action (whitespace-only, control chars, leading/trailing ASCII & Unicode
+    // whitespace, padded/cased reserved DML, overlong) MUST be rejected with SQLSTATE 22023.
+    let invalid_actions: &[(&str, &str)] = &[
+        ("empty", ""),
+        ("spaces only", "   "),
+        ("newline only", "\n"),
+        ("tab only", "\t"),
+        ("cr only", "\r"),
+        ("vt only", "\x0b"),
+        ("ff only", "\x0c"),
+        ("nbsp only", "\u{00A0}"),
+        ("ideographic space only", "\u{3000}"),
+        ("leading space", " invoice.exported"),
+        ("trailing space", "invoice.exported "),
+        ("leading and trailing space", " invoice.exported "),
+        ("leading nbsp", "\u{00A0}invoice.exported"),
+        ("trailing em space", "invoice.exported\u{2003}"),
+        ("trailing ideographic space", "invoice.exported\u{3000}"),
+        ("leading line separator", "\u{2028}invoice.exported"),
+        ("trailing paragraph separator", "invoice.exported\u{2029}"),
+        ("embedded newline", "invoice\nexported"),
+        ("embedded cr", "invoice\rexported"),
+        ("embedded tab", "invoice\texported"),
+        ("embedded vt", "invoice\x0bexported"),
+        ("embedded ff", "invoice\x0cexported"),
+        ("embedded soh", "invoice\x01exported"),
+        ("embedded us", "invoice\x1fexported"),
+        ("embedded del", "invoice\x7fexported"),
+        ("embedded nel", "invoice\u{0085}exported"),
+        ("embedded csi", "invoice\u{009B}exported"),
+        ("reserved INSERT", "INSERT"),
+        ("reserved lowercase insert", "insert"),
+        ("reserved mixed UpDaTe", "UpDaTe"),
+        ("reserved DELETE", "DELETE"),
+        ("reserved TRUNCATE", "TRUNCATE"),
+        ("tab-padded INSERT", "\tINSERT"),
+        ("newline-padded update", "\nupdate"),
+        ("nbsp-padded delete", "\u{00A0}delete"),
+        ("space-padded TRUNCATE", " TRUNCATE "),
+    ];
+
+    for (label, action) in invalid_actions {
+        let err = sqlx::query("SELECT auditstream.log_event($1, NULL, NULL)")
+            .bind(*action)
+            .execute(&mut conn)
+            .await
+            .expect_err(&format!("{label} ({action:?}) must be rejected"));
+        assert_eq!(
+            err.as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("22023"),
+            "{label}: expected SQLSTATE 22023, got {err}"
+        );
+    }
+
+    let overlong_65 = "é".repeat(65);
+    let overlong_err = sqlx::query("SELECT auditstream.log_event($1, NULL, NULL)")
+        .bind(&overlong_65)
+        .execute(&mut conn)
+        .await
+        .expect_err("65-char action must be rejected");
+    assert_eq!(
+        overlong_err
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("22023"),
+        "expected SQLSTATE 22023 for 65-char action, got {overlong_err}"
+    );
+
+    // Valid actions (including internal space and exact 64-char UTF-8) succeed and decode cleanly
+    // through `reader::lookup` without SourceError::Decode.
+    let valid_64 = "é".repeat(64);
+    for action in ["invoice.exported", "invoice exported", valid_64.as_str()] {
+        let _: String = sqlx::query_scalar(
+            "SELECT auditstream.log_event($1, '{\"id\":1}'::jsonb, '{\"ok\":true}'::jsonb)::text",
+        )
+        .bind(action)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap_or_else(|e| panic!("valid action {action:?} failed: {e}"));
+    }
+    conn.close().await.expect("close conn");
+
+    let events = auditstream_pg::reader::lookup(
+        db.pool(),
+        DEFAULT_SCHEMA,
+        &auditstream_pg::reader::HistoryQuery::default(),
+    )
+    .await
+    .expect("reader::lookup must decode every accepted log_event row cleanly");
+    assert_eq!(events.len(), 3);
+    let ops: Vec<&str> = events.iter().map(|ev| ev.op.as_str()).collect();
+    assert!(ops.contains(&"invoice.exported"));
+    assert!(ops.contains(&"invoice exported"));
+    assert!(ops.contains(&valid_64.as_str()));
+}
+
+#[tokio::test]
+async fn adversarial_dollar_quote_schema_names_install_and_execute_without_breakout() {
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let db = TestDb::new().await.expect("create TestDb");
+    let mut conn = PgConnection::connect(db.url()).await.expect("connect");
+
+    // Combines `\`, `$$`, `$do$`, `$fn$`, `'`, and `"` within PostgreSQL's 63-byte NAMEDATALEN;
+    // executing under `standard_conforming_strings = off` would break out of any `DO '...'` fallback.
+    let schema = r#"a\$$$do$$fn$'" ;DROP TABLE z;--"#;
+    assert!(schema.len() <= 63);
+
+    let mut stmts = ddl::generate(&DdlOptions::new(schema, vec![]));
+    stmts.extend(triggers::generate(&TriggerOptions::new(schema, vec![])));
+    for stmt in &stmts {
+        if stmt.starts_with("DO ") {
+            assert!(
+                stmt.starts_with("DO $"),
+                "DO block must use collision-free dollar-quoting, got: {stmt}"
+            );
+        }
+    }
+
+    // Install and idempotently re-apply under `standard_conforming_strings = off`.
+    for phase in ["install", "re-apply"] {
+        let mut tx = conn.begin().await.expect("begin tx");
+        tx.execute("SET LOCAL standard_conforming_strings = off")
+            .await
+            .expect("disable standard_conforming_strings");
+        run_statements(&mut tx, &stmts)
+            .await
+            .unwrap_or_else(|err| panic!("adversarial schema {phase} failed: {err}"));
+        tx.commit().await.expect("commit tx");
+    }
+
+    let schema_q = quote_ident(schema);
+    let event_id: String = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT {schema_q}.log_event('invoice.exported', '{{\"id\":7}}'::jsonb, NULL)::text"
+    )))
+    .fetch_one(&mut conn)
+    .await
+    .expect("log_event executes inside adversarial schema");
+    assert_ne!(event_id, "");
+
+    let recorded_op: String = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT op FROM {schema_q}.changes WHERE event_id::text = $1"
+    )))
+    .bind(&event_id)
+    .fetch_one(&mut conn)
+    .await
+    .expect("read back row from adversarial schema");
+    assert_eq!(recorded_op, "invoice.exported");
+    conn.close().await.expect("close conn");
+}
+
+#[tokio::test]
+async fn standard_conforming_strings_off_prevents_quote_literal_breakout_and_preserves_trigger_args()
+ {
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let db = TestDb::new().await.expect("create TestDb");
+    let mut conn = PgConnection::connect(db.url()).await.expect("connect");
+
+    let evil_table = r"t\'); CREATE TABLE public.scs_pwned (id int); --";
+    assert!(evil_table.len() <= 63);
+    let evil_role = format!(r"r\'_{}", db.database_name());
+    assert!(evil_role.len() <= 63);
+
+    conn.execute(AssertSqlSafe(format!(
+        "CREATE ROLE {} NOLOGIN; \
+         CREATE TABLE public.{} (\"col\"\"id\" int PRIMARY KEY, \"secret\\new\" text, note text) \
+         PARTITION BY RANGE (\"col\"\"id\"); \
+         CREATE TABLE public.scs_child PARTITION OF public.{} FOR VALUES FROM (0) TO (100);",
+        quote_ident(&evil_role),
+        quote_ident(evil_table),
+        quote_ident(evil_table),
+    )))
+    .await
+    .expect("create adversarial role and partitioned table");
+
+    let spec = auditstream_pg::triggers::TableTriggerSpec::new(
+        "public",
+        evil_table,
+        vec![r#"col"id"#.to_owned()],
+        vec![r"secret\new".to_owned()],
+    )
+    .partitioned();
+    let mut stmts = ddl::generate(&DdlOptions::new(DEFAULT_SCHEMA, vec![evil_role.clone()]));
+    stmts.extend(triggers::generate(&TriggerOptions::new(
+        DEFAULT_SCHEMA,
+        vec![spec],
+    )));
+
+    // Apply ALL generated statements inside a transaction with `standard_conforming_strings = off`.
+    let mut tx = conn.begin().await.expect("begin tx");
+    tx.execute("SET LOCAL standard_conforming_strings = off")
+        .await
+        .expect("disable standard_conforming_strings");
+    run_statements(&mut tx, &stmts)
+        .await
+        .expect("install DDL & triggers safely under standard_conforming_strings = off");
+    tx.commit().await.expect("commit tx");
+
+    let pwned_exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.scs_pwned') IS NOT NULL")
+            .fetch_one(&mut conn)
+            .await
+            .expect("check pwned table absent");
+    assert!(!pwned_exists, "injected table must not exist");
+
+    // Insert into the partitioned table: PK `col"id` must parse cleanly and `secret\new` must stay excluded.
+    conn.execute(AssertSqlSafe(format!(
+        "INSERT INTO public.{} (\"col\"\"id\", \"secret\\new\", note) VALUES (1, 'topsecret', 'ok')",
+        quote_ident(evil_table)
+    )))
+    .await
+    .expect("insert captured cleanly");
+
+    let (record_id, after): (String, String) = sqlx::query_as(
+        "SELECT record_id::text, after::text FROM auditstream.changes WHERE op = 'INSERT' LIMIT 1",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .expect("read captured row");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&record_id).expect("valid record_id json"),
+        serde_json::json!({"col\"id": 1})
+    );
+    let after_val: serde_json::Value = serde_json::from_str(&after).expect("valid after json");
+    assert!(
+        after_val.get(r"secret\new").is_none(),
+        "excluded column with backslash must be stripped, got: {after}"
+    );
+    assert_eq!(after_val.get("note").and_then(|v| v.as_str()), Some("ok"));
+
+    conn.close().await.expect("close conn");
+    let admin_url = db.admin_url().to_owned();
+    drop(db);
+    let mut admin = PgConnection::connect(&admin_url)
+        .await
+        .expect("admin cleanup");
+    admin
+        .execute(AssertSqlSafe(format!(
+            "DROP ROLE IF EXISTS {}",
+            quote_ident(&evil_role)
+        )))
+        .await
+        .expect("drop evil role");
+    admin.close().await.expect("close admin");
+}
+
+#[tokio::test]
+async fn log_event_handles_nondeterministic_icu_collations_deterministically() {
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let db = TestDb::new().await.expect("create TestDb");
+    let mut conn = PgConnection::connect(db.url()).await.expect("connect");
+
+    let mut stmts = ddl::generate(&DdlOptions::default());
+    stmts.extend(triggers::generate(&TriggerOptions::default()));
+    run_statements_tx(&mut conn, &stmts)
+        .await
+        .expect("install DDL and triggers");
+
+    // Create nondeterministic ICU collations (case-insensitive, accent-insensitive, and ignorable-space).
+    if let Err(err) = conn
+        .execute(
+            "CREATE COLLATION public.nd_ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false); \
+             CREATE COLLATION public.nd_l1 (provider = icu, locale = 'und-u-ks-level1', deterministic = false); \
+             CREATE COLLATION public.nd_ignorable (provider = icu, locale = 'und-u-ka-shifted', deterministic = false);",
+        )
+        .await
+    {
+        let code = err
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code);
+        if code.as_deref() == Some("0A000") && std::env::var_os("AUDITSTREAM_TEST_PG").is_none() {
+            // Skip only on local non-ICU PostgreSQL builds; never silently skip in CI.
+            return;
+        }
+        panic!("CREATE COLLATION for ICU test failed: {err}");
+    }
+
+    // Confirm the created ICU collations genuinely collapse accents and spaces as expected.
+    let (accent_eq, space_eq): (bool, bool) = sqlx::query_as(
+        "SELECT ('ïnsert' = 'INSERT' COLLATE public.nd_l1), \
+                (' invoice.exported ' = 'invoice.exported' COLLATE public.nd_ignorable)",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .expect("verify nondeterministic ICU collation semantics");
+    assert!(accent_eq, "nd_l1 must treat 'ïnsert' as equal to 'INSERT'");
+    assert!(
+        space_eq,
+        "nd_ignorable must treat ' invoice.exported ' as equal to 'invoice.exported'"
+    );
+
+    // Valid actions carrying nondeterministic collations MUST succeed (never fail with 0A000).
+    let _: String = sqlx::query_scalar(
+        "SELECT auditstream.log_event('invoice.exported' COLLATE public.nd_ci, NULL, NULL)::text",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .expect("valid action with nondeterministic CI collation must succeed");
+
+    // Accent-insensitive collation must NOT falsely reject accented non-DML action `'ïnsert'`.
+    let _: String = sqlx::query_scalar(
+        "SELECT auditstream.log_event('ïnsert' COLLATE public.nd_l1, NULL, NULL)::text",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .expect(
+        "accented non-DML action must not be falsely rejected under accent-insensitive collation",
+    );
+
+    // Ignorable-space collation must NOT bypass leading/trailing whitespace rejection.
+    let padded_err = sqlx::query(
+        "SELECT auditstream.log_event(' invoice.exported ' COLLATE public.nd_ignorable, NULL, NULL)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect_err("whitespace-padded action must still be rejected under ignorable-space collation");
+    assert_eq!(
+        padded_err
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("22023")
+    );
+
+    // Control characters and reserved DML are still rejected under nondeterministic collations.
+    for sql in [
+        "SELECT auditstream.log_event(E'invoice\\nexported' COLLATE public.nd_ci, NULL, NULL)",
+        "SELECT auditstream.log_event('insert' COLLATE public.nd_ci, NULL, NULL)",
+    ] {
+        let err = sqlx::query(sql)
+            .execute(&mut conn)
+            .await
+            .expect_err(&format!("{sql} must fail with 22023"));
+        assert_eq!(
+            err.as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("22023")
+        );
+    }
+
+    conn.close().await.expect("close conn");
+}

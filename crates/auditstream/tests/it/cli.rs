@@ -122,6 +122,25 @@ fn config_precedence_layers_end_to_end() {
         .code(2)
         .stderr(predicate::str::contains("flag-host"))
         .stderr(predicate::str::contains("from_flag"));
+
+    // 5. Empty AUDITSTREAM_SCHEMA env var falls through to auditstream.toml, while explicit
+    //    `--schema ""` fails validation with exit code 2.
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .env("AUDITSTREAM_SCHEMA", "")
+        .args(SHOW_CONFIG)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("from_file"));
+
+    auditstream_cmd()
+        .current_dir(dir.path())
+        .args(["--schema", "", "status"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "audit schema name must not be empty",
+        ));
 }
 
 #[test]

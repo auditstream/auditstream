@@ -367,7 +367,24 @@ fn validate_and_compile_reject_malformed_table_and_action_targets() {
         );
     }
 
-    for bad_action in ["", "   ", " invoice.sent"] {
+    let overlong_action = "a".repeat(65);
+    for bad_action in [
+        "",
+        "   ",
+        " invoice.sent",
+        "invoice.sent ",
+        "\u{00A0}invoice.sent",
+        "invoice\nsent",
+        "invoice\tsent",
+        "invoice\x7fsent",
+        "invoice\u{0085}sent",
+        "INSERT",
+        "insert",
+        "Update",
+        "DELETE",
+        "TRUNCATE",
+        overlong_action.as_str(),
+    ] {
         let bad = Redaction::new(vec![RedactionRule::for_app_action(
             bad_action,
             ["ssn"],

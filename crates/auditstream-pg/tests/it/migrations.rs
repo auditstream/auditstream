@@ -363,6 +363,7 @@ async fn assert_v0_1_0_verify_drift(pool: &sqlx::PgPool) {
     for object in [
         "auditstream.resolve_actor()",
         "auditstream.capture()",
+        "auditstream.log_event(text, jsonb, jsonb)",
         "public.invoice.auditstream_update",
     ] {
         assert!(
@@ -1130,6 +1131,408 @@ fn rejects_primary_key_column_in_excluded_columns() {
         err2.to_string().contains("primary key"),
         "unexpected error: {err2}"
     );
+}
+
+#[test]
+fn drizzle_journal_rejects_path_traversal_and_invalid_tags() {
+    let outside_dir = ScratchDir::new("drizzle_outside_secret");
+    fs::write(
+        outside_dir.path().join("outside.sql"),
+        "-- auditstream:manifest {\"app_roles\":[],\"schema\":\"auditstream\",\"schema_version\":1,\"tables\":[]}\n",
+    )
+    .expect("seed outside sql");
+
+    let bad_tags = [
+        "../outside",
+        "..\\outside",
+        "..",
+        ".",
+        "",
+        "sub/0000_init",
+        "sub\\0000_init",
+        "/etc/passwd",
+        "C:evil",
+        "0000..evil",
+        "0000\nevil",
+        "0000\0evil",
+        "CON",
+        "con ",
+        "PRN",
+        "AUX",
+        "nul.bak",
+        "COM1",
+        "LPT9",
+    ];
+
+    for (idx, tag) in bad_tags.iter().enumerate() {
+        // Place each migration dir directly inside `outside_dir` so `"../outside"` genuinely
+        // resolves to `outside_dir/outside.sql` if traversal were ever allowed.
+        let mig_dir = outside_dir.path().join(format!("mig_{idx}"));
+        let meta = mig_dir.join("meta");
+        fs::create_dir_all(&meta).expect("create meta");
+        let journal = serde_json::json!({
+            "version": "7",
+            "dialect": "postgresql",
+            "entries": [
+                { "idx": 0, "version": "7", "when": 1_763_900_000_000_i64, "tag": tag, "breakpoints": true },
+                { "idx": 1, "version": "7", "when": 1_763_900_000_001_i64, "tag": "0001_valid", "breakpoints": true }
+            ]
+        });
+        fs::write(
+            meta.join("_journal.json"),
+            serde_json::to_string_pretty(&journal).expect("serialize journal"),
+        )
+        .expect("write journal");
+
+        let opts = MigrationOptions::new(
+            MigrationFormat::Drizzle,
+            &mig_dir,
+            fixed_time(),
+            DdlOptions::default(),
+            fixture_tables(),
+        )
+        .with_drizzle_layout(DrizzleLayout::V045);
+
+        let prev_err = migrations::preview(&opts)
+            .expect_err(&format!("preview must reject Drizzle tag {tag:?}"));
+        assert!(
+            prev_err.to_string().contains("invalid Drizzle journal tag"),
+            "unexpected preview error for {tag:?}: {prev_err}"
+        );
+        let write_err =
+            migrations::write(&opts).expect_err(&format!("write must reject Drizzle tag {tag:?}"));
+        assert!(
+            write_err
+                .to_string()
+                .contains("invalid Drizzle journal tag"),
+            "unexpected write error for {tag:?}: {write_err}"
+        );
+    }
+}
+
+#[test]
+fn drizzle_journal_rejects_malformed_entries_and_avoids_overwriting_existing_files() {
+    for (label, journal_json, expected_substr) in [
+        (
+            "non-object entry",
+            r#"{"version":"7","dialect":"postgresql","entries":[null]}"#,
+            "non-object entry",
+        ),
+        (
+            "missing tag",
+            r#"{"version":"7","dialect":"postgresql","entries":[{"idx":0,"when":1}]}"#,
+            "missing a string `tag`",
+        ),
+        (
+            "non-string tag",
+            r#"{"version":"7","dialect":"postgresql","entries":[{"idx":0,"tag":42}]}"#,
+            "missing a string `tag`",
+        ),
+        (
+            "idx u64::MAX overflow",
+            r#"{"version":"7","dialect":"postgresql","entries":[{"idx":18446744073709551615,"when":1,"tag":"0000_init"}]}"#,
+            "idx overflow",
+        ),
+        (
+            "idx u64::MAX + 1 invalid",
+            r#"{"version":"7","dialect":"postgresql","entries":[{"idx":18446744073709551616,"when":1,"tag":"0000_init"}]}"#,
+            "invalid `idx`",
+        ),
+        (
+            "idx negative invalid",
+            r#"{"version":"7","dialect":"postgresql","entries":[{"idx":-1,"when":1,"tag":"0000_init"}]}"#,
+            "invalid `idx`",
+        ),
+        (
+            "when i64::MAX overflow",
+            r#"{"version":"7","dialect":"postgresql","entries":[{"idx":0,"when":9223372036854775807,"tag":"0000_init"}]}"#,
+            "when overflow",
+        ),
+        (
+            "when i64::MAX + 1 invalid",
+            r#"{"version":"7","dialect":"postgresql","entries":[{"idx":0,"when":9223372036854775808,"tag":"0000_init"}]}"#,
+            "invalid `when`",
+        ),
+    ] {
+        let dir = ScratchDir::new(&format!(
+            "drizzle_malformed_{}",
+            label.replace([' ', ':', '+'], "_")
+        ));
+        let meta = dir.path().join("meta");
+        fs::create_dir_all(&meta).expect("create meta");
+        fs::write(meta.join("_journal.json"), journal_json).expect("write malformed journal");
+        let opts = MigrationOptions::new(
+            MigrationFormat::Drizzle,
+            dir.path(),
+            fixed_time(),
+            DdlOptions::default(),
+            fixture_tables(),
+        )
+        .with_drizzle_layout(DrizzleLayout::V045);
+        let err = migrations::write(&opts).expect_err(&format!("{label} must fail on write"));
+        assert!(
+            err.to_string().contains(expected_substr),
+            "{label}: expected {expected_substr:?} in {err}"
+        );
+    }
+
+    // Existing `{next_idx:04}_auditstream.sql` on disk must never be silently overwritten.
+    let collision_dir = ScratchDir::new("drizzle_no_overwrite");
+    let meta = collision_dir.path().join("meta");
+    fs::create_dir_all(&meta).expect("create meta");
+    fs::write(
+        meta.join("_journal.json"),
+        r#"{"version":"7","dialect":"postgresql","entries":[{"idx":0,"when":1,"tag":"0000_init"}]}"#,
+    )
+    .expect("write journal");
+    let pre_existing = collision_dir.path().join("0001_auditstream.sql");
+    fs::write(&pre_existing, "-- hand-authored sql\n").expect("seed pre-existing sql");
+    let opts = MigrationOptions::new(
+        MigrationFormat::Drizzle,
+        collision_dir.path(),
+        fixed_time(),
+        DdlOptions::default(),
+        fixture_tables(),
+    )
+    .with_drizzle_layout(DrizzleLayout::V045);
+    let WriteOutcome::Written { files, .. } =
+        migrations::write(&opts).expect("write avoids collision")
+    else {
+        panic!("expected Written");
+    };
+    assert!(
+        files[0].ends_with("0002_auditstream.sql"),
+        "expected next free index 0002, got {:?}",
+        files[0]
+    );
+    assert_eq!(
+        fs::read_to_string(&pre_existing).expect("pre-existing untouched"),
+        "-- hand-authored sql\n"
+    );
+}
+
+#[test]
+fn drizzle_rejects_statement_breakpoint_inside_identifiers() {
+    let bp_dir = ScratchDir::new("drizzle_breakpoint_injection");
+    let evil_ident = "--> statement-breakpointDROP TABLE u;--> statement-breakpoint--";
+    let bp_opts = MigrationOptions::new(
+        MigrationFormat::Drizzle,
+        bp_dir.path(),
+        fixed_time(),
+        DdlOptions::new(DEFAULT_SCHEMA, vec![evil_ident.to_owned()]),
+        fixture_tables(),
+    );
+    assert!(
+        migrations::preview(&bp_opts)
+            .expect_err("drizzle preview must reject statement-breakpoint in identifiers")
+            .to_string()
+            .contains("statement-breakpoint")
+    );
+    assert!(
+        migrations::write(&bp_opts)
+            .expect_err("drizzle write must reject statement-breakpoint in identifiers")
+            .to_string()
+            .contains("statement-breakpoint")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn migrations_refuse_to_follow_symlinks_across_drizzle_sql_and_prisma() {
+    use std::os::unix::fs::symlink;
+
+    let make_opts = |format, dir: &Path| {
+        MigrationOptions::new(
+            format,
+            dir,
+            fixed_time(),
+            DdlOptions::default(),
+            fixture_tables(),
+        )
+    };
+    let outside = ScratchDir::new("mig_symlink_outside");
+    let outside_sql = outside.path().join("outside.sql");
+    fs::write(
+        &outside_sql,
+        "-- auditstream:manifest {\"app_roles\":[],\"schema\":\"auditstream\",\"schema_version\":1,\"tables\":[{\"excluded_columns\":[],\"is_partitioned\":false,\"primary_key\":[\"id\"],\"schema\":\"public\",\"table\":\"victim\"}]}\n",
+    )
+    .expect("write outside sql");
+
+    // 1. Drizzle 0.45: symlinked tag SQL file and dangling journal symlink are rejected.
+    let drizzle_dir = ScratchDir::new("mig_symlink_drizzle");
+    fs::create_dir_all(drizzle_dir.path().join("meta")).expect("create meta");
+    fs::write(
+        drizzle_dir.path().join("meta/_journal.json"),
+        r#"{"version":"7","dialect":"postgresql","entries":[{"idx":0,"when":1,"tag":"0000_link"}]}"#,
+    )
+    .expect("write journal");
+    symlink(&outside_sql, drizzle_dir.path().join("0000_link.sql")).expect("symlink drizzle sql");
+    let drizzle_opts = make_opts(MigrationFormat::Drizzle, drizzle_dir.path())
+        .with_drizzle_layout(DrizzleLayout::V045);
+    assert!(
+        migrations::preview(&drizzle_opts)
+            .unwrap_err()
+            .to_string()
+            .contains("symlink")
+    );
+    assert!(
+        migrations::write(&drizzle_opts)
+            .unwrap_err()
+            .to_string()
+            .contains("symlink")
+    );
+
+    let journal_dir = ScratchDir::new("mig_symlink_drizzle_journal");
+    fs::create_dir_all(journal_dir.path().join("meta")).expect("create meta");
+    let dangling_journal = outside.path().join("should_not_create_journal.json");
+    symlink(
+        &dangling_journal,
+        journal_dir.path().join("meta/_journal.json"),
+    )
+    .expect("symlink journal");
+    let journal_opts = make_opts(MigrationFormat::Drizzle, journal_dir.path());
+    assert!(
+        migrations::write(&journal_opts)
+            .unwrap_err()
+            .to_string()
+            .contains("symlink")
+    );
+    assert!(!dangling_journal.exists());
+
+    // 2. Plain SQL: dangling symlink at timestamped filename is rejected (not followed).
+    let sql_dir = ScratchDir::new("mig_symlink_sql");
+    let dangling_target = outside.path().join("should_not_be_created.sql");
+    symlink(
+        &dangling_target,
+        sql_dir.path().join("20261124123000_auditstream.sql"),
+    )
+    .expect("symlink sql file");
+    let sql_opts = make_opts(MigrationFormat::Sql, sql_dir.path());
+    assert!(
+        migrations::write(&sql_opts)
+            .unwrap_err()
+            .to_string()
+            .contains("symlink")
+    );
+    assert!(!dangling_target.exists());
+
+    // 3. Prisma / folder layout: symlinked migration directory is rejected.
+    let prisma_dir = ScratchDir::new("mig_symlink_prisma");
+    let outside_folder = outside.path().join("fake_prisma_mig");
+    fs::create_dir_all(&outside_folder).expect("create outside folder");
+    fs::copy(&outside_sql, outside_folder.join("migration.sql")).expect("copy migration.sql");
+    symlink(
+        &outside_folder,
+        prisma_dir.path().join("20261124120000_linked"),
+    )
+    .expect("symlink prisma folder");
+    let prisma_opts = make_opts(MigrationFormat::Prisma, prisma_dir.path());
+    assert!(
+        migrations::preview(&prisma_opts)
+            .unwrap_err()
+            .to_string()
+            .contains("symlink")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn migrations_refuse_symlinked_drizzle_meta_dir_and_prisma_migration_sql() {
+    use std::os::unix::fs::symlink;
+
+    let outside = ScratchDir::new("mig_symlink_nested_outside");
+    let outside_meta = outside.path().join("outside_meta");
+    fs::create_dir_all(&outside_meta).expect("create outside meta");
+    fs::write(
+        outside_meta.join("_journal.json"),
+        r#"{"version":"7","dialect":"postgresql","entries":[]}"#,
+    )
+    .expect("write outside journal");
+    let outside_sql = outside.path().join("outside.sql");
+    fs::write(
+        &outside_sql,
+        "-- auditstream:manifest {\"app_roles\":[],\"schema\":\"auditstream\",\"schema_version\":1,\"tables\":[]}\n",
+    )
+    .expect("write outside sql");
+
+    // Symlinked `meta` directory must auto-detect V045 and fail via `reject_symlink(&meta_dir)`.
+    let meta_link_dir = ScratchDir::new("mig_symlink_meta_dir");
+    symlink(&outside_meta, meta_link_dir.path().join("meta")).expect("symlink meta dir");
+    let meta_opts = MigrationOptions::new(
+        MigrationFormat::Drizzle,
+        meta_link_dir.path(),
+        fixed_time(),
+        DdlOptions::default(),
+        fixture_tables(),
+    );
+    assert!(
+        migrations::preview(&meta_opts)
+            .unwrap_err()
+            .to_string()
+            .contains("symlink")
+    );
+    assert!(
+        migrations::write(&meta_opts)
+            .unwrap_err()
+            .to_string()
+            .contains("symlink")
+    );
+
+    // Symlinked `migration.sql` inside a real Prisma folder must fail via `reject_symlink(&migration_sql)`.
+    let prisma_dir = ScratchDir::new("mig_symlink_prisma_sql");
+    let real_folder = prisma_dir.path().join("20261124120000_real");
+    fs::create_dir_all(&real_folder).expect("create real folder");
+    symlink(&outside_sql, real_folder.join("migration.sql")).expect("symlink migration.sql");
+    let prisma_opts = MigrationOptions::new(
+        MigrationFormat::Prisma,
+        prisma_dir.path(),
+        fixed_time(),
+        DdlOptions::default(),
+        fixture_tables(),
+    );
+    assert!(
+        migrations::preview(&prisma_opts)
+            .unwrap_err()
+            .to_string()
+            .contains("symlink")
+    );
+}
+
+#[test]
+fn migrations_and_install_helpers_reject_invalid_audit_schema_names() {
+    let dir = ScratchDir::new("bad_schema");
+    let overlong = "a".repeat(64);
+    for bad in [
+        "",
+        "audit$$stream",
+        "audit$fn$stream",
+        "audit\"stream",
+        "audit; DROP TABLE x;--",
+        "pg_audit",
+        "information_schema",
+        "INFORMATION_SCHEMA",
+        overlong.as_str(),
+    ] {
+        let ddl = DdlOptions::new(bad, vec![]);
+        assert!(
+            migrations::install_statements(&ddl, &[]).is_err(),
+            "install_statements must reject {bad:?}"
+        );
+        assert!(
+            migrations::render_install_sql(&ddl, &[]).is_err(),
+            "render_install_sql must reject {bad:?}"
+        );
+        let opts =
+            MigrationOptions::new(MigrationFormat::Sql, dir.path(), fixed_time(), ddl, vec![]);
+        assert!(
+            migrations::preview(&opts).is_err(),
+            "preview must reject {bad:?}"
+        );
+        assert!(
+            migrations::write(&opts).is_err(),
+            "write must reject {bad:?}"
+        );
+    }
 }
 
 #[tokio::test]

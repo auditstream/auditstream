@@ -61,8 +61,10 @@ impl Op {
     ///
     /// Returns [`CoreError::NullByteInField`] if `action` contains a NUL character (`\0`),
     /// [`CoreError::EmptyAction`] if `action` is blank, [`CoreError::ActionTooLong`] if it
-    /// exceeds 64 Unicode scalar values, or [`CoreError::ReservedAction`] if it collides
-    /// (case-insensitively) with `INSERT`, `UPDATE`, `DELETE`, or `TRUNCATE`.
+    /// exceeds 64 Unicode scalar values, [`CoreError::ReservedAction`] if it collides
+    /// (case-insensitively) with `INSERT`, `UPDATE`, `DELETE`, or `TRUNCATE`, or
+    /// [`CoreError::InvalidAction`] if it contains control characters or leading/trailing
+    /// whitespace.
     pub fn app(action: impl Into<String>) -> Result<Self, CoreError> {
         let action = action.into();
         if action.contains('\0') {
@@ -83,6 +85,18 @@ impl Op {
             "INSERT" | "UPDATE" | "DELETE" | "TRUNCATE"
         ) {
             return Err(CoreError::ReservedAction { action });
+        }
+        if action.chars().any(char::is_control) {
+            return Err(CoreError::InvalidAction {
+                action,
+                reason: "must not contain control characters",
+            });
+        }
+        if action != action.trim() {
+            return Err(CoreError::InvalidAction {
+                action,
+                reason: "must not have leading or trailing whitespace",
+            });
         }
         Ok(Self::App(action))
     }

@@ -86,7 +86,7 @@ auditstream.log_event(action text, target jsonb DEFAULT NULL, data jsonb DEFAULT
 Requirements:
 
 - **Validation:**
-  - `action` MUST be non-NULL, MUST have trimmed length between **1 and 64 characters** inclusive, MUST have total length at most **64 characters**, and `upper(btrim(action))` MUST NOT be `'INSERT'`, `'UPDATE'`, `'DELETE'`, or `'TRUNCATE'`.
+  - `action` MUST be non-NULL, MUST have length between **1 and 64 characters** inclusive, MUST NOT contain control characters (Unicode category `Cc`: `U+0000..U+001F`, `U+007F`, `U+0080..U+009F`), MUST NOT have leading or trailing ASCII or Unicode whitespace (Unicode `White_Space`), and MUST NOT match `'INSERT'`, `'UPDATE'`, `'DELETE'`, or `'TRUNCATE'` ASCII case-insensitively.
   - `target`, when non-NULL, MUST be a JSON object (`jsonb_typeof(target) = 'object'`).
   - `data`, when non-NULL, MUST be a JSON object (`jsonb_typeof(data) = 'object'`).
   - Any invalid parameter MUST raise an exception (`22023` / `invalid_parameter_value`).
@@ -540,7 +540,8 @@ BEGIN
     IF pg_catalog.jsonb_exists(claims, 'sub')
        AND pg_catalog.jsonb_typeof(claims->'sub') IS DISTINCT FROM 'null' THEN
       IF pg_catalog.jsonb_typeof(claims->'sub') IS DISTINCT FROM 'string'
-         OR pg_catalog.length(claims->>'sub') = 0 THEN
+         OR pg_catalog.length(claims->>'sub') = 0
+         OR 21 + pg_catalog.octet_length((claims->'sub')::text) > 512 THEN
         actor := NULL; context := NULL; actor_source := 'invalid'; RETURN;
       END IF;
       actor := pg_catalog.jsonb_build_object('type', 'user', 'id', claims->>'sub');
@@ -571,9 +572,18 @@ DECLARE
   v_event_id uuid;
 BEGIN
   IF action IS NULL
-     OR pg_catalog.char_length(pg_catalog.btrim(action)) < 1
+     OR pg_catalog.char_length(action) < 1
      OR pg_catalog.char_length(action) > 64
-     OR pg_catalog.upper(pg_catalog.btrim(action)) IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE') THEN
+     OR pg_catalog.regexp_like(action COLLATE pg_catalog."C", E'[\\x01-\\x1f\\x7f\\u0080-\\u009f]')
+     OR pg_catalog.btrim(
+          action,
+          E' \t\n\r\f\x0b\u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000'
+        ) COLLATE pg_catalog."C" <> action COLLATE pg_catalog."C"
+     OR pg_catalog.translate(
+          action,
+          'abcdefghijklmnopqrstuvwxyz',
+          'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        ) COLLATE pg_catalog."C" IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE') THEN
     RAISE EXCEPTION 'auditstream.log_event: invalid action %', action
       USING ERRCODE = '22023';
   END IF;

@@ -7,7 +7,7 @@ pub mod set_config;
 
 use serde_json::{Map, Value};
 
-use crate::ActorSource;
+use crate::{Actor, ActorSource, ActorType, validate_actor_payload};
 
 pub use crate::transport::comment::{
     DecodedActor, MAX_ENCODED_COMMENT_CHARS, decode, encode, encode_with_context, tag,
@@ -101,6 +101,14 @@ pub fn resolve_precedence(
         match claims.get("sub") {
             None | Some(Value::Null) => {}
             Some(Value::String(sub)) if !sub.is_empty() => {
+                let candidate = Actor::new(ActorType::User, sub.clone());
+                if validate_actor_payload(&candidate, None).is_err() {
+                    return ResolvedActor {
+                        actor: None,
+                        context: None,
+                        actor_source: Some(ActorSource::Invalid),
+                    };
+                }
                 let mut actor = Map::new();
                 actor.insert("type".to_owned(), Value::String("user".to_owned()));
                 actor.insert("id".to_owned(), Value::String(sub.clone()));

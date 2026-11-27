@@ -96,9 +96,9 @@ Database readers MUST resolve the actor in the following strict precedence order
 | 1 (malformed) | `set_config` | `nullif(current_setting('auditstream.actor', true), '')` is non-NULL and malformed | `NULL` | `'invalid'` (MUST NOT fall through) |
 | 2 | `comment` | Trailing comment in `right(current_query(), 4096)` has key `auditstream` and valid payload | Decoded JSON object | `'comment'` |
 | 2 (malformed) | `comment` | Trailing comment in `right(current_query(), 4096)` has key `auditstream` and malformed payload | `NULL` | `'invalid'` (MUST NOT fall through) |
-| 3 | `jwt` | `nullif(current_setting('request.jwt.claims', true), '')` is a valid JSON object with non-empty string `sub` | `{"type":"user","id":"<sub>"}` | `'jwt'` |
+| 3 | `jwt` | `nullif(current_setting('request.jwt.claims', true), '')` is a valid JSON object with non-empty string `sub` whose resulting compact JSON actor `{"type":"user","id":"<sub>"}` fits within 512 UTF-8 bytes | `{"type":"user","id":"<sub>"}` | `'jwt'` |
 | 3 (absent `sub`) | `jwt` | `nullif(current_setting('request.jwt.claims', true), '')` is a valid JSON object with no `sub` key (or `sub: null`) | `NULL` | `NULL` |
-| 3 (malformed) | `jwt` | `nullif(current_setting('request.jwt.claims', true), '')` is invalid JSON, contains NUL (`U+0000`), is a non-object JSON value, or has a non-null `sub` that is not a non-empty string | `NULL` | `'invalid'` |
+| 3 (malformed) | `jwt` | `nullif(current_setting('request.jwt.claims', true), '')` is invalid JSON, contains NUL (`U+0000`), is a non-object JSON value, or has a non-null `sub` that is not a non-empty string or produces a compact JSON actor exceeding 512 UTF-8 bytes | `NULL` | `'invalid'` |
 | 4 | none | None of the above produced an actor | `NULL` | `NULL` |
 
 In all cases — including when `actor` is `NULL` — the trigger MUST still write the history row with `db_user` set to `session_user`.
@@ -127,7 +127,7 @@ To avoid scanning arbitrarily large SQL statements and to work within PostgreSQL
 | Unpadded base64url encoded value (`ceil(512 * 4 / 3)`) | **683 characters** |
 
 - **Encoders** MUST reject any payload exceeding 512 UTF-8 bytes (or 683 unpadded base64url characters) with an error and MUST NOT truncate or send it.
-- **Database readers** MUST check the length outside the regex (because PostgreSQL caps regex repetition counts at 255) and treat any `set_config` value over 512 UTF-8 bytes or any `auditstream` comment value over 683 characters (or decoding to over 512 UTF-8 bytes) as malformed (`actor = NULL`, `actor_source = 'invalid'`).
+- **Database readers** MUST check the length outside the regex (because PostgreSQL caps regex repetition counts at 255) and treat any `set_config` value over 512 UTF-8 bytes, any `auditstream` comment value over 683 characters (or decoding to over 512 UTF-8 bytes), or any `request.jwt.claims` `sub` whose resulting compact JSON actor `{"type":"user","id":"<sub>"}` exceeds 512 UTF-8 bytes as malformed (`actor = NULL`, `actor_source = 'invalid'`).
 
 ## Malformed inputs and validation parity
 
@@ -140,7 +140,7 @@ A malformed actor payload MUST NEVER abort the application's SQL write. Any of t
 - Present `tenant` that is not a non-empty string.
 - Present `onBehalfOf` that is not a JSON object, lacks a valid `type` (same 5-value enum) or non-empty string `id`, has a non-string or empty `tenant`, or contains a nested `onBehalfOf` key (even `null`; max nesting depth is 1).
 - Present `context` that is not a JSON object, or contains any known context key (`requestId`, `source`, `ip`, `userAgent`) whose value is not a non-empty string. (Non-object `context` MUST yield `actor_source = 'invalid'` rather than being silently dropped.)
-- Present non-null `sub` in `request.jwt.claims` that is not a non-empty string.
+- Present non-null `sub` in `request.jwt.claims` that is not a non-empty string, or whose resulting compact JSON actor `{"type":"user","id":"<sub>"}` exceeds 512 UTF-8 bytes.
 - Duplicate `auditstream` keys inside a valid trailing sqlcommenter comment (for example `/*auditstream='...',auditstream='...'*/`).
 - `auditstream` comment value that is empty (`auditstream=''`), contains characters outside `[A-Za-z0-9_-]` (for example `auditstream='!!!notbase64'`), has invalid base64url length (`length % 4 = 1`), or decodes to invalid UTF-8.
 - Payload exceeding 512 UTF-8 bytes or encoded comment value exceeding 683 characters.

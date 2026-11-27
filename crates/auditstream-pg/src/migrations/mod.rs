@@ -217,7 +217,12 @@ fn validate_tables(tables: &[TableTriggerSpec]) -> Result<(), MigrationError> {
     Ok(())
 }
 
+fn validate_ddl(ddl: &DdlOptions) -> Result<(), MigrationError> {
+    ddl::validate_schema_name(&ddl.schema).map_err(MigrationError::InvalidMetadata)
+}
+
 fn validate_options(options: &MigrationOptions) -> Result<(), MigrationError> {
+    validate_ddl(&options.ddl)?;
     validate_tables(&options.tables)
 }
 
@@ -236,12 +241,14 @@ fn validate_options(options: &MigrationOptions) -> Result<(), MigrationError> {
 ///
 /// # Errors
 ///
-/// Returns [`MigrationError::InvalidMetadata`] if `tables` contains duplicate `(schema, table)`
-/// entries or any table specification excludes one of its own primary key columns.
+/// Returns [`MigrationError::InvalidMetadata`] if `ddl.schema` fails
+/// [`crate::ddl::validate_schema_name`], `tables` contains duplicate `(schema, table)` entries, or
+/// any table specification excludes one of its own primary key columns.
 pub fn install_statements(
     ddl: &DdlOptions,
     tables: &[TableTriggerSpec],
 ) -> Result<Vec<String>, MigrationError> {
+    validate_ddl(ddl)?;
     validate_tables(tables)?;
     Ok(compose_statements_inner(ddl, tables, &[]))
 }
@@ -254,8 +261,9 @@ pub fn install_statements(
 ///
 /// # Errors
 ///
-/// Returns [`MigrationError::InvalidMetadata`] if `tables` contains duplicate `(schema, table)`
-/// entries or any table specification excludes one of its own primary key columns.
+/// Returns [`MigrationError::InvalidMetadata`] if `ddl.schema` fails
+/// [`crate::ddl::validate_schema_name`], `tables` contains duplicate `(schema, table)` entries, or
+/// any table specification excludes one of its own primary key columns.
 pub fn render_install_sql(
     ddl: &DdlOptions,
     tables: &[TableTriggerSpec],
@@ -270,8 +278,8 @@ pub fn render_install_sql(
 /// # Errors
 ///
 /// Returns [`MigrationError::Io`] on filesystem read errors or [`MigrationError::InvalidMetadata`]
-/// if an existing Drizzle `meta/_journal.json`, Auditstream manifest, duplicate `(schema, table)`
-/// entry, or table exclusion spec is invalid.
+/// if `options.ddl.schema`, an existing Drizzle `meta/_journal.json`, Auditstream manifest,
+/// duplicate `(schema, table)` entry, or table exclusion spec is invalid.
 pub fn preview(options: &MigrationOptions) -> Result<PreviewOutcome, MigrationError> {
     validate_options(options)?;
     match options.format {
@@ -294,8 +302,8 @@ pub fn preview(options: &MigrationOptions) -> Result<PreviewOutcome, MigrationEr
 /// # Errors
 ///
 /// Returns [`MigrationError::Io`] on filesystem errors or [`MigrationError::InvalidMetadata`]
-/// if an existing Drizzle `meta/_journal.json`, duplicate `(schema, table)` entry, or table
-/// exclusion spec is invalid.
+/// if `options.ddl.schema`, an existing Drizzle `meta/_journal.json`, duplicate `(schema, table)`
+/// entry, or table exclusion spec is invalid.
 pub fn write(options: &MigrationOptions) -> Result<WriteOutcome, MigrationError> {
     validate_options(options)?;
     match options.format {
@@ -530,6 +538,31 @@ pub(crate) fn preview_with(
     }
 }
 
+/// Inspects `path` via `symlink_metadata`, refusing to follow symlinks.
+pub(crate) fn reject_symlink(path: &Path) -> Result<Option<fs::Metadata>, MigrationError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(MigrationError::InvalidMetadata(format!(
+            "refusing to follow symlink at {}",
+            path.display()
+        ))),
+        Ok(meta) => Ok(Some(meta)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(MigrationError::Io(err)),
+    }
+}
+
+/// Atomically creates a brand-new regular file without following symlinks or overwriting existing
+/// files (`O_CREAT | O_EXCL`).
+pub(crate) fn write_new_file(path: &Path, content: &str) -> Result<(), MigrationError> {
+    use std::io::Write as _;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(content.as_bytes())?;
+    Ok(())
+}
+
 /// Scans `<out_dir>/<name>/migration.sql` folders (Prisma and Drizzle 1.x layouts) and returns
 /// the lexicographically newest folder containing an Auditstream manifest comment.
 pub(crate) fn find_newest_folder_migration(
@@ -543,14 +576,19 @@ pub(crate) fn find_newest_folder_migration(
     for entry in fs::read_dir(out_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_dir() {
+        let Some(meta) = reject_symlink(&path)? else {
+            continue;
+        };
+        if !meta.is_dir() {
             continue;
         }
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
         let migration_sql = path.join("migration.sql");
-        if migration_sql.is_file() {
+        if let Some(sql_meta) = reject_symlink(&migration_sql)?
+            && sql_meta.is_file()
+        {
             dirs.push((name, migration_sql));
         }
     }
@@ -575,12 +613,16 @@ pub(crate) fn write_folder_migration(
 ) -> Result<WriteOutcome, MigrationError> {
     fs::create_dir_all(&options.out_dir)?;
     let ts = next_unique_timestamp(options.now, |ts| {
-        options.out_dir.join(format!("{ts}_auditstream")).exists()
+        options
+            .out_dir
+            .join(format!("{ts}_auditstream"))
+            .symlink_metadata()
+            .is_ok()
     });
     let folder = options.out_dir.join(format!("{ts}_auditstream"));
     fs::create_dir(&folder)?;
     let file_path = folder.join("migration.sql");
-    fs::write(&file_path, rendered)?;
+    write_new_file(&file_path, rendered)?;
 
     Ok(WriteOutcome::Written {
         files: vec![file_path],

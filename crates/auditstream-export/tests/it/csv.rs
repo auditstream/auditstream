@@ -287,8 +287,8 @@ async fn preserves_40_digit_numeric_trailing_zero_decimal_and_u64_overflow_byte_
 #[tokio::test]
 async fn formula_prefix_characters_are_not_escaped_and_rfc4180_quoting_rules_hold() {
     let mut event = sample_events_all_five_kinds().remove(4);
-    event.op = Op::app("=SUM(A1:A2),\"+-\r\n@").expect("valid app op");
-    event.db_user = "@admin,-user+1".to_owned();
+    event.op = Op::app("=SUM(A1:A2),\"+-@").expect("valid app op");
+    event.db_user = "@admin,\"+-\r\nuser+1".to_owned();
 
     let mut sink = CsvSink::new(Vec::<u8>::new());
     sink.write(&Batch::new(vec![event], Some(Cursor::new(1, 1))))
@@ -297,8 +297,9 @@ async fn formula_prefix_characters_are_not_escaped_and_rfc4180_quoting_rules_hol
     sink.flush().await.expect("flush");
 
     let output = String::from_utf8(sink.into_inner()).expect("utf8");
-    // Quotes inside field must be doubled in RFC 4180 output.
-    assert!(output.contains("\"=SUM(A1:A2),\"\"+-\r\n@\""));
+    // Quotes inside field must be doubled in RFC 4180 output, and embedded CRLF stays quoted.
+    assert!(output.contains("\"=SUM(A1:A2),\"\"+-@\""));
+    assert!(output.contains("\"@admin,\"\"+-\r\nuser+1\""));
 
     let mut reader = csv::Reader::from_reader(output.as_bytes());
     let record = reader
@@ -306,8 +307,8 @@ async fn formula_prefix_characters_are_not_escaped_and_rfc4180_quoting_rules_hol
         .next()
         .expect("one record")
         .expect("valid csv");
-    assert_eq!(&record[5], "=SUM(A1:A2),\"+-\r\n@");
-    assert_eq!(&record[13], "@admin,-user+1");
+    assert_eq!(&record[5], "=SUM(A1:A2),\"+-@");
+    assert_eq!(&record[13], "@admin,\"+-\r\nuser+1");
 }
 
 #[tokio::test]

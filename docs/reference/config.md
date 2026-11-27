@@ -10,7 +10,7 @@
 
 ## Precedence
 
-Values resolve in strict order (first non-empty source wins):
+Values resolve in strict order (first non-empty source wins; empty environment variables fall through to lower-priority sources, while an explicit empty `--schema ""` or `schema = ""` fails validation with exit code `2`):
 
 1. Command-line flag
 2. Environment variable (global options only, so subcommand flags never collide)
@@ -22,7 +22,7 @@ Values resolve in strict order (first non-empty source wins):
 | Key | Type | Default | Flag | Environment |
 | --- | --- | --- | --- | --- |
 | `database_url` | string | none | `--database-url` | `AUDITSTREAM_DATABASE_URL`, then `DATABASE_URL` (use `sslmode=verify-full` for non-loopback hosts) |
-| `schema` | string | `auditstream` | `--schema` | `AUDITSTREAM_SCHEMA` |
+| `schema` | string (`[A-Za-z_][A-Za-z0-9_]*`, max 63 bytes, not `pg_*` or `information_schema`) | `auditstream` | `--schema` | `AUDITSTREAM_SCHEMA` |
 | `capture.tables` | list of `schema.table` | `[]` | `init --table` | none |
 | `capture.exclude` | list of `schema.table.column` (non-primary-key columns only) | `[]` | `init --exclude` | none |
 | `migrations.format` | `prisma`, `drizzle` or `sql` | none | `init --migrations` | none |
