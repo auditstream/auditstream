@@ -5,6 +5,7 @@ pub mod error;
 pub mod jsonl;
 pub mod pipeline;
 
+use std::borrow::Cow;
 use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -12,6 +13,55 @@ use std::path::{Path, PathBuf};
 use auditstream_core::{Batch, Sink, SinkError};
 use serde::{Deserialize, Serialize};
 use tokio as _;
+
+/// Returns a stateful predicate that keeps every byte except insignificant RFC 8259 ASCII
+/// whitespace (` `, `\t`, `\n`, `\r`) outside JSON string literals.
+fn keep_compact_json_byte() -> impl FnMut(u8) -> bool {
+    let mut in_string = false;
+    let mut escaped = false;
+    move |b| {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            true
+        } else if b == b'"' {
+            in_string = true;
+            true
+        } else {
+            !matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+        }
+    }
+}
+
+/// Strips insignificant RFC 8259 ASCII whitespace (` `, `\t`, `\n`, `\r`) outside JSON string
+/// literals in place while keeping key order, UTF-8 string contents, and arbitrary-precision
+/// numeric literals byte-for-byte intact.
+pub(crate) fn compact_json_bytes_in_place(buf: &mut Vec<u8>) {
+    let mut keep = keep_compact_json_byte();
+    buf.retain(|&b| keep(b));
+}
+
+/// Strips insignificant RFC 8259 ASCII whitespace outside JSON string literals while keeping
+/// key order, UTF-8 string contents, and arbitrary-precision numeric literals byte-for-byte
+/// intact without parsing into `serde_json::Value`.
+pub(crate) fn compact_json(raw: &str) -> Cow<'_, str> {
+    if !raw
+        .bytes()
+        .any(|b| matches!(b, b' ' | b'\n' | b'\r' | b'\t'))
+    {
+        return Cow::Borrowed(raw);
+    }
+
+    let mut out = raw.to_owned();
+    let mut keep = keep_compact_json_byte();
+    out.retain(|ch| keep(if ch.is_ascii() { ch as u8 } else { 0 }));
+    Cow::Owned(out)
+}
 
 pub(crate) fn open_append_file(path: &Path) -> io::Result<std::fs::File> {
     let mut options = OpenOptions::new();
@@ -300,6 +350,30 @@ mod tests {
         assert_send(&write_fut);
         write_fut.await.expect("empty csv batch write succeeds");
         csv.flush().await.expect("csv stdout flush succeeds");
+    }
+
+    #[test]
+    fn compact_json_preserves_strings_escapes_unicode_and_numbers() {
+        use std::borrow::Cow;
+
+        let already_compact = r#"{"id":1,"price":1.10}"#;
+        assert!(matches!(
+            super::compact_json(already_compact),
+            Cow::Borrowed(s) if s == already_compact
+        ));
+
+        let pretty = " \r\n{\n  \"path\": \"C:\\\\dir\\\\\",\n  \"esc\": \"a\\\\\\\"b \u{2022}   é 日 🚀\",\n  \"num\": 123456789012345678901234567890.1234567890\n}\t ";
+        let expected = r#"{"path":"C:\\dir\\","esc":"a\\\"b •   é 日 🚀","num":123456789012345678901234567890.1234567890}"#;
+        assert_eq!(super::compact_json(pretty).as_ref(), expected);
+
+        let mut bytes = pretty.as_bytes().to_vec();
+        super::compact_json_bytes_in_place(&mut bytes);
+        assert_eq!(bytes, expected.as_bytes());
+
+        for ws in [" ", "\t", "\n", "\r"] {
+            let input = format!("{{\"id\":{ws}1}}");
+            assert_eq!(super::compact_json(&input).as_ref(), r#"{"id":1}"#);
+        }
     }
 
     #[cfg(unix)]

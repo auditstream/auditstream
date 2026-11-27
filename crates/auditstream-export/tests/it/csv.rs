@@ -285,6 +285,35 @@ async fn preserves_40_digit_numeric_trailing_zero_decimal_and_u64_overflow_byte_
 }
 
 #[tokio::test]
+async fn compacts_pretty_printed_raw_values_with_escapes_unicode_and_numbers() {
+    let huge_numeric = "123456789012345678901234567890.1234567890";
+    let mut event = sample_events_all_five_kinds().remove(1);
+    event.after = Some(raw_json(&format!(
+        "{{\r\n\t\"huge\": {huge_numeric},\r\n\t\"price\": 1.10,\n  \"dir\": \"C:\\\\dir\\\\\",\n  \"note\": \"  a \\\"b  c\\\" \u{2022} é 日 🚀  \"\r\n}}"
+    )));
+
+    let mut sink = CsvSink::new(Vec::<u8>::new());
+    sink.write(&Batch::new(vec![event], Some(Cursor::new(1, 1))))
+        .await
+        .expect("write");
+    sink.flush().await.expect("flush");
+
+    let output = sink.into_inner();
+    let mut reader = csv::Reader::from_reader(output.as_slice());
+    let record = reader
+        .records()
+        .next()
+        .expect("one record")
+        .expect("valid csv");
+    assert_eq!(
+        &record[8],
+        format!(
+            r#"{{"huge":{huge_numeric},"price":1.10,"dir":"C:\\dir\\","note":"  a \"b  c\" • é 日 🚀  "}}"#
+        )
+    );
+}
+
+#[tokio::test]
 async fn formula_prefix_characters_are_not_escaped_and_rfc4180_quoting_rules_hold() {
     let mut event = sample_events_all_five_kinds().remove(4);
     event.op = Op::app("=SUM(A1:A2),\"+-@").expect("valid app op");

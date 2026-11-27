@@ -138,15 +138,15 @@ fn write_event_record<W: io::Write>(
     let record_id = event
         .record_id
         .as_deref()
-        .map_or(Cow::Borrowed(""), |raw| compact_json(raw.get()));
+        .map_or(Cow::Borrowed(""), |raw| crate::compact_json(raw.get()));
     let before = event
         .before
         .as_deref()
-        .map_or(Cow::Borrowed(""), |raw| compact_json(raw.get()));
+        .map_or(Cow::Borrowed(""), |raw| crate::compact_json(raw.get()));
     let after = event
         .after
         .as_deref()
-        .map_or(Cow::Borrowed(""), |raw| compact_json(raw.get()));
+        .map_or(Cow::Borrowed(""), |raw| crate::compact_json(raw.get()));
     let changed = match &event.changed {
         Some(cols) => serde_json::to_string(cols)?,
         None => String::new(),
@@ -154,11 +154,11 @@ fn write_event_record<W: io::Write>(
     let actor = event
         .actor
         .as_deref()
-        .map_or(Cow::Borrowed(""), |raw| compact_json(raw.get()));
+        .map_or(Cow::Borrowed(""), |raw| crate::compact_json(raw.get()));
     let context = event
         .context
         .as_deref()
-        .map_or(Cow::Borrowed(""), |raw| compact_json(raw.get()));
+        .map_or(Cow::Borrowed(""), |raw| crate::compact_json(raw.get()));
     let actor_source = match event.actor_source {
         Some(ActorSource::SetConfig) => "set_config",
         Some(ActorSource::Comment) => "comment",
@@ -188,39 +188,6 @@ fn write_event_record<W: io::Write>(
         ])
         .map_err(csv_to_sink_error)?;
     Ok(())
-}
-
-/// Strips insignificant ASCII whitespace outside JSON string literals while keeping key order
-/// and numeric literals byte-for-byte intact without parsing into `serde_json::Value`.
-fn compact_json(raw: &str) -> Cow<'_, str> {
-    if !raw
-        .bytes()
-        .any(|b| matches!(b, b' ' | b'\n' | b'\r' | b'\t'))
-    {
-        return Cow::Borrowed(raw);
-    }
-
-    let mut out = String::with_capacity(raw.len());
-    let mut in_string = false;
-    let mut escaped = false;
-    for ch in raw.chars() {
-        if in_string {
-            out.push(ch);
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-        } else if ch == '"' {
-            in_string = true;
-            out.push(ch);
-        } else if !matches!(ch, ' ' | '\n' | '\r' | '\t') {
-            out.push(ch);
-        }
-    }
-    Cow::Owned(out)
 }
 
 fn format_rfc3339_micros(dt: OffsetDateTime) -> String {
