@@ -1,0 +1,298 @@
+name: Skill hygiene
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    paths:
+      - "skills/**"
+      - "crates/auditstream/src/cli.rs"
+      - "docs/handbook/releases.md"
+      - ".github/workflows/skill-hygiene.yml"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  skill-hygiene:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate declarative skills, Unicode/BiDi hygiene, and CLI/version references
+        run: |
+          python3 -I - <<'PY'
+          import os
+          import pathlib
+          import re
+          import stat
+          import subprocess
+          import sys
+          import unicodedata
+
+          root = pathlib.Path(".")
+          skills_dir = root / "skills"
+          skill_md = skills_dir / "auditstream" / "SKILL.md"
+          errors = []
+
+          if skills_dir.is_symlink():
+              errors.append("skills: root skills/ directory must not be a symlink")
+          if not skill_md.is_file() or skill_md.is_symlink():
+              print("ERROR: skills/auditstream/SKILL.md is missing or is a symlink", file=sys.stderr)
+              sys.exit(1)
+
+          # 1. Enforce strictly declarative Markdown (zero scripts/, symlinks, executables, submodules).
+          md_files = []
+          for dirpath, dirnames, filenames in os.walk(skills_dir, followlinks=False):
+              dp = pathlib.Path(dirpath)
+              for d in list(dirnames):
+                  sub = dp / d
+                  if sub.is_symlink():
+                      errors.append(f"{sub}: symlinks are forbidden under skills/")
+                  if d.lower() == "scripts":
+                      errors.append(f"{sub}: executable scripts/ directories are forbidden under skills/")
+              for fname in filenames:
+                  fp = dp / fname
+                  st = os.lstat(fp)
+                  if stat.S_ISLNK(st.st_mode):
+                      errors.append(f"{fp}: symlinks are forbidden under skills/")
+                      continue
+                  if st.st_mode & 0o111:
+                      errors.append(f"{fp}: executable permission bit is forbidden under skills/")
+                  if fp.suffix != ".md":
+                      errors.append(f"{fp}: only declarative .md files are allowed under skills/")
+                      continue
+                  md_files.append(fp)
+
+          # Verify git index modes when running inside a git checkout (blocks 100755, 120000, 160000).
+          if (root / ".git").exists():
+              ls = subprocess.run(
+                  ["git", "ls-files", "--stage", "skills"],
+                  capture_output=True,
+                  text=True,
+                  check=False,
+              )
+              if ls.returncode != 0:
+                  errors.append(f"git ls-files --stage skills failed (rc={ls.returncode}): {ls.stderr.strip()}")
+              else:
+                  for line in ls.stdout.splitlines():
+                      parts = line.split(None, 3)
+                      if len(parts) == 4:
+                          mode, _, _, path = parts
+                          if mode != "100644":
+                              errors.append(f"{path}: git mode {mode} is forbidden under skills/ (must be 100644)")
+
+          # 2. Enforce <250 lines and strict allowlisted YAML frontmatter on EVERY SKILL.md under skills/,
+          #    and forbid frontmatter on any non-SKILL.md Markdown files under skills/.
+          allowed_keys = {"name", "description"}
+          skill_raw = ""
+          skill_lines = []
+          for fp in md_files:
+              raw = fp.read_bytes().decode("utf-8")
+              lines = raw.split("\n")
+              if lines and lines[-1] == "":
+                  lines = lines[:-1]
+              if fp == skill_md:
+                  skill_raw = raw
+                  skill_lines = lines
+              if fp.name == "SKILL.md":
+                  if len(lines) >= 250:
+                      errors.append(f"{fp}: {len(lines)} lines (must be strictly < 250 lines)")
+                  fm_match = re.match(r"\A---\n(.*?)\n---\n", raw, flags=re.S)
+                  if not fm_match:
+                      errors.append(f"{fp}: missing YAML frontmatter delimited by ---")
+                  else:
+                      seen_keys = {}
+                      for idx, fm_line in enumerate(fm_match.group(1).split("\n"), 2):
+                          if not fm_line.strip():
+                              continue
+                          kv = re.match(r"^([A-Za-z0-9_-]+):\s*(.*)$", fm_line)
+                          if not kv:
+                              errors.append(f"{fp}:{idx}: unsupported frontmatter line (must be simple key: value)")
+                              continue
+                          key, val = kv.group(1), kv.group(2).strip()
+                          if key not in allowed_keys:
+                              errors.append(f"{fp}:{idx}: disallowed frontmatter key '{key}' (allowed: {sorted(allowed_keys)})")
+                              continue
+                          if key in seen_keys:
+                              errors.append(f"{fp}:{idx}: duplicate frontmatter key '{key}'")
+                              continue
+                          seen_keys[key] = val.strip("'\"")
+                      expected_name = fp.parent.name
+                      if seen_keys.get("name") != expected_name:
+                          errors.append(f"{fp}: frontmatter must declare 'name: {expected_name}'")
+                      if not seen_keys.get("description"):
+                          errors.append(f"{fp}: frontmatter must declare a non-empty 'description'")
+              elif fp.name.lower() == "skill.md":
+                  errors.append(f"{fp}: skill filename must be exact uppercase 'SKILL.md'")
+              elif re.match(r"\A[ \t]*(?:---|\+\+\+)", raw):
+                  errors.append(f"{fp}: YAML/TOML frontmatter is forbidden on non-SKILL.md files under skills/")
+
+          # 3. Block hidden Unicode tags, BiDi/format/control chars, variation selectors, and shell preprocessing.
+          FORBIDDEN_CATEGORIES = {"Cf", "Cc", "Zl", "Zp", "Co", "Cs"}
+          EXTRA_FORBIDDEN = {0x034F, 0x115F, 0x1160, 0x3164, 0xFFA0}
+
+          def forbidden_reason(ch):
+              cp = ord(ch)
+              if 0xE0000 <= cp <= 0xE007F:
+                  return "Unicode tag character"
+              if 0x202A <= cp <= 0x202E:
+                  return "Unicode BiDi override/embedding"
+              if 0x2066 <= cp <= 0x2069:
+                  return "Unicode BiDi isolate"
+              if 0xFE00 <= cp <= 0xFE0F or 0xE0100 <= cp <= 0xE01EF:
+                  return "Unicode variation selector"
+              if cp in EXTRA_FORBIDDEN:
+                  return "invisible filler/combiner"
+              cat = unicodedata.category(ch)
+              if cat in FORBIDDEN_CATEGORIES:
+                  return f"forbidden Unicode category {cat}"
+              return None
+
+          shell_inline_re = re.compile(r"!\x60")
+          shell_fence_re = re.compile(r"^\s*(?:`{3,}|~{3,})\s*!")
+          for fp in md_files:
+              raw_text = fp.read_bytes().decode("utf-8")
+              for lineno, line in enumerate(raw_text.split("\n"), 1):
+                  for col, ch in enumerate(line, 1):
+                      reason = forbidden_reason(ch)
+                      if reason:
+                          errors.append(f"{fp}:{lineno}:{col}: {reason} (U+{ord(ch):04X})")
+                  if shell_inline_re.search(line) or shell_fence_re.match(line):
+                      errors.append(f"{fp}:{lineno}: dynamic shell preprocessing (!` or ```!) is forbidden under skills/")
+
+          # 4. Validate CLI subcommand references (inline backticks + fenced shell blocks) against cli.rs.
+          cli_rs = (root / "crates/auditstream/src/cli.rs").read_text(encoding="utf-8")
+          enum_start = re.search(r"enum\s+Command\s*\{", cli_rs)
+          valid_cmds = set()
+          if not enum_start:
+              errors.append("crates/auditstream/src/cli.rs: could not locate enum Command")
+          else:
+              depth = 1
+              pos = enum_start.end()
+              while pos < len(cli_rs) and depth > 0:
+                  if cli_rs[pos] == "{":
+                      depth += 1
+                  elif cli_rs[pos] == "}":
+                      depth -= 1
+                  pos += 1
+              if depth != 0:
+                  errors.append("crates/auditstream/src/cli.rs: unbalanced braces while parsing enum Command")
+              else:
+                  enum_body = cli_rs[enum_start.end() : pos - 1]
+                  explicit_name = None
+                  for line in enum_body.splitlines():
+                      nm = re.search(r'\bname\s*=\s*"([^"]+)"', line)
+                      if nm:
+                          explicit_name = nm.group(1)
+                          continue
+                      vm = re.match(r"^\s*([A-Z][A-Za-z0-9]*)\s*(?:\(|\{|,|$)", line)
+                      if vm:
+                          if explicit_name:
+                              valid_cmds.add(explicit_name)
+                              explicit_name = None
+                          else:
+                              kebab = re.sub(r"(?<!^)(?=[A-Z])", "-", vm.group(1)).lower()
+                              valid_cmds.add(kebab)
+          if not valid_cmds:
+              errors.append("crates/auditstream/src/cli.rs: parsed zero CLI subcommands (fail closed)")
+
+          GLOBAL_VALUE_FLAGS = {"--config", "--database-url", "--schema", "--log-format"}
+          GLOBAL_BOOL_FLAGS = {"-v", "-vv", "-q", "--verbose", "--quiet"}
+          SHELL_LANGS = {"sh", "bash", "shell", "zsh", "console"}
+
+          def check_command_line(fp, lineno, cmd_text):
+              for m in re.finditer(r"(?<![A-Za-z0-9_./-])auditstream\b", cmd_text):
+                  tail = cmd_text[m.end() :]
+                  segment = re.split(r"&&|\|\||[;|]", tail, maxsplit=1)[0]
+                  tokens = segment.strip().split()
+                  i = 0
+                  while i < len(tokens):
+                      tok = tokens[i].rstrip(";,)|`\"'")
+                      if not tok:
+                          i += 1
+                          continue
+                      if tok in GLOBAL_VALUE_FLAGS:
+                          i += 2
+                          continue
+                      if any(tok.startswith(f + "=") for f in GLOBAL_VALUE_FLAGS) or tok in GLOBAL_BOOL_FLAGS:
+                          i += 1
+                          continue
+                      if tok in ("-h", "--help", "-V", "--version", "<cmd>"):
+                          break
+                      if tok.startswith("-"):
+                          i += 1
+                          continue
+                      if re.match(r"^[a-z][a-z0-9-]*$", tok):
+                          if tok not in valid_cmds:
+                              errors.append(
+                                  f"{fp}:{lineno}: unknown CLI subcommand 'auditstream {tok}' "
+                                  f"(valid from cli.rs: {sorted(valid_cmds)})"
+                              )
+                      break
+
+          open_fence_re = re.compile(r"^\s{0,3}(`{3,}|~{3,})(.*)$")
+          for fp in md_files:
+              lines = fp.read_bytes().decode("utf-8").split("\n")
+              fence_char = None
+              fence_len = 0
+              fence_is_shell = False
+              for lineno, line in enumerate(lines, 1):
+                  if fence_char is None:
+                      om = open_fence_re.match(line)
+                      if om:
+                          marker, info = om.group(1), om.group(2)
+                          if not (marker[0] == "`" and "`" in info):
+                              fence_char = marker[0]
+                              fence_len = len(marker)
+                              lang = info.strip().split()[0].lower() if info.strip() else ""
+                              fence_is_shell = lang in SHELL_LANGS
+                              continue
+                      for span in re.findall(r"`([^`]+)`", line):
+                          check_command_line(fp, lineno, span)
+                  else:
+                      cm = re.match(r"^\s{0,3}(" + re.escape(fence_char) + r"{3,})\s*$", line)
+                      if cm and len(cm.group(1)) >= fence_len:
+                          fence_char = None
+                          fence_len = 0
+                          fence_is_shell = False
+                          continue
+                      if fence_is_shell:
+                          check_command_line(fp, lineno, line)
+
+          # 5. Validate supported version references against docs/handbook/releases.md.
+          releases_md = (root / "docs/handbook/releases.md").read_text(encoding="utf-8")
+          for label, (skill_pat, rel_pat) in [
+              ("Engine CLI 0.1.x", (r"Engine CLI `0\.1\.x`", r"\|\s*`0\.1\.x`\s*\|")),
+              ("Spec 0.1.0-0.1.1", (r"Spec `0\.1\.0`[–-]`0\.1\.1`", r"`0\.1\.0`\s*[–-]\s*`0\.1\.1`")),
+              ("TypeScript SDK 0.2.x", (r"`@auditstream/\*`\s+`0\.2\.x`", r"\|\s*`0\.2\.x`\s*\|")),
+              ("PostgreSQL 15-19", (r"PostgreSQL\s+`15`[–-]`19`", r"PostgreSQL\s*\|\s*15 to 19")),
+              ("Node.js 22.12+", (r"Node\.js\s+`22\.12\+`", r"Node\.js\s*\|\s*22\.12")),
+              ("Prisma 7.1+ (7.x)", (r"`@prisma/client`\s+`7\.1\+`\s+\(`7\.x`", r"@prisma/client`\s+7\.1\s+and\s+newer\s+within\s+7\.x")),
+              ("Drizzle 0.45 and 1.x", (r"Drizzle\s+`0\.45`\s+and\s+`1\.x`", r"Drizzle\s*\|\s*0\.45 and 1\.x")),
+          ]:
+              if not re.search(skill_pat, skill_raw):
+                  errors.append(f"{skill_md}: missing expected version claim '{label}'")
+              if not re.search(rel_pat, releases_md):
+                  errors.append(f"docs/handbook/releases.md: version baseline drifted for '{label}'; update SKILL.md and skill-hygiene.yml")
+
+          if errors:
+              print("Skill hygiene check FAILED:", file=sys.stderr)
+              for err in errors:
+                  print(f"  - {err}", file=sys.stderr)
+              sys.exit(1)
+
+          print(
+              f"Skill hygiene check PASSED: {len(md_files)} file(s), "
+              f"{len(skill_lines)} lines (<250), valid CLI commands={sorted(valid_cmds)}."
+          )
+          PY

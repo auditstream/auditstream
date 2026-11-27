@@ -18,6 +18,7 @@ Task-oriented recipes for integrating and operating Auditstream.
 - [Add Auditstream to a Prisma project](how-to/add-to-prisma.md)
 - [Add Auditstream to a Drizzle project](how-to/add-to-drizzle.md)
 - [Add Auditstream to a plain SQL project](how-to/add-to-plain-sql.md)
+- [Audit AI agent mutations](how-to/audit-ai-agents.md)
 - [Set the actor without an adapter](how-to/set-actor-without-adapter.md)
 - [Export incrementally to JSON Lines or CSV](how-to/export-incrementally.md)
 - [Isolate tenants with Row-Level Security (RLS)](how-to/multi-tenant-rls.md)
