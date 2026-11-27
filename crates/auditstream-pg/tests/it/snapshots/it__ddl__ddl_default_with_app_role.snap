@@ -701,6 +701,119 @@ DO $$
 DECLARE
   prev_role name := current_user;
   switched_role boolean := false;
+  parent_locked boolean := false;
+  current_part text;
+  obj_schema name;
+  rel_name name;
+  is_parent boolean;
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+      FROM pg_catalog.pg_settings
+     WHERE name = 'default_toast_compression'
+       AND 'lz4' = ANY(enumvals)
+  ) THEN
+    RETURN;
+  END IF;
+
+  current_part := 'changes_' || pg_catalog.to_char(
+    pg_catalog.date_trunc('month', pg_catalog.now() AT TIME ZONE 'UTC'),
+    'YYYY_MM'
+  );
+
+  FOR obj_schema, rel_name, is_parent IN
+    WITH RECURSIVE parent AS (
+      SELECT c.oid, n.nspname, c.relname
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = 'auditstream'
+         AND c.relname = 'changes'
+         AND c.relkind IN ('r', 'p')
+    ),
+    child_tree(relid, rel_schema, rel_name, sort_group, depth) AS (
+      SELECT
+        child.oid,
+        cn.nspname,
+        child.relname,
+        CASE WHEN child.relname = 'changes_default' THEN 1 ELSE 2 END,
+        1
+        FROM parent p
+        JOIN pg_catalog.pg_inherits i ON i.inhparent = p.oid
+        JOIN pg_catalog.pg_class child ON child.oid = i.inhrelid
+        JOIN pg_catalog.pg_namespace cn ON cn.oid = child.relnamespace
+       WHERE cn.nspname = 'auditstream'
+         AND child.relispartition
+         AND child.relkind IN ('r', 'p')
+         AND (
+           child.relname = 'changes_default'
+           OR (
+             pg_catalog.regexp_like(
+               child.relname::text COLLATE pg_catalog."C",
+               '^changes_[0-9]{4}_(0[1-9]|1[0-2])$'
+             )
+             AND child.relname::text COLLATE pg_catalog."C" >= current_part COLLATE pg_catalog."C"
+           )
+         )
+      UNION ALL
+      SELECT sub.oid, sn.nspname, sub.relname, ct.sort_group, ct.depth + 1
+        FROM child_tree ct
+        JOIN pg_catalog.pg_inherits i ON i.inhparent = ct.relid
+        JOIN pg_catalog.pg_class sub ON sub.oid = i.inhrelid
+        JOIN pg_catalog.pg_namespace sn ON sn.oid = sub.relnamespace
+       WHERE sub.relispartition
+         AND sub.relkind IN ('r', 'p')
+    ),
+    targets AS (
+      SELECT p.oid AS relid, p.nspname AS rel_schema, p.relname AS rel_name, 0 AS sort_group, 0 AS depth
+        FROM parent p
+      UNION ALL
+      SELECT ct.relid, ct.rel_schema, ct.rel_name, ct.sort_group, ct.depth
+        FROM child_tree ct
+    )
+    SELECT t.rel_schema, t.rel_name, (t.sort_group = 0)
+      FROM targets t
+     WHERE EXISTS (
+       SELECT 1
+         FROM pg_catalog.pg_attribute a
+        WHERE a.attrelid = t.relid
+          AND a.attname IN ('before', 'after')
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+          AND a.attcompression IS DISTINCT FROM 'l'
+     )
+     ORDER BY t.sort_group ASC, t.depth ASC, t.rel_schema, t.rel_name
+  LOOP
+    IF NOT switched_role AND prev_role <> 'auditstream_owner' THEN
+      EXECUTE pg_catalog.format('SET LOCAL ROLE %I', 'auditstream_owner');
+      switched_role := true;
+    END IF;
+    IF NOT is_parent AND NOT parent_locked THEN
+      EXECUTE pg_catalog.format('LOCK TABLE ONLY %I.changes IN ACCESS EXCLUSIVE MODE', 'auditstream');
+      parent_locked := true;
+    END IF;
+    EXECUTE pg_catalog.format(
+      'ALTER TABLE ONLY %I.%I ALTER COLUMN before SET COMPRESSION lz4, ALTER COLUMN after SET COMPRESSION lz4',
+      obj_schema,
+      rel_name
+    );
+    IF is_parent THEN
+      parent_locked := true;
+    END IF;
+  END LOOP;
+
+  IF switched_role THEN
+    SET LOCAL ROLE NONE;
+    IF prev_role <> current_user THEN
+      EXECUTE pg_catalog.format('SET LOCAL ROLE %I', prev_role);
+    END IF;
+  END IF;
+END
+$$;
+
+DO $$
+DECLARE
+  prev_role name := current_user;
+  switched_role boolean := false;
   base_month timestamp := pg_catalog.date_trunc('month', pg_catalog.now() AT TIME ZONE 'UTC');
   m int;
   month_start timestamp;

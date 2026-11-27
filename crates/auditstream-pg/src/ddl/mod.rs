@@ -4,7 +4,8 @@
 //! `auditstream_owner`, the audit schema, the monthly-partitioned `changes` table,
 //! runtime partitions (DEFAULT + current UTC month + next 3 months), indexes,
 //! `log_event()`, strict ACL sanitization across tables, partitions, identity sequences,
-//! schema, and functions, grants for application roles, and cleanup of any temporary self-grant.
+//! schema, and functions, grants for application roles, LZ4 TOAST compression on
+//! `changes.(before, after)` when supported by the server, and cleanup of any temporary self-grant.
 //!
 //! No generated statement drops a role, schema, table, or owned object.
 
@@ -339,9 +340,11 @@ pub fn quote_literal(value: &str) -> String {
 }
 
 /// Structured parts of [`generate`] so migration composers can interleave trigger statements
-/// before creating future monthly partitions and revoking the temporary self-grant.
+/// before enabling LZ4 TOAST compression, creating future monthly partitions, and revoking the
+/// temporary self-grant.
 pub(crate) struct GeneratedDdl {
     pub(crate) setup: Vec<String>,
+    pub(crate) toast_compression: String,
     pub(crate) future_partitions: String,
     pub(crate) role_cleanup: String,
 }
@@ -363,13 +366,16 @@ pub(crate) struct GeneratedDdl {
 /// or [`crate::migrations::render_install_sql`] (for `psql`) instead of manually stitching this
 /// output with [`crate::triggers::generate`].
 ///
-/// The second-to-last statement creates the next three monthly partitions. Creating a
-/// partition locks `changes` until commit, so migrations run it after their trigger statements.
+/// The statements before role cleanup enable `COMPRESSION lz4` on `before`/`after` (when the
+/// PostgreSQL server supports LZ4) and create the next three monthly partitions. Both operations
+/// can lock `changes` until commit, so migrations run them after trigger statements to preserve
+/// `audited_table -> changes` lock ordering.
 pub fn generate(options: &DdlOptions) -> Vec<String> {
     let parts = generate_parts(options);
-    let mut stmts = Vec::with_capacity(parts.setup.len() + 3);
+    let mut stmts = Vec::with_capacity(parts.setup.len() + 4);
     stmts.push(tx_begin_guard_sql());
     stmts.extend(parts.setup);
+    stmts.push(parts.toast_compression);
     stmts.push(parts.future_partitions);
     stmts.push(parts.role_cleanup);
     stmts
@@ -425,6 +431,7 @@ pub(crate) fn generate_parts(options: &DdlOptions) -> GeneratedDdl {
 
     GeneratedDdl {
         setup,
+        toast_compression: toast_compression_sql(&schema_lit, &owner_lit),
         future_partitions: partitions_sql(&schema_lit, &owner_lit, 1, 3),
         role_cleanup: role_grant_cleanup_sql(&owner_q, "auditstream._granted_self"),
     }
@@ -840,6 +847,134 @@ END"
     ))
 }
 
+/// Enables PostgreSQL `COMPRESSION lz4` on `before` and `after` for parent `changes`,
+/// `changes_default`, and current/future monthly partitions (`changes_YYYY_MM >= current UTC
+/// month`, plus any attached non-foreign sub-partitions underneath them) when the server supports
+/// LZ4 TOAST compression.
+///
+/// Checks `pg_catalog.pg_settings` lock-free before acquiring any relation lock or switching
+/// roles, skips relations whose `before` and `after` columns already have `attcompression = 'l'`,
+/// acquires `ACCESS EXCLUSIVE` on parent `changes` first whenever any child partition needs
+/// altering (preserving `parent -> changes_default -> changes_YYYY_MM` lock order even when parent
+/// `changes` already uses LZ4 while a child partition does not), and leaves historical partitions
+/// (`< current UTC month`) untouched. Runs under `auditstream_owner` so non-superuser migrators
+/// succeed.
+#[allow(clippy::too_many_lines)]
+fn toast_compression_sql(schema_lit: &str, owner_lit: &str) -> String {
+    do_block(&format!(
+        "DECLARE
+  prev_role name := current_user;
+  switched_role boolean := false;
+  parent_locked boolean := false;
+  current_part text;
+  obj_schema name;
+  rel_name name;
+  is_parent boolean;
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+      FROM pg_catalog.pg_settings
+     WHERE name = 'default_toast_compression'
+       AND 'lz4' = ANY(enumvals)
+  ) THEN
+    RETURN;
+  END IF;
+
+  current_part := 'changes_' || pg_catalog.to_char(
+    pg_catalog.date_trunc('month', pg_catalog.now() AT TIME ZONE 'UTC'),
+    'YYYY_MM'
+  );
+
+  FOR obj_schema, rel_name, is_parent IN
+    WITH RECURSIVE parent AS (
+      SELECT c.oid, n.nspname, c.relname
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = {schema_lit}
+         AND c.relname = 'changes'
+         AND c.relkind IN ('r', 'p')
+    ),
+    child_tree(relid, rel_schema, rel_name, sort_group, depth) AS (
+      SELECT
+        child.oid,
+        cn.nspname,
+        child.relname,
+        CASE WHEN child.relname = 'changes_default' THEN 1 ELSE 2 END,
+        1
+        FROM parent p
+        JOIN pg_catalog.pg_inherits i ON i.inhparent = p.oid
+        JOIN pg_catalog.pg_class child ON child.oid = i.inhrelid
+        JOIN pg_catalog.pg_namespace cn ON cn.oid = child.relnamespace
+       WHERE cn.nspname = {schema_lit}
+         AND child.relispartition
+         AND child.relkind IN ('r', 'p')
+         AND (
+           child.relname = 'changes_default'
+           OR (
+             pg_catalog.regexp_like(
+               child.relname::text COLLATE pg_catalog.\"C\",
+               '^changes_[0-9]{{4}}_(0[1-9]|1[0-2])$'
+             )
+             AND child.relname::text COLLATE pg_catalog.\"C\" >= current_part COLLATE pg_catalog.\"C\"
+           )
+         )
+      UNION ALL
+      SELECT sub.oid, sn.nspname, sub.relname, ct.sort_group, ct.depth + 1
+        FROM child_tree ct
+        JOIN pg_catalog.pg_inherits i ON i.inhparent = ct.relid
+        JOIN pg_catalog.pg_class sub ON sub.oid = i.inhrelid
+        JOIN pg_catalog.pg_namespace sn ON sn.oid = sub.relnamespace
+       WHERE sub.relispartition
+         AND sub.relkind IN ('r', 'p')
+    ),
+    targets AS (
+      SELECT p.oid AS relid, p.nspname AS rel_schema, p.relname AS rel_name, 0 AS sort_group, 0 AS depth
+        FROM parent p
+      UNION ALL
+      SELECT ct.relid, ct.rel_schema, ct.rel_name, ct.sort_group, ct.depth
+        FROM child_tree ct
+    )
+    SELECT t.rel_schema, t.rel_name, (t.sort_group = 0)
+      FROM targets t
+     WHERE EXISTS (
+       SELECT 1
+         FROM pg_catalog.pg_attribute a
+        WHERE a.attrelid = t.relid
+          AND a.attname IN ('before', 'after')
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+          AND a.attcompression IS DISTINCT FROM 'l'
+     )
+     ORDER BY t.sort_group ASC, t.depth ASC, t.rel_schema, t.rel_name
+  LOOP
+    IF NOT switched_role AND prev_role <> {owner_lit} THEN
+      EXECUTE pg_catalog.format('SET LOCAL ROLE %I', {owner_lit});
+      switched_role := true;
+    END IF;
+    IF NOT is_parent AND NOT parent_locked THEN
+      EXECUTE pg_catalog.format('LOCK TABLE ONLY %I.changes IN ACCESS EXCLUSIVE MODE', {schema_lit});
+      parent_locked := true;
+    END IF;
+    EXECUTE pg_catalog.format(
+      'ALTER TABLE ONLY %I.%I ALTER COLUMN before SET COMPRESSION lz4, ALTER COLUMN after SET COMPRESSION lz4',
+      obj_schema,
+      rel_name
+    );
+    IF is_parent THEN
+      parent_locked := true;
+    END IF;
+  END LOOP;
+
+  IF switched_role THEN
+    SET LOCAL ROLE NONE;
+    IF prev_role <> current_user THEN
+      EXECUTE pg_catalog.format('SET LOCAL ROLE %I', prev_role);
+    END IF;
+  END IF;
+END"
+    ))
+}
+
 /// Sanitizes schema `{schema}`, parent `{schema}.changes`, and `{schema}.log_event()` ACLs under
 /// `auditstream_owner` without taking locks on clean refreshes, and applies explicit grants for
 /// `app_roles` when configured.
@@ -1243,6 +1378,22 @@ mod tests {
             "expected dynamic tag on harden_ddl_acls_sql, got: {acl_stmt}"
         );
         assert_eq!(acl_stmt.matches("$auditstream_do_1$").count(), 2);
+
+        // Adversarial schema names with all fixed DO tags also use dynamic tags in toast_compression_sql.
+        let evil_schema_stmts = generate(&DdlOptions::new(
+            "s$$$do$$audit_do$$auditstream_do$",
+            vec![],
+        ));
+        let toast_stmt = evil_schema_stmts
+            .iter()
+            .find(|s| s.contains("default_toast_compression"))
+            .expect("toast_compression_sql emitted");
+        assert!(
+            toast_stmt.starts_with("DO $auditstream_do_1$\n")
+                && toast_stmt.ends_with("\n$auditstream_do_1$"),
+            "expected dynamic tag on toast_compression_sql, got: {toast_stmt}"
+        );
+        assert_eq!(toast_stmt.matches("$auditstream_do_1$").count(), 2);
     }
 
     #[test]

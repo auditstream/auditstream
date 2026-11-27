@@ -231,9 +231,10 @@ fn validate_options(options: &MigrationOptions) -> Result<(), MigrationError> {
 ///
 /// The returned sequence matches the exact production composition emitted by [`write()`] and
 /// [`preview()`]: it sets the transaction guard and `lock_timeout` fallback, installs the history
-/// schema and functions, attaches capture triggers before creating future monthly partitions
-/// (avoiding lock-order deadlocks with concurrent writers), revokes any temporary
-/// `auditstream_owner` self-grant, and restores `lock_timeout`.
+/// schema and functions, attaches capture triggers before enabling LZ4 TOAST compression (when
+/// supported) and creating future monthly partitions (avoiding lock-order deadlocks with
+/// concurrent writers), revokes any temporary `auditstream_owner` self-grant, and restores
+/// `lock_timeout`.
 ///
 /// Callers MUST execute the returned statements sequentially inside a single transaction
 /// (for example via `sqlx::Transaction`, a transactional migrator, or [`render_install_sql()`]);
@@ -437,8 +438,8 @@ fn compose_statements_inner(
     dropped_tables: &[(String, String)],
 ) -> Vec<String> {
     // Keep D2's temporary `auditstream_owner` self-grant active while D3 creates/alters functions,
-    // and run future monthly partition creation after triggers so holding a lock on `changes`
-    // cannot deadlock with in-flight writers holding an audited table.
+    // and run LZ4 TOAST compression and future monthly partition creation after triggers/drops so
+    // holding a lock on `changes` cannot deadlock with in-flight writers holding an audited table.
     let ddl_parts = ddl::generate_parts(ddl);
     let tables_sorted = canonicalize_tables(tables);
 
@@ -461,6 +462,7 @@ fn compose_statements_inner(
         .chain(ddl_parts.setup)
         .chain(trigger_stmts)
         .chain(drop_stmts)
+        .chain(std::iter::once(ddl_parts.toast_compression))
         .chain(std::iter::once(ddl_parts.future_partitions))
         .chain(std::iter::once(ddl_parts.role_cleanup))
         .chain(std::iter::once(RESTORE_LOCK_TIMEOUT.to_owned()))
@@ -704,21 +706,52 @@ mod tests {
             "canonical composition must not emit duplicate trigger role self-grant"
         );
 
-        // Triggers must be installed before future monthly partitions and role cleanup.
-        let trigger_idx = stmts
+        // Triggers and drops must run before LZ4 TOAST compression, future monthly partitions,
+        // and role cleanup (`audited_table -> changes` lock ordering).
+        let with_drops = compose_statements_inner(
+            &DdlOptions::new(ddl::DEFAULT_SCHEMA, vec!["app_user".to_owned()]),
+            &sample_tables(),
+            &[("public".to_owned(), "old_table".to_owned())],
+        );
+        let last_trigger_idx = with_drops
             .iter()
-            .position(|s| s.starts_with("CREATE OR REPLACE TRIGGER auditstream_insert"))
+            .rposition(|s| s.starts_with("CREATE OR REPLACE TRIGGER "))
             .expect("trigger statement");
-        let future_part_idx = stmts
+        let last_drop_idx = with_drops
+            .iter()
+            .rposition(|s| s.starts_with("DROP TRIGGER IF EXISTS "))
+            .expect("drop trigger statement");
+        let toast_idx = with_drops
+            .iter()
+            .position(|s| {
+                s.contains("default_toast_compression") && s.contains("SET COMPRESSION lz4")
+            })
+            .expect("LZ4 TOAST compression statement");
+        let future_part_idx = with_drops
             .iter()
             .position(|s| *s == ddl_parts.future_partitions)
             .expect("future partitions statement");
-        let cleanup_idx = stmts
+        let cleanup_idx = with_drops
             .iter()
             .position(|s| *s == ddl_parts.role_cleanup)
             .expect("role cleanup statement");
-        assert!(trigger_idx < future_part_idx);
+        assert!(last_trigger_idx < last_drop_idx);
+        assert!(last_drop_idx < toast_idx);
+        assert!(toast_idx < future_part_idx);
         assert!(future_part_idx < cleanup_idx);
+
+        // Capability check must precede role switch and ALTER TABLE in the LZ4 block.
+        let toast_sql = &with_drops[toast_idx];
+        let guard_pos = toast_sql
+            .find("default_toast_compression")
+            .expect("pg_settings capability guard");
+        let role_pos = toast_sql
+            .find("SET LOCAL ROLE")
+            .expect("auditstream_owner role switch");
+        let alter_pos = toast_sql
+            .find("SET COMPRESSION lz4")
+            .expect("ALTER TABLE SET COMPRESSION lz4");
+        assert!(guard_pos < role_pos && role_pos < alter_pos);
     }
 
     #[test]
