@@ -8,7 +8,7 @@
 
 - name: "area:pg"
   color: "1d76db"
-  description: "auditstream-pg: everything that speaks to Postgres"
+  description: "auditstream-pg: everything that speaks to PostgreSQL"
 
 - name: "area:export"
   color: "1d76db"

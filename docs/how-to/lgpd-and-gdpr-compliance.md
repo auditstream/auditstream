@@ -305,12 +305,12 @@ COMMIT;
 
 `auditstream.changes_2026_11` is owned by `auditstream_owner` (`NOLOGIN`), and `auditstream verify` forbids granting `MAINTAIN` to non-owners. Running bare `VACUUM` as a role that is neither `auditstream_owner`, the database owner, a superuser, nor (on PostgreSQL 17+) a member of `pg_maintain` **does not error** — PostgreSQL emits only a `WARNING` (`skipping ...` / `permission denied to vacuum ...`) and leaves scrubbed dead tuples containing leaked PII on disk.
 
-Because `VACUUM` cannot run inside a transaction block, execute it on a **direct (non-pooled) connection** as a superuser, as the database owner or an inheriting (`INHERIT`) PG 17+ `pg_maintain` member that **also holds `USAGE` on schema `auditstream`**, or briefly elevated to `auditstream_owner`, and confirm the `VERBOSE` output shows zero `skipping` warnings:
+Because `VACUUM` cannot run inside a transaction block, execute it on a **direct (non-pooled) connection** as a superuser, as the database owner or an inheriting (`INHERIT`) PostgreSQL 17+ `pg_maintain` member that **also holds `USAGE` on schema `auditstream`**, or briefly elevated to `auditstream_owner`, and confirm the `VERBOSE` output shows zero `skipping` warnings:
 
 ```sql
 -- Direct (non-pooled) connection only; outside a transaction block.
 -- Omit GRANT/SET ROLE/RESET ROLE/REVOKE only if running as superuser, or as the database owner /
--- inheriting (INHERIT) PG 17+ pg_maintain member that also holds USAGE on schema auditstream
+-- inheriting (INHERIT) PostgreSQL 17+ pg_maintain member that also holds USAGE on schema auditstream
 -- (otherwise keep this elevation block, since schema lookup checks USAGE for current_user before
 -- evaluating VACUUM privileges).
 -- On PostgreSQL 15, use: GRANT auditstream_owner TO migrator_role;

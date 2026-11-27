@@ -1,10 +1,10 @@
 # auditstream-pg
 
-Postgres adapter crate for the Auditstream Rust engine.
+PostgreSQL adapter crate for the Auditstream Rust engine.
 
 ## Owns
 
-- Everything that speaks to Postgres
+- Everything that speaks to PostgreSQL
 - Schema introspection and drift checks (`verify`)
 - History schema DDL, partition maintenance and trigger generation
 - Migration writers (Prisma, Drizzle, plain SQL)

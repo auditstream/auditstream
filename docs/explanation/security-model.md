@@ -73,7 +73,7 @@ Auditstream isolates audit storage behind a dedicated `NOLOGIN` role (`auditstre
 
 - **Capture integrity:** `missing`, `disabled`, `outdated`, `invalid_exclusion`, `default_partition_rows`, `insufficient_partitions`, and advisory `partitioned_table`.
 - **Privilege and tamper detection:** `unsafe_privileges`, `invalid_ownership`, and `tampered_history`.
-  `unsafe_privileges` detects unexpected grants, unsafe `auditstream_owner` attributes, recursive PG 16+ `ADMIN` memberships, and `session_replication_role = replica` overrides or non-superuser grants.
+  `unsafe_privileges` detects unexpected grants, unsafe `auditstream_owner` attributes, recursive PostgreSQL 16+ `ADMIN` memberships, and `session_replication_role = replica` overrides or non-superuser grants.
   `tampered_history` detects unexpected triggers (including internal RI triggers), rewrite rules, child-partition RLS policies, and unexpected helper overloads.
 - **Row-Level Security hygiene:** `forced_rls` and `rls_without_select_policy` are `error` findings.
   `forced_rls` catches `FORCE ROW LEVEL SECURITY`, which breaks `auditstream_owner` trigger writes and partition maintenance.
