@@ -117,6 +117,7 @@ Measured on 2026-11-24 against PostgreSQL 19.0 and PgBouncer 1.26.1 ([full bench
 ## Contributing and security
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
+Ask questions in [GitHub Discussions](https://github.com/auditstream/auditstream/discussions) or chat on the [Auditstream Discord](https://auditstream.dev/discord); see [SUPPORT.md](SUPPORT.md).
 Contributions require no CLA and no DCO.
 CI enforces `cargo-deny` for dependency advisories and licenses, `zizmor` for workflow hardening, and [GitHub Build Attestations](https://github.com/auditstream/auditstream/attestations) for release artifacts.
 Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
