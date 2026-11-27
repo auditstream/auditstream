@@ -39,6 +39,7 @@ Exact specifications of commands, configuration, exit codes, and database object
 Architecture, trade-offs, security model, and performance characteristics.
 
 - [How capture works](explanation/how-capture-works.md)
+- [Security model and threat-model boundaries](explanation/security-model.md)
 
 ## Project documentation
 

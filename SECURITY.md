@@ -9,6 +9,10 @@ During v0.x development, security fixes apply to the latest 0.x release (current
 | Latest `0.x` release (currently `0.1.x`) / `main` | Yes |
 | Earlier versions | No |
 
+## Security model
+
+For in-scope engine guarantees, operator responsibilities, and documented PostgreSQL/runtime threat-model boundaries, see [Security model and threat-model boundaries](docs/explanation/security-model.md).
+
 ## Reporting a vulnerability
 
 Please do **not** open a public GitHub issue for security vulnerabilities.
