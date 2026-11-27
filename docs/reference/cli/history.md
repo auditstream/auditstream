@@ -24,6 +24,9 @@ auditstream [GLOBAL OPTIONS] history [OPTIONS]
 | `--limit` | `1..=1000` | `100` | Maximum number of events returned |
 | `--format` | `table`, `json` | `table` | Output format written to stdout |
 | `--diff` | — | off | Show field-level `before -> after` diffs (`--format table` only) |
+| `--redact` | — | auto when configured | Require configured `[[export.redaction.rules]]` to be applied (exits `2` if none are configured; conflicts with `--unredacted`) |
+| `--unredacted` | — | off | Break-glass opt-out disabling configured `[[export.redaction.rules]]` (conflicts with `--redact`) |
+| `--omit-payload` | — | off | Omit `before` and `after` values (`null` in JSON), keeping event metadata and `changed` column names (cannot be combined with `--diff`) |
 
 ## Filter semantics
 
@@ -113,13 +116,33 @@ All human-readable terminal output (`--format table` and `--diff`) strips ANSI C
 ### JSON output (`--format json`)
 
 Prints one compact JSON event per line matching `spec/schemas/event.schema.json`.
-JSON output includes `before` and `after` and preserves arbitrary-precision PostgreSQL `numeric` values verbatim.
+JSON output includes `before` and `after` (unless `--omit-payload` is set, in which case both are `null`) and preserves arbitrary-precision PostgreSQL `numeric` values verbatim.
+
+## Redaction and payload omission
+
+When `[[export.redaction.rules]]` are configured in `auditstream.toml`, `auditstream history` applies them automatically across `--format table`, `--diff`, and `--format json` before writing anything to stdout:
+
+- **`mode = "mask"` (default):** Replaces matching top-level keys in `before` and `after` with `"[redacted]"` while keeping the column name in `changed` and preserving untouched key order and arbitrary-precision PostgreSQL `numeric` values.
+- **`mode = "remove"`:** Drops matching top-level keys from `before`, `after`, and `changed` (including the `CHANGED` column in `--format table` and diff lines in `--diff`).
+- **Stderr indicator:** Whenever configured redaction rules are active and at least one event is returned, `auditstream history` writes a concise note to stderr (formatted as plain text or a single-line JSON `INFO` record under `--log-format json`, and suppressed by `-q`/`--quiet`). Stdout remains reserved strictly for event data.
+- **`--redact`:** Enforces that at least one `[[export.redaction.rules]]` rule is loaded; exits `2` without querying PostgreSQL if no rules are configured. Useful in scripts or coding-agent wrappers that must fail closed if `auditstream.toml` is missing.
+- **`--unredacted`:** Explicit break-glass flag for local debugging that disables configured redaction rules and suppresses the redaction stderr note. Conflicts with `--redact` (exit `2`).
+- **`--omit-payload`:** Sets `before` and `after` to `null` (preserving `spec/schemas/event.schema.json` compliance, event metadata, and `changed` column names) for compact, payload-free incident timelines and agent inspection. Cannot be combined with `--diff` (exit `2`). When redaction rules are configured and `--unredacted` is not set, `mode = "remove"` rules still filter `changed`.
+- **Terminal escaping preserved:** `--format table` and `--diff` continue applying terminal escaping (stripping ANSI/C0/C1/BiDi controls and normalizing line breaks) to all displayed fields and keys when redaction is active.
+- **Fail-closed on non-object payloads:** If a matching redaction rule encounters a non-object or malformed JSON payload (such as an `app` event whose `data` is a JSON array), `auditstream history` aborts with exit code `5` before emitting the redaction note or writing any event to stdout (use `--omit-payload` for payload-free metadata or `--unredacted` for break-glass inspection).
+
+### Redaction scope (v0.1)
+
+- **Top-level `before`/`after` keys only:** In v0.1, `[[export.redaction.rules]]` matches top-level JSON object keys inside `before` and `after` only.
+- **Secrets belong in `capture.exclude`:** Secrets, credentials, password hashes, payment card numbers (PAN/CVV), and API tokens should be excluded via `capture.exclude` so triggers never write them into `auditstream.changes`.
+- **Nested JSONB and `record_id`:** Nested JSONB path redaction and `record_id` redaction / HMAC pseudonymization are planned for v0.3. In v0.1, `record_id` is never redacted; prefer surrogate primary keys and opaque `log_event()` `target` identifiers when inspected output must exclude PII. See [Configuration reference: Export redaction](../config.md#export-redaction-exportredactionrules).
 
 ## Exit codes
 
 - `0`: Query succeeded (including when no events matched or stdout closed early).
-- `2`: Invalid CLI flags, filter combinations, timestamps, or configuration.
+- `2`: Invalid CLI flags, filter combinations, timestamps, configuration (including invalid `export.redaction` rules), or `--redact` passed with no configured rules.
 - `3`: Database unreachable or query failed.
 - `4`: Writing output failed.
+- `5`: Fail-closed redaction error on a non-object or malformed event payload, or unexpected internal failure.
 
 See [Exit codes](../exit-codes.md) for the full table.

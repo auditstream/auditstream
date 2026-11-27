@@ -690,7 +690,7 @@ pub(crate) struct ExportConfig {
     pub(crate) sink: SinkConfig,
     /// Raw export redaction policy from `auditstream.toml` (bound into export checkpoints).
     pub(crate) redaction: Redaction,
-    /// Pre-validated, pre-compiled redaction rules applied before `sink.write`.
+    /// Pre-validated, pre-compiled redaction rules applied by `export` and `history`.
     pub(crate) compiled_redaction: CompiledRedaction,
 }
 
