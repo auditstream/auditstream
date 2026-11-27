@@ -13,6 +13,7 @@ permissions: {}
 jobs:
   publish:
     name: Publish ghcr.io/auditstream/auditstream
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/auditstream-v') }}
     runs-on: ubuntu-24.04
     permissions:
       attestations: write
