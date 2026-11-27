@@ -1626,3 +1626,157 @@ async fn install_statements_and_render_install_sql_install_clean_schema_and_reje
     .expect("count captured invoice rows");
     assert_eq!(captured, 1);
 }
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn lz4_upgrade_from_v0_1_0_preserves_lock_order_and_skips_historical_partitions() {
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let db = TestDb::new().await.expect("create TestDb");
+    let admin_url = db.admin_url().to_owned();
+    let app_role = format!("lz4_upg_{}", db.database_name());
+    let legacy = V0_1_0_PLAIN_SQL.replace("app_user", &app_role);
+    let dir = ScratchDir::new("lz4_v0_1_0_upgrade");
+    fs::write(dir.path().join("20261124123000_auditstream.sql"), &legacy)
+        .expect("save v0.1.0 migration");
+
+    let mut admin = PgConnection::connect(db.url()).await.expect("connect");
+    admin
+        .execute(AssertSqlSafe(format!(
+            "CREATE ROLE {} NOLOGIN",
+            quote_ident(&app_role)
+        )))
+        .await
+        .expect("create role");
+    admin
+        .execute(
+            "CREATE TABLE public.invoice (id int PRIMARY KEY, status text, password_hash text); \
+             CREATE TABLE public.line_item (id int PRIMARY KEY, invoice_id int, qty int);",
+        )
+        .await
+        .expect("create tables");
+    admin
+        .execute(AssertSqlSafe(legacy))
+        .await
+        .expect("install v0.1.0");
+    admin
+        .execute(
+            "CREATE TABLE auditstream.changes_2025_01 PARTITION OF auditstream.changes \
+               FOR VALUES FROM ('2025-01-01 00:00:00+00') TO ('2025-02-01 00:00:00+00'); \
+             ALTER TABLE auditstream.changes_2025_01 OWNER TO auditstream_owner; \
+             REVOKE ALL ON TABLE auditstream.changes_2025_01 FROM PUBLIC CASCADE; \
+             INSERT INTO public.invoice (id, status) VALUES (1, 'open');",
+        )
+        .await
+        .expect("seed historical partition and initial row");
+
+    let options = MigrationOptions::new(
+        MigrationFormat::Sql,
+        dir.path(),
+        fixed_time() + time::Duration::days(1),
+        DdlOptions::new(DEFAULT_SCHEMA, vec![app_role.clone()]),
+        fixture_tables(),
+    );
+    let WriteOutcome::Written { files, .. } = migrations::write(&options).expect("write refresh")
+    else {
+        panic!("expected Written refresh migration");
+    };
+    let refresh_sql = fs::read_to_string(&files[0]).expect("read refresh");
+
+    // Hold an in-flight writer on public.invoice BEFORE the LZ4 upgrade migration runs,
+    // wait until the migration blocks on public.invoice (trigger step), then perform an
+    // audited write into auditstream.changes. Because LZ4 SET COMPRESSION runs AFTER
+    // trigger_stmts/drop_stmts, lock ordering stays `audited_table -> changes` with zero deadlock.
+    let mut writer = admin.begin().await.expect("begin writer");
+    writer
+        .execute("UPDATE public.invoice SET status = status WHERE false")
+        .await
+        .expect("lock invoice");
+
+    let url = db.url().to_owned();
+    let refresh_task = tokio::spawn(async move {
+        let mut conn = PgConnection::connect(&url).await.expect("connect");
+        conn.execute(AssertSqlSafe(refresh_sql)).await.map(|_| ())
+    });
+    wait_until_a_lock_on_invoice_is_awaited(&db).await;
+
+    writer
+        .execute("UPDATE public.invoice SET status = 'paid' WHERE id = 1")
+        .await
+        .expect("in-flight write must not deadlock with LZ4 upgrade migration");
+    writer.commit().await.expect("commit writer");
+    refresh_task
+        .await
+        .expect("join refresh")
+        .expect("LZ4 upgrade migration finishes cleanly after writer commits");
+
+    let server_supports_lz4: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+           SELECT 1 FROM pg_catalog.pg_settings \
+            WHERE name = 'default_toast_compression' AND 'lz4' = ANY(enumvals) \
+         )",
+    )
+    .fetch_one(&mut admin)
+    .await
+    .expect("check server LZ4 support");
+
+    let comps: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT c.relname::text, a.attname::text, a.attcompression::text \
+           FROM pg_catalog.pg_class c \
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+           JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid \
+          WHERE n.nspname = 'auditstream' \
+            AND c.relkind IN ('r', 'p') \
+            AND a.attname IN ('before', 'after') \
+            AND a.attnum > 0 AND NOT a.attisdropped \
+          ORDER BY c.relname, a.attname",
+    )
+    .fetch_all(&mut admin)
+    .await
+    .expect("query attcompression after upgrade");
+
+    assert!(
+        comps.len() >= 14,
+        "expected parent + default + historical + >=4 current/future partitions x 2 cols, got {comps:?}"
+    );
+    let hist_count = comps
+        .iter()
+        .filter(|(rel, _, _)| rel == "changes_2025_01")
+        .count();
+    assert_eq!(
+        hist_count, 2,
+        "expected before + after rows for historical partition changes_2025_01, got {comps:?}"
+    );
+    for (rel, col, comp) in &comps {
+        if rel == "changes_2025_01" {
+            assert_eq!(
+                comp, "",
+                "historical partition {rel}.{col} must stay untouched"
+            );
+        } else if server_supports_lz4 {
+            assert_eq!(comp, "l", "upgraded {rel}.{col} must use LZ4 compression");
+        } else {
+            assert_ne!(
+                comp, "l",
+                "non-LZ4 server must not set LZ4 compression on {rel}.{col}"
+            );
+        }
+    }
+
+    let report = verify::check(db.pool(), &fixture_tables())
+        .await
+        .expect("verify after LZ4 upgrade");
+    assert!(report.findings.is_empty(), "{:?}", report.findings);
+
+    admin.close().await.expect("close admin");
+    drop(db);
+    let mut cleanup = PgConnection::connect(&admin_url)
+        .await
+        .expect("cleanup connect");
+    let _ = cleanup
+        .execute(AssertSqlSafe(format!(
+            "DROP ROLE IF EXISTS {}",
+            quote_ident(&app_role)
+        )))
+        .await;
+    let _ = cleanup.close().await;
+}

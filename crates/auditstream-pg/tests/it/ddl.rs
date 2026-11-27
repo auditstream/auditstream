@@ -1522,6 +1522,45 @@ async fn adversarial_dollar_quote_schema_names_install_and_execute_without_break
     .await
     .expect("read back row from adversarial schema");
     assert_eq!(recorded_op, "invoice.exported");
+
+    let server_supports_lz4: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+           SELECT 1 FROM pg_catalog.pg_settings \
+            WHERE name = 'default_toast_compression' AND 'lz4' = ANY(enumvals) \
+         )",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .expect("check LZ4 support");
+    let adversarial_comps: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT c.relname::text, a.attname::text, a.attcompression::text \
+           FROM pg_catalog.pg_class c \
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+           JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid \
+          WHERE n.nspname = $1 \
+            AND c.relkind IN ('r', 'p') \
+            AND a.attname IN ('before', 'after') \
+            AND a.attnum > 0 AND NOT a.attisdropped \
+          ORDER BY c.relname, a.attname",
+    )
+    .bind(schema)
+    .fetch_all(&mut conn)
+    .await
+    .expect("query attcompression in adversarial schema");
+    assert!(
+        adversarial_comps.len() >= 12,
+        "expected parent + default + 4 monthly partitions x 2 cols, got {adversarial_comps:?}"
+    );
+    for (rel, col, comp) in &adversarial_comps {
+        if server_supports_lz4 {
+            assert_eq!(
+                comp, "l",
+                "adversarial schema {rel}.{col} must use LZ4 compression"
+            );
+        } else {
+            assert_ne!(comp, "l");
+        }
+    }
     conn.close().await.expect("close conn");
 }
 
@@ -1720,4 +1759,366 @@ async fn log_event_handles_nondeterministic_icu_collations_deterministically() {
     }
 
     conn.close().await.expect("close conn");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn lz4_toast_compression_sets_current_and_future_skips_historical_and_is_lock_free_on_rerun()
+{
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let db = TestDb::non_superuser()
+        .await
+        .expect("create non-superuser TestDb");
+    let admin_url = db.admin_url().to_owned();
+    let migrator_role = db.role_name().expect("migrator role").to_owned();
+    let (base_admin, _) = admin_url.rsplit_once('/').expect("admin url slash");
+    let admin_db_url = format!("{base_admin}/{}", db.database_name());
+
+    // Prepare clean owner role / delegation for the non-superuser migrator.
+    {
+        let mut admin = PgConnection::connect(&admin_url)
+            .await
+            .expect("admin connect");
+        admin
+            .execute(AssertSqlSafe(format!(
+                "DO $$ BEGIN \
+                   DROP ROLE IF EXISTS {owner}; \
+                 EXCEPTION WHEN dependent_objects_still_exist THEN \
+                   IF pg_catalog.current_setting('server_version_num')::int >= 160000 THEN \
+                     EXECUTE 'GRANT {owner} TO {mig} WITH ADMIN OPTION, INHERIT FALSE, SET FALSE'; \
+                   END IF; \
+                 END $$",
+                owner = quote_ident(OWNER_ROLE),
+                mig = quote_ident(&migrator_role),
+            )))
+            .await
+            .expect("prepare owner role");
+        admin.close().await.expect("close admin");
+    }
+
+    let stmts = ddl::generate(&DdlOptions::default());
+    let toast_stmt = stmts
+        .iter()
+        .find(|s| s.contains("default_toast_compression") && s.contains("SET COMPRESSION lz4"))
+        .expect("ddl::generate must emit lock-free LZ4 TOAST compression statement")
+        .clone();
+
+    let mut conn = PgConnection::connect(db.url())
+        .await
+        .expect("migrator connect");
+    let server_supports_lz4: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+           SELECT 1 FROM pg_catalog.pg_settings \
+            WHERE name = 'default_toast_compression' AND 'lz4' = ANY(enumvals) \
+         )",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .expect("check server LZ4 support");
+
+    // 1. Fresh install as non-superuser migrator.
+    run_statements_tx(&mut conn, &stmts)
+        .await
+        .expect("non-superuser DDL setup must succeed");
+
+    let mut admin = PgConnection::connect(&admin_db_url)
+        .await
+        .expect("admin db connect");
+
+    let compression_rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT c.relname::text, a.attname::text, a.attcompression::text \
+           FROM pg_catalog.pg_class c \
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+           JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid \
+          WHERE n.nspname = 'auditstream' \
+            AND c.relkind IN ('r', 'p') \
+            AND a.attname IN ('before', 'after') \
+            AND a.attnum > 0 AND NOT a.attisdropped \
+          ORDER BY c.relname, a.attname",
+    )
+    .fetch_all(&mut admin)
+    .await
+    .expect("query attcompression");
+    assert!(
+        compression_rows.len() >= 12,
+        "expected parent + default + 4 monthly partitions x 2 cols, got {compression_rows:?}"
+    );
+    if server_supports_lz4 {
+        for (rel, col, comp) in &compression_rows {
+            assert_eq!(
+                comp, "l",
+                "expected attcompression='l' on {rel}.{col}, got {comp:?}"
+            );
+        }
+
+        // Verify PostgreSQL actually compresses large JSONB payloads with LZ4.
+        admin
+            .execute(
+                "INSERT INTO auditstream.changes (source, op, after, db_user, schema_version) \
+                 VALUES ('app', 'lz4.probe', jsonb_build_object('pad', repeat('abcdefghij', 500)), 'postgres', 1)",
+            )
+            .await
+            .expect("insert large payload");
+        let actual_codec: Option<String> = sqlx::query_scalar(
+            "SELECT pg_catalog.pg_column_compression(after) \
+               FROM auditstream.changes WHERE op = 'lz4.probe'",
+        )
+        .fetch_one(&mut admin)
+        .await
+        .expect("check pg_column_compression");
+        assert_eq!(actual_codec.as_deref(), Some("lz4"));
+
+        // Verify partitions::ensure_ahead inherits attcompression = 'l' automatically.
+        let report = auditstream_pg::partitions::ensure_ahead(db.pool(), DEFAULT_SCHEMA, 4)
+            .await
+            .expect("ensure_ahead month +4");
+        assert_eq!(report.created.len(), 1);
+        let month4_name = report.created[0].partition_name();
+        let month4_comps: Vec<String> = sqlx::query_scalar(
+            "SELECT a.attcompression::text \
+               FROM pg_catalog.pg_class c \
+               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+               JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid \
+              WHERE n.nspname = 'auditstream' AND c.relname = $1 \
+                AND a.attname IN ('before', 'after') AND a.attnum > 0 AND NOT a.attisdropped",
+        )
+        .bind(&month4_name)
+        .fetch_all(&mut admin)
+        .await
+        .expect("query month +4 compression");
+        assert_eq!(month4_comps, vec!["l", "l"]);
+    } else {
+        for (rel, col, comp) in &compression_rows {
+            assert_ne!(
+                comp, "l",
+                "non-LZ4 server must not set attcompression='l' on {rel}.{col}"
+            );
+        }
+    }
+
+    // 2. Historical partition (< current UTC month) must stay untouched and NEVER be locked,
+    //    even while an upgrade migration sets LZ4 on parent, default, and current/future months.
+    //    Also test child-only drift (parent already 'l' while `changes_default` has 'p') to verify
+    //    parent `changes` is locked FIRST (`AccessExclusiveLock`) before altering any child.
+    admin
+        .execute(
+            "CREATE TABLE auditstream.changes_2025_01 PARTITION OF auditstream.changes \
+               FOR VALUES FROM ('2025-01-01 00:00:00+00') TO ('2025-02-01 00:00:00+00'); \
+             ALTER TABLE ONLY auditstream.changes_2025_01 \
+               ALTER COLUMN before SET COMPRESSION default, \
+               ALTER COLUMN after SET COMPRESSION default; \
+             ALTER TABLE auditstream.changes_2025_01 OWNER TO auditstream_owner; \
+             REVOKE ALL ON TABLE auditstream.changes_2025_01 FROM PUBLIC CASCADE; \
+             ALTER TABLE ONLY auditstream.changes_default \
+               ALTER COLUMN after SET COMPRESSION pglz;",
+        )
+        .await
+        .expect("seed historical partition and child-only compression drift");
+
+    if server_supports_lz4 {
+        let mut child_only_tx = conn.begin().await.expect("begin child-only heal tx");
+        run_statements(&mut child_only_tx, &stmts)
+            .await
+            .expect("child-only compression drift heals cleanly");
+        let child_heal_locks: Vec<String> = sqlx::query_scalar(
+            "SELECT c.relname || ': ' || l.mode FROM pg_catalog.pg_locks l \
+               JOIN pg_catalog.pg_class c ON c.oid = l.relation \
+              WHERE l.pid = pg_catalog.pg_backend_pid() \
+                AND c.relnamespace = 'auditstream'::pg_catalog.regnamespace \
+                AND l.mode = 'AccessExclusiveLock' \
+              ORDER BY 1",
+        )
+        .fetch_all(&mut *child_only_tx)
+        .await
+        .expect("read child-only heal locks");
+        assert!(
+            child_heal_locks.contains(&"changes: AccessExclusiveLock".to_owned()),
+            "parent `changes` must acquire AccessExclusiveLock before altering child partition to prevent child->parent deadlocks, got: {child_heal_locks:?}"
+        );
+        assert!(
+            child_heal_locks.contains(&"changes_default: AccessExclusiveLock".to_owned()),
+            "drifted child `changes_default` must be altered, got: {child_heal_locks:?}"
+        );
+        assert!(
+            !child_heal_locks
+                .iter()
+                .any(|entry| entry.starts_with("changes_2025_01:")),
+            "historical partition must never be locked, got: {child_heal_locks:?}"
+        );
+        child_only_tx
+            .commit()
+            .await
+            .expect("commit child-only heal tx");
+    }
+
+    admin
+        .execute(
+            "ALTER TABLE ONLY auditstream.changes \
+               ALTER COLUMN before SET COMPRESSION pglz; \
+             ALTER TABLE ONLY auditstream.changes_default \
+               ALTER COLUMN after SET COMPRESSION pglz;",
+        )
+        .await
+        .expect("seed parent + child pre-LZ4 compression");
+
+    let mut hist_blocker = admin.begin().await.expect("begin historical lock tx");
+    hist_blocker
+        .execute("LOCK TABLE auditstream.changes_2025_01 IN ACCESS EXCLUSIVE MODE")
+        .await
+        .expect("hold ACCESS EXCLUSIVE on historical partition");
+
+    {
+        let mut upgrade_tx = conn.begin().await.expect("begin upgrade tx");
+        upgrade_tx
+            .execute("SET LOCAL lock_timeout = '500ms'")
+            .await
+            .expect("set lock_timeout");
+        run_statements(&mut upgrade_tx, &stmts)
+            .await
+            .expect("upgrade must not lock historical partition changes_2025_01");
+        upgrade_tx.commit().await.expect("commit upgrade tx");
+    }
+    hist_blocker
+        .rollback()
+        .await
+        .expect("release historical lock");
+
+    let hist_comps: Vec<String> = sqlx::query_scalar(
+        "SELECT a.attcompression::text \
+           FROM pg_catalog.pg_class c \
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+           JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid \
+          WHERE n.nspname = 'auditstream' AND c.relname = 'changes_2025_01' \
+            AND a.attname IN ('before', 'after') AND a.attnum > 0 AND NOT a.attisdropped",
+    )
+    .fetch_all(&mut admin)
+    .await
+    .expect("query historical partition compression");
+    assert_eq!(
+        hist_comps,
+        vec!["", ""],
+        "historical partition attcompression must stay untouched"
+    );
+
+    if server_supports_lz4 {
+        let upgraded_parent: Vec<String> = sqlx::query_scalar(
+            "SELECT a.attcompression::text \
+               FROM pg_catalog.pg_class c \
+               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+               JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid \
+              WHERE n.nspname = 'auditstream' \
+                AND c.relname IN ('changes', 'changes_default') \
+                AND a.attname IN ('before', 'after') AND a.attnum > 0 AND NOT a.attisdropped",
+        )
+        .fetch_all(&mut admin)
+        .await
+        .expect("query upgraded parent/default compression");
+        assert_eq!(upgraded_parent, vec!["l", "l", "l", "l"]);
+    }
+
+    // 3. Re-running DDL a second time must execute zero ALTER TABLE commands and hold zero
+    //    blocking locks on auditstream.*.
+    admin
+        .execute(
+            "CREATE FUNCTION reject_alter_on_rerun() RETURNS event_trigger LANGUAGE plpgsql \
+             AS $$ BEGIN RAISE EXCEPTION 'unexpected % on rerun', tg_tag; END $$; \
+             CREATE EVENT TRIGGER reject_alter_on_rerun ON ddl_command_start \
+             WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION reject_alter_on_rerun()",
+        )
+        .await
+        .expect("install ALTER TABLE event trigger");
+
+    {
+        let mut rerun_tx = conn.begin().await.expect("begin rerun tx");
+        run_statements(&mut rerun_tx, &stmts)
+            .await
+            .expect("second DDL run must execute zero ALTER TABLE commands");
+        let blocking: Vec<String> = sqlx::query_scalar(
+            "SELECT c.relname || ': ' || l.mode FROM pg_catalog.pg_locks l \
+               JOIN pg_catalog.pg_class c ON c.oid = l.relation \
+              WHERE l.pid = pg_catalog.pg_backend_pid() \
+                AND c.relnamespace = 'auditstream'::pg_catalog.regnamespace \
+                AND l.mode IN ('ShareLock', 'ShareRowExclusiveLock', 'ExclusiveLock', 'AccessExclusiveLock') \
+              ORDER BY 1",
+        )
+        .fetch_all(&mut *rerun_tx)
+        .await
+        .expect("read rerun locks");
+        assert!(
+            blocking.is_empty(),
+            "second DDL run must hold zero blocking locks, got: {blocking:?}"
+        );
+        rerun_tx.commit().await.expect("commit rerun tx");
+    }
+
+    // 4. Simulate a PostgreSQL server compiled without `--with-lz4`: resetting `before` to pglz
+    //    and probing a missing codec in `enumvals` must return lock-free before any ALTER TABLE.
+    admin
+        .execute("DROP EVENT TRIGGER reject_alter_on_rerun")
+        .await
+        .expect("temporarily drop event trigger");
+    admin
+        .execute("ALTER TABLE ONLY auditstream.changes ALTER COLUMN before SET COMPRESSION pglz")
+        .await
+        .expect("reset before to pglz");
+    admin
+        .execute(
+            "CREATE EVENT TRIGGER reject_alter_on_rerun ON ddl_command_start \
+             WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION reject_alter_on_rerun()",
+        )
+        .await
+        .expect("reinstall event trigger");
+
+    let non_lz4_probe = toast_stmt.replacen("'lz4' = ANY", "'__no_lz4__' = ANY", 1);
+    assert_ne!(
+        non_lz4_probe, toast_stmt,
+        "toast_compression statement must check `'lz4' = ANY(enumvals)`"
+    );
+    {
+        let mut no_lz4_tx = conn.begin().await.expect("begin non-lz4 tx");
+        no_lz4_tx
+            .execute(AssertSqlSafe(non_lz4_probe))
+            .await
+            .expect("non-LZ4 server path must return before acquiring any ALTER TABLE lock");
+        let held_locks: Vec<String> = sqlx::query_scalar(
+            "SELECT c.relname || ': ' || l.mode FROM pg_catalog.pg_locks l \
+               JOIN pg_catalog.pg_class c ON c.oid = l.relation \
+              WHERE l.pid = pg_catalog.pg_backend_pid() \
+                AND c.relnamespace = 'auditstream'::pg_catalog.regnamespace \
+              ORDER BY 1",
+        )
+        .fetch_all(&mut *no_lz4_tx)
+        .await
+        .expect("check non-lz4 locks");
+        assert!(
+            held_locks.is_empty(),
+            "non-LZ4 capability guard must acquire zero locks on auditstream.*, got: {held_locks:?}"
+        );
+        no_lz4_tx.commit().await.expect("commit non-lz4 tx");
+    }
+    let before_comp: String = sqlx::query_scalar(
+        "SELECT a.attcompression::text \
+           FROM pg_catalog.pg_class c \
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+           JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid \
+          WHERE n.nspname = 'auditstream' AND c.relname = 'changes' AND a.attname = 'before'",
+    )
+    .fetch_one(&mut admin)
+    .await
+    .expect("read before compression");
+    assert_eq!(before_comp, "p");
+
+    admin.close().await.expect("close admin");
+    conn.close().await.expect("close migrator");
+    drop(db);
+    let mut cleanup = PgConnection::connect(&admin_url)
+        .await
+        .expect("admin cleanup");
+    let _ = cleanup
+        .execute(AssertSqlSafe(format!(
+            "DROP ROLE IF EXISTS {}",
+            quote_ident(OWNER_ROLE)
+        )))
+        .await;
+    let _ = cleanup.close().await;
 }

@@ -39,6 +39,16 @@ The primary key is `(id, occurred_at)` to satisfy PostgreSQL range partitioning.
 - `auditstream verify` exits `1` whenever `changes_default` holds any row.
 - A `BRIN` index on `(occurred_at)` always exists on `auditstream.changes`.
 
+### TOAST compression
+
+When the target PostgreSQL server supports LZ4 TOAST compression (`'lz4' = ANY(enumvals)` on `default_toast_compression` in `pg_catalog.pg_settings`), Auditstream sets `COMPRESSION lz4` on the `before` and `after` `jsonb` columns for parent `auditstream.changes`, `changes_default`, and current/future monthly partitions (`changes_YYYY_MM` from the current UTC month onward).
+
+- **Future partitions:** Monthly partitions created afterward by migrations or `auditstream verify --fix` automatically inherit `COMPRESSION lz4` from parent `auditstream.changes`.
+- **Historical partitions:** Partitions older than the current UTC month are left untouched because `ALTER TABLE ... SET COMPRESSION` does not rewrite already-stored TOAST values, avoiding unnecessary `ACCESS EXCLUSIVE` locks on archived months during migrations.
+- **Servers without LZ4:** On PostgreSQL builds compiled without `--with-lz4`, migrations detect the missing codec lock-free via `pg_catalog.pg_settings`, skip `SET COMPRESSION lz4`, and fall back to PostgreSQL's built-in `pglz` compression.
+- **Dump/restore portability:** When dumping from an LZ4-enabled server and restoring onto a PostgreSQL server compiled without `--with-lz4`, pass `--no-toast-compression` to `pg_dump` or `pg_dumpall` at dump time so standalone `ALTER TABLE ... SET COMPRESSION lz4;` statements are omitted (rows are logically decompressed on dump and re-compressed on restore). `pg_restore` does not accept `--no-toast-compression`; if an archive was already dumped without that flag, re-dump with `pg_dump --no-toast-compression` or remove those `ALTER TABLE ... SET COMPRESSION lz4;` statements from SQL emitted by `pg_restore -f -`.
+- **Replication:** Physical (streaming / WAL-based) standbys replicate compressed TOAST tuples verbatim and must also be compiled with `--with-lz4`. Logical replication decodes tuples before sending and is unaffected.
+
 ## Capture triggers
 
 `auditstream init` installs four triggers on each audited table:
