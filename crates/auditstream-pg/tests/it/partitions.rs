@@ -280,20 +280,27 @@ async fn malicious_lock_timeout_is_rejected_by_parameterized_set_config_without_
     let db = TestDb::new().await.expect("create TestDb");
     install_ddl(&db).await;
 
-    // Use `standard_conforming_strings = off` with a `\'` breakout payload so any unparameterized
-    // `'...'` interpolation of `SET LOCAL lock_timeout = ...` would break out of the string literal.
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .after_connect(|conn, _meta| {
+    // Use `standard_conforming_strings = off` (on PG <= 18; PG 19 removed non-standard string
+    // literals) with a `\'` breakout payload so any unparameterized `'...'` interpolation of
+    // `SET LOCAL lock_timeout = ...` would break out of the string literal.
+    let scs_off = {
+        let mut probe = db.pool().acquire().await.expect("acquire probe conn");
+        crate::supports_non_standard_strings(&mut probe).await
+    };
+    let mut pool_opts = PgPoolOptions::new().max_connections(2);
+    if scs_off {
+        pool_opts = pool_opts.after_connect(|conn, _meta| {
             Box::pin(async move {
                 conn.execute("SET standard_conforming_strings = off")
                     .await?;
                 Ok(())
             })
-        })
+        });
+    }
+    let pool = pool_opts
         .connect(db.url())
         .await
-        .expect("connect scs=off pool");
+        .expect("connect test pool");
 
     let opts = EnsureOptions::new(DEFAULT_SCHEMA, 5)
         .with_lock_timeout(r"100ms\'; CREATE TABLE public.lock_timeout_pwned (id int); --");

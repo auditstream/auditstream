@@ -1489,12 +1489,16 @@ async fn adversarial_dollar_quote_schema_names_install_and_execute_without_break
         }
     }
 
-    // Install and idempotently re-apply under `standard_conforming_strings = off`.
+    // Install and idempotently re-apply (under `standard_conforming_strings = off` on PG <= 18;
+    // PG 19 removed non-standard string literals with SQLSTATE 0A000).
+    let scs_off = crate::supports_non_standard_strings(&mut conn).await;
     for phase in ["install", "re-apply"] {
         let mut tx = conn.begin().await.expect("begin tx");
-        tx.execute("SET LOCAL standard_conforming_strings = off")
-            .await
-            .expect("disable standard_conforming_strings");
+        if scs_off {
+            tx.execute("SET LOCAL standard_conforming_strings = off")
+                .await
+                .expect("disable standard_conforming_strings");
+        }
         run_statements(&mut tx, &stmts)
             .await
             .unwrap_or_else(|err| panic!("adversarial schema {phase} failed: {err}"));
@@ -1558,14 +1562,18 @@ async fn standard_conforming_strings_off_prevents_quote_literal_breakout_and_pre
         vec![spec],
     )));
 
-    // Apply ALL generated statements inside a transaction with `standard_conforming_strings = off`.
+    // Apply ALL generated statements inside a transaction (with `standard_conforming_strings = off`
+    // on PG <= 18; PG 19 removed non-standard string literals with SQLSTATE 0A000).
+    let scs_off = crate::supports_non_standard_strings(&mut conn).await;
     let mut tx = conn.begin().await.expect("begin tx");
-    tx.execute("SET LOCAL standard_conforming_strings = off")
-        .await
-        .expect("disable standard_conforming_strings");
+    if scs_off {
+        tx.execute("SET LOCAL standard_conforming_strings = off")
+            .await
+            .expect("disable standard_conforming_strings");
+    }
     run_statements(&mut tx, &stmts)
         .await
-        .expect("install DDL & triggers safely under standard_conforming_strings = off");
+        .expect("install DDL & triggers safely");
     tx.commit().await.expect("commit tx");
 
     let pwned_exists: bool =
