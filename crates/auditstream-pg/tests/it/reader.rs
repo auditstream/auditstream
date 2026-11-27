@@ -1392,7 +1392,7 @@ async fn cursor_ahead_of_xmin_fails_loudly_and_anchor_timeline_and_lag_work_as_r
         .expect("insert trailing db event");
     let (tail_xact_raw, tail_event_id): (String, String) = sqlx::query_as(
         "SELECT xact_id::text, event_id::text FROM auditstream.changes \
-         ORDER BY xact_id DESC, id DESC LIMIT 1",
+         ORDER BY changes.xact_id DESC, changes.id DESC LIMIT 1",
     )
     .fetch_one(&reader_pool)
     .await
@@ -1546,4 +1546,243 @@ async fn cursor_ahead_of_xmin_fails_loudly_and_anchor_timeline_and_lag_work_as_r
     drop(db);
     cleanup_role(&admin_url, &app_role).await;
     cleanup_role(&admin_url, &reader_role).await;
+}
+
+#[tokio::test]
+async fn export_across_power_of_ten_xid8_boundary_preserves_all_events_and_tail_anchor() {
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let ReaderFixture {
+        db,
+        app_role,
+        reader_role,
+        app_pool,
+        reader_pool,
+        admin_url,
+        ..
+    } = setup_reader_db().await;
+
+    let xmin: u64 = sqlx::query_scalar::<_, String>(
+        "SELECT pg_catalog.pg_snapshot_xmin(pg_catalog.pg_current_snapshot())::text",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("fetch xmin")
+    .parse()
+    .expect("parse xmin");
+    assert!(
+        xmin > 100,
+        "fresh test database xmin ({xmin}) must exceed synthetic fixture xact_ids"
+    );
+
+    // Insert 5 rows whose xact_ids cross two power-of-10 boundaries (9 -> 10 and 99 -> 100)
+    // and share a same-xact_id tie at 100. Unqualified `ORDER BY xact_id` resolves to the
+    // `xact_id::text` SELECT alias: ASC drops xact_ids 9 and 99; DESC picks 99 instead of 100
+    // as the filtered tail BoundaryAnchor.
+    db.execute(
+        "INSERT INTO auditstream.changes \
+           (xact_id, source, schema_name, table_name, op, record_id) \
+         VALUES \
+           ('9'::xid8,   'db', 'public', 'invoice', 'INSERT', '{\"seq\":1}'::jsonb), \
+           ('10'::xid8,  'db', 'public', 'invoice', 'INSERT', '{\"seq\":2}'::jsonb), \
+           ('99'::xid8,  'db', 'public', 'invoice', 'INSERT', '{\"seq\":3}'::jsonb), \
+           ('100'::xid8, 'db', 'public', 'invoice', 'INSERT', '{\"seq\":4}'::jsonb), \
+           ('100'::xid8, 'db', 'public', 'invoice', 'INSERT', '{\"seq\":5}'::jsonb)",
+    )
+    .await
+    .expect("seed power-of-10 xact_id fixture");
+
+    // 1. Unfiltered multi-batch export delivers all 5 events in numeric xid8 order.
+    let mut source = PgEventSource::with_default_schema(reader_pool.clone(), Cursor::new(0, 0));
+    let mut delivered = Vec::new();
+    let mut batches = 0usize;
+    while let Some(batch) = source.next_batch(2).await.expect("next_batch(2)") {
+        assert!(batch.events.len() <= 2);
+        let cursor = batch.cursor.expect("batch cursor");
+        source.ack(&cursor).await.expect("ack");
+        delivered.extend(batch.events);
+        batches += 1;
+    }
+
+    let record_ids: Vec<&str> = delivered
+        .iter()
+        .map(|ev| ev.record_id.as_deref().expect("record_id").get())
+        .collect();
+    assert_eq!(
+        record_ids,
+        vec![
+            r#"{"seq":1}"#,
+            r#"{"seq":2}"#,
+            r#"{"seq":3}"#,
+            r#"{"seq":4}"#,
+            r#"{"seq":5}"#,
+        ],
+        "export must deliver all 5 events in numeric xid8 order across power-of-10 boundaries"
+    );
+    assert_eq!(batches, 3, "5 events with batch_size=2 must span 3 batches");
+    assert!(
+        source
+            .next_batch(2)
+            .await
+            .expect("empty after drain")
+            .is_none()
+    );
+
+    // 2. Filtered export with 0 matching rows must anchor the true numeric max row (xact_id=100,
+    //    seq=5), NOT lexicographic max `"99"`, so failover resume verification passes cleanly.
+    assert_filtered_tail_anchor_is_numeric_max(&reader_pool, delivered[4].event_id).await;
+
+    app_pool.close().await;
+    reader_pool.close().await;
+    drop(db);
+    cleanup_role(&admin_url, &app_role).await;
+    cleanup_role(&admin_url, &reader_role).await;
+}
+
+async fn assert_filtered_tail_anchor_is_numeric_max(reader_pool: &PgPool, expected_event_id: Uuid) {
+    let mut filtered = PgEventSource::new(
+        reader_pool.clone(),
+        DEFAULT_SCHEMA,
+        Cursor::new(0, 0),
+        ExportFilter {
+            source: Some(Source::App),
+            ..ExportFilter::default()
+        },
+    );
+    let empty_batch = filtered
+        .next_batch(10)
+        .await
+        .expect("filtered next_batch")
+        .expect("filtered drain must advance cursor past skipped db rows");
+    assert_eq!(empty_batch.events, Vec::new());
+    let filtered_cursor = empty_batch.cursor.expect("filtered cursor");
+    filtered
+        .ack(&filtered_cursor)
+        .await
+        .expect("ack filtered cursor");
+
+    let anchor = filtered
+        .acked_anchor()
+        .expect("filtered drain must record boundary anchor");
+    assert_eq!(
+        anchor.xact_id, 100,
+        "tail anchor must be numeric max xact_id 100, not lexicographic max 99"
+    );
+    assert_eq!(
+        anchor.event_id, expected_event_id,
+        "tail anchor must reference the final (xact_id=100, seq=5) event"
+    );
+
+    let ident = database_identity(reader_pool, DEFAULT_SCHEMA)
+        .await
+        .expect("database_identity");
+    let tl = ident.timeline_id.unwrap_or(1);
+    verify_resume_state(
+        reader_pool,
+        DEFAULT_SCHEMA,
+        ResumeVerification {
+            cursor: filtered_cursor,
+            anchor: Some(anchor),
+            saved_timeline_id: Some(tl),
+            current_timeline_id: Some(tl.saturating_add(1)),
+        },
+    )
+    .await
+    .expect("resume verification across simulated failover must succeed with true tail anchor");
+}
+
+#[tokio::test]
+async fn reader_qualified_order_by_works_with_custom_schema_and_same_timestamp_ties() {
+    let _lock = TestDb::cluster_lock().await.expect("cluster lock");
+    let db = TestDb::new().await.expect("create TestDb");
+    let custom_schema = "custom-audit";
+
+    let ddl_stmts = ddl::generate(&DdlOptions::new(custom_schema, vec![]));
+    db.execute_statements(&ddl_stmts)
+        .await
+        .expect("apply DDL in custom schema");
+
+    // Seed identical sub-millisecond occurred_at with ids crossing a power-of-10 boundary
+    // (9, 10, 11) and xact_ids crossing 9 -> 10 in a quoted non-default schema.
+    db.execute(
+        "INSERT INTO \"custom-audit\".changes \
+           (id, occurred_at, xact_id, source, schema_name, table_name, op, record_id) \
+         OVERRIDING SYSTEM VALUE VALUES \
+           (9,  date_trunc('second', now()) + interval '123456 microseconds', '9'::xid8,  'db', 'public', 'invoice', 'INSERT', '{\"id\":9}'::jsonb), \
+           (10, date_trunc('second', now()) + interval '123456 microseconds', '10'::xid8, 'db', 'public', 'invoice', 'INSERT', '{\"id\":10}'::jsonb), \
+           (11, date_trunc('second', now()) + interval '123456 microseconds', '11'::xid8, 'db', 'public', 'invoice', 'INSERT', '{\"id\":11}'::jsonb)",
+    )
+    .await
+    .expect("seed custom-schema fixture");
+
+    let mut source = PgEventSource::new(
+        db.pool().clone(),
+        custom_schema,
+        Cursor::new(0, 0),
+        ExportFilter::default(),
+    );
+    let mut exported = Vec::new();
+    while let Some(batch) = source.next_batch(1).await.expect("next_batch(1)") {
+        if let Some(cursor) = batch.cursor {
+            source.ack(&cursor).await.expect("ack");
+        }
+        exported.extend(batch.events);
+    }
+    let exported_ids: Vec<&str> = exported
+        .iter()
+        .map(|ev| ev.record_id.as_deref().expect("record_id").get())
+        .collect();
+    assert_eq!(
+        exported_ids,
+        vec![r#"{"id":9}"#, r#"{"id":10}"#, r#"{"id":11}"#]
+    );
+
+    let mut filtered_custom = PgEventSource::new(
+        db.pool().clone(),
+        custom_schema,
+        Cursor::new(0, 0),
+        ExportFilter {
+            source: Some(Source::App),
+            ..ExportFilter::default()
+        },
+    );
+    let filtered_batch = filtered_custom
+        .next_batch(10)
+        .await
+        .expect("filtered custom-schema next_batch")
+        .expect("filtered custom-schema drain must advance cursor");
+    assert_eq!(filtered_batch.events, Vec::new());
+    let filtered_cursor = filtered_batch.cursor.expect("filtered cursor");
+    filtered_custom
+        .ack(&filtered_cursor)
+        .await
+        .expect("ack filtered custom-schema cursor");
+    let custom_anchor = filtered_custom
+        .acked_anchor()
+        .expect("filtered custom-schema drain must record tail anchor");
+    assert_eq!(
+        custom_anchor.xact_id, 11,
+        "custom-schema tail anchor must be numeric max xact_id 11, not lexicographic max 9"
+    );
+
+    let history = lookup(
+        db.pool(),
+        custom_schema,
+        &HistoryQuery {
+            table: Some("invoice".to_owned()),
+            limit: 10,
+            ..HistoryQuery::default()
+        },
+    )
+    .await
+    .expect("lookup in custom schema");
+    let history_ids: Vec<&str> = history
+        .iter()
+        .map(|ev| ev.record_id.as_deref().expect("record_id").get())
+        .collect();
+    assert_eq!(
+        history_ids,
+        vec![r#"{"id":11}"#, r#"{"id":10}"#, r#"{"id":9}"#]
+    );
+
+    drop(db);
 }

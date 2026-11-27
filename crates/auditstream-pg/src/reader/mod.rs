@@ -6,7 +6,7 @@
 //! ```text
 //! WHERE (xact_id, id) > ($cursor_xact, $cursor_id)
 //!   AND xact_id < pg_catalog.pg_snapshot_xmin(pg_catalog.pg_current_snapshot())
-//! ORDER BY xact_id ASC, id ASC
+//! ORDER BY changes.xact_id ASC, changes.id ASC
 //! ```
 //!
 //! Transactions below `pg_snapshot_xmin` have already committed or rolled back, so rows in
@@ -960,15 +960,7 @@ impl PgEventSource {
             event_id: String,
         }
 
-        let schema_q = quote_ident(&self.audit_schema);
-        let sql = format!(
-            "SELECT xact_id::text AS xact_id, id, event_id::text AS event_id \
-             FROM {schema_q}.changes \
-             WHERE (xact_id, id) > ($1::text::xid8, $2) \
-               AND xact_id < $3::text::xid8 \
-             ORDER BY xact_id DESC, id DESC \
-             LIMIT 1"
-        );
+        let sql = latest_row_in_window_sql(&self.audit_schema);
         let row: Option<AnchorRow> = sqlx::query_as(AssertSqlSafe(sql))
             .bind(after.xact_id.to_string())
             .bind(after.id)
@@ -994,8 +986,14 @@ impl PgEventSource {
         .transpose()
     }
 
-    fn build_window_query(&self, xmin: u64, limit: i64) -> QueryBuilder<Postgres> {
-        let schema_q = quote_ident(&self.audit_schema);
+    fn build_window_query_sql(
+        audit_schema: &str,
+        position: Cursor,
+        filter: &ExportFilter,
+        xmin: u64,
+        limit: i64,
+    ) -> QueryBuilder<Postgres> {
+        let schema_q = quote_ident(audit_schema);
         let mut qb = QueryBuilder::<Postgres>::new(format!(
             "SELECT \
                id, \
@@ -1018,41 +1016,43 @@ impl PgEventSource {
              FROM {schema_q}.changes \
              WHERE (xact_id, id) > ("
         ));
-        qb.push_bind(self.position.xact_id.to_string());
+        qb.push_bind(position.xact_id.to_string());
         qb.push("::text::xid8, ");
-        qb.push_bind(self.position.id);
+        qb.push_bind(position.id);
         qb.push(") AND xact_id < ");
         qb.push_bind(xmin.to_string());
         qb.push("::text::xid8");
 
-        if let Some(from) = self.filter.from {
+        if let Some(from) = filter.from {
             qb.push(" AND occurred_at >= ");
             qb.push_bind(format_rfc3339_utc(from));
             qb.push("::timestamptz");
         }
-        if let Some(to) = self.filter.to {
+        if let Some(to) = filter.to {
             qb.push(" AND occurred_at <= ");
             qb.push_bind(format_rfc3339_utc(to));
             qb.push("::timestamptz");
         }
-        if let Some(until) = self.filter.until {
+        if let Some(until) = filter.until {
             qb.push(" AND occurred_at < ");
             qb.push_bind(format_rfc3339_utc(until));
             qb.push("::timestamptz");
         }
         push_actor_and_tenant_filters(
             &mut qb,
-            self.filter.actor_id.as_deref(),
-            self.filter.actor_or_on_behalf_of.as_deref(),
-            self.filter.tenant.as_deref(),
-            self.filter.tenant_or_on_behalf_of.as_deref(),
+            filter.actor_id.as_deref(),
+            filter.actor_or_on_behalf_of.as_deref(),
+            filter.tenant.as_deref(),
+            filter.tenant_or_on_behalf_of.as_deref(),
         );
-        if let Some(source) = self.filter.source {
+        if let Some(source) = filter.source {
             qb.push(" AND source = ");
             qb.push_bind(source_as_str(source));
         }
 
-        qb.push(" ORDER BY xact_id ASC, id ASC LIMIT ");
+        // Table-qualify ORDER BY columns so PostgreSQL orders by native `xid8`/`bigint` columns
+        // rather than resolving unqualified `xact_id` to the `xact_id::text AS xact_id` SELECT alias.
+        qb.push(" ORDER BY changes.xact_id ASC, changes.id ASC LIMIT ");
         qb.push_bind(limit);
         qb
     }
@@ -1070,6 +1070,20 @@ impl PgEventSource {
         let tail = self.latest_row_in_window_after(conn, after, xmin).await?;
         Ok(tail.or(fallback))
     }
+}
+
+fn latest_row_in_window_sql(audit_schema: &str) -> String {
+    let schema_q = quote_ident(audit_schema);
+    // Table-qualify ORDER BY columns so PostgreSQL orders by native `xid8`/`bigint` columns
+    // rather than resolving unqualified `xact_id` to the `xact_id::text AS xact_id` SELECT alias.
+    format!(
+        "SELECT xact_id::text AS xact_id, id, event_id::text AS event_id \
+         FROM {schema_q}.changes \
+         WHERE (xact_id, id) > ($1::text::xid8, $2) \
+           AND xact_id < $3::text::xid8 \
+         ORDER BY changes.xact_id DESC, changes.id DESC \
+         LIMIT 1"
+    )
 }
 
 impl EventSource for PgEventSource {
@@ -1092,7 +1106,13 @@ impl EventSource for PgEventSource {
         }
 
         let limit_i64 = i64::try_from(max).unwrap_or(i64::MAX - 1).saturating_add(1);
-        let mut qb = self.build_window_query(xmin, limit_i64);
+        let mut qb = Self::build_window_query_sql(
+            &self.audit_schema,
+            self.position,
+            &self.filter,
+            xmin,
+            limit_i64,
+        );
         let mut rows: Vec<ChangeRow> = qb
             .build_query_as()
             .fetch_all(&mut *conn)
@@ -1147,7 +1167,7 @@ impl EventSource for PgEventSource {
     }
 }
 
-/// Reads history rows matching `query`, ordered newest first (`occurred_at DESC, id DESC`),
+/// Reads history rows matching `query`, ordered newest first (`changes.occurred_at DESC, changes.id DESC`),
 /// for point-in-time lookups (such as `auditstream history`).
 ///
 /// Requires only `USAGE` on `audit_schema` and `SELECT` on `{audit_schema}.changes`.
@@ -1161,6 +1181,18 @@ pub async fn lookup(
     audit_schema: &str,
     query: &HistoryQuery,
 ) -> Result<Vec<Event>, SourceError> {
+    let mut qb = build_lookup_query_sql(audit_schema, query);
+
+    let rows: Vec<ChangeRow> = qb
+        .build_query_as()
+        .fetch_all(pool)
+        .await
+        .map_err(|err| SourceError::backend("failed to query history lookup", err))?;
+
+    rows.into_iter().map(ChangeRow::into_event).collect()
+}
+
+fn build_lookup_query_sql(audit_schema: &str, query: &HistoryQuery) -> QueryBuilder<Postgres> {
     let schema_q = quote_ident(audit_schema);
     let limit = query.limit.clamp(1, MAX_LOOKUP_LIMIT);
 
@@ -1250,16 +1282,12 @@ pub async fn lookup(
         qb.push_bind(source_as_str(source));
     }
 
-    qb.push(" ORDER BY occurred_at DESC, id DESC LIMIT ");
+    // Table-qualify ORDER BY columns so PostgreSQL orders by native `timestamptz`/`bigint`
+    // columns rather than resolving unqualified `occurred_at` to the `to_char(...) AS occurred_at`
+    // SELECT alias.
+    qb.push(" ORDER BY changes.occurred_at DESC, changes.id DESC LIMIT ");
     qb.push_bind(limit);
-
-    let rows: Vec<ChangeRow> = qb
-        .build_query_as()
-        .fetch_all(pool)
-        .await
-        .map_err(|err| SourceError::backend("failed to query history lookup", err))?;
-
-    rows.into_iter().map(ChangeRow::into_event).collect()
+    qb
 }
 
 #[derive(Debug, FromRow)]
@@ -1852,5 +1880,36 @@ mod tests {
                 .expect_err("zero/negative history key must fail decode");
             assert!(matches!(err, SourceError::Decode { .. }), "{err:?}");
         }
+    }
+
+    #[test]
+    fn reader_queries_qualify_order_by_columns_to_avoid_text_alias_sort() {
+        let latest_sql = latest_row_in_window_sql(DEFAULT_SCHEMA);
+        assert!(
+            latest_sql.contains(" ORDER BY changes.xact_id DESC, changes.id DESC LIMIT 1"),
+            "latest-row anchor query must qualify ORDER BY columns: {latest_sql}"
+        );
+
+        let window_qb = PgEventSource::build_window_query_sql(
+            DEFAULT_SCHEMA,
+            Cursor::new(0, 0),
+            &ExportFilter::default(),
+            1000,
+            10,
+        );
+        let window_raw = window_qb.sql();
+        let window_sql = window_raw.as_str();
+        assert!(
+            window_sql.contains(" ORDER BY changes.xact_id ASC, changes.id ASC LIMIT "),
+            "window query must qualify ORDER BY columns: {window_sql}"
+        );
+
+        let lookup_qb = build_lookup_query_sql(DEFAULT_SCHEMA, &HistoryQuery::default());
+        let lookup_raw = lookup_qb.sql();
+        let lookup_sql = lookup_raw.as_str();
+        assert!(
+            lookup_sql.contains(" ORDER BY changes.occurred_at DESC, changes.id DESC LIMIT "),
+            "lookup query must qualify ORDER BY columns: {lookup_sql}"
+        );
     }
 }
