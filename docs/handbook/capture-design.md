@@ -13,7 +13,7 @@ v0.1 captures with generated triggers that write to a partitioned `auditstream.c
 ## Who acted: resolution order
 
 1. `nullif(current_setting('auditstream.actor', true), '')`, set with `set_config(..., true)` inside the transaction. After the transaction the setting reads as an empty string, hence the `nullif`.
-2. The `auditstream` key of the last comment at the end of `right(current_query(), 4096)`, whose body contains no `/`. `#102` replaced POSIX regex extraction with pure PostgreSQL string builtins (`rtrim`, `right`, `reverse`, `strpos`, `substr`, `ltrim`), checking that the value is 1–683 unpadded base64url characters (`<= 512` decoded UTF-8 bytes) directly without regexes.
+2. The `auditstream` key of the last comment at the end of `right(current_query(), 4096)`, whose body contains no `/`. `#102` replaced POSIX regex comment extraction with PostgreSQL string builtins (`rtrim`, `right`, `reverse`, `strpos`, `substr`), and `#162` ([ADR-0010](../decisions/0010-no-guc-actor-caching-in-capture-trigger.md)) inlined the fast path directly into `capture()` (with trailing-character and single-`/` short-circuits) and replaced `ltrim` with DFA-cached `pg_catalog.textregexeq(... COLLATE pg_catalog."C", ...)` while keeping the 1–683 unpadded base64url / 512 decoded UTF-8 byte length bounds explicit outside regexes.
 3. The `sub` of `request.jwt.claims`, for Supabase and PostgREST callers.
 4. No actor: the row is still written, with `actor` NULL and `db_user` set to `session_user`.
 
