@@ -2,10 +2,12 @@
 //!
 //! Generates an ordered, deterministic sequence of single SQL statements that create
 //! `auditstream_owner`, the audit schema, the monthly-partitioned `changes` table,
-//! runtime partitions (DEFAULT + current UTC month + next 3 months), indexes,
-//! `log_event()`, strict ACL sanitization across tables, partitions, identity sequences,
-//! schema, and functions, grants for application roles, LZ4 TOAST compression on
-//! `changes.(before, after)` when supported by the server, and cleanup of any temporary self-grant.
+//! runtime partitions (DEFAULT + current UTC month + next 3 months), indexes (including
+//! `changes_occurred_at_brin_idx` with `autosummarize = on`), `log_event()`, strict ACL
+//! sanitization across tables, partitions, identity sequences, schema, and functions, grants
+//! for application roles, LZ4 TOAST compression on `changes.(before, after)` when supported by
+//! the server, leaf BRIN `autosummarize = on` reconciliation, and cleanup of any temporary
+//! self-grant.
 //!
 //! No generated statement drops a role, schema, table, or owned object.
 
@@ -340,12 +342,13 @@ pub fn quote_literal(value: &str) -> String {
 }
 
 /// Structured parts of [`generate`] so migration composers can interleave trigger statements
-/// before enabling LZ4 TOAST compression, creating future monthly partitions, and revoking the
-/// temporary self-grant.
+/// before enabling LZ4 TOAST compression, creating future monthly partitions, reconciling leaf
+/// BRIN `autosummarize = on` options, and revoking the temporary self-grant.
 pub(crate) struct GeneratedDdl {
     pub(crate) setup: Vec<String>,
     pub(crate) toast_compression: String,
     pub(crate) future_partitions: String,
+    pub(crate) brin_autosummarize: String,
     pub(crate) role_cleanup: String,
 }
 
@@ -367,16 +370,18 @@ pub(crate) struct GeneratedDdl {
 /// output with [`crate::triggers::generate`].
 ///
 /// The statements before role cleanup enable `COMPRESSION lz4` on `before`/`after` (when the
-/// PostgreSQL server supports LZ4) and create the next three monthly partitions. Both operations
-/// can lock `changes` until commit, so migrations run them after trigger statements to preserve
-/// `audited_table -> changes` lock ordering.
+/// PostgreSQL server supports LZ4), create the next three monthly partitions, and ensure
+/// `autosummarize = on` on `changes_default` and current/future leaf BRIN indexes. These
+/// operations can lock `changes` until commit, so migrations run them after trigger statements to
+/// preserve `audited_table -> changes` lock ordering.
 pub fn generate(options: &DdlOptions) -> Vec<String> {
     let parts = generate_parts(options);
-    let mut stmts = Vec::with_capacity(parts.setup.len() + 4);
+    let mut stmts = Vec::with_capacity(parts.setup.len() + 5);
     stmts.push(tx_begin_guard_sql());
     stmts.extend(parts.setup);
     stmts.push(parts.toast_compression);
     stmts.push(parts.future_partitions);
+    stmts.push(parts.brin_autosummarize);
     stmts.push(parts.role_cleanup);
     stmts
 }
@@ -403,14 +408,15 @@ pub(crate) fn generate_parts(options: &DdlOptions) -> GeneratedDdl {
         enter_owner_role_sql(&owner_lit),
         changes_table_sql(&schema_q),
         partitions_sql(&schema_lit, &owner_lit, 0, 0),
-        // Named indexes: BRIN on occurred_at, B-tree on (xact_id, id) for export cursor reads
-        // (PostgreSQL 15-19 has no BRIN operator class for xid8), and partial hash on record_id
-        // per ADR-0008 (`docs/decisions/0008-history-lookup-index.md`).
+        // Named indexes: BRIN on occurred_at with autosummarize = on (so autovacuum summarizes
+        // newly filled 128-page ranges without waiting for a table VACUUM), B-tree on (xact_id, id)
+        // for export cursor reads (PostgreSQL 15-19 has no BRIN operator class for xid8), and
+        // partial hash on record_id per ADR-0008 (`docs/decisions/0008-history-lookup-index.md`).
         history_index_sql(
             &schema_q,
             &schema_lit,
             "changes_occurred_at_brin_idx",
-            "USING brin (occurred_at)",
+            "USING brin (occurred_at) WITH (autosummarize = on)",
         ),
         history_index_sql(
             &schema_q,
@@ -433,6 +439,7 @@ pub(crate) fn generate_parts(options: &DdlOptions) -> GeneratedDdl {
         setup,
         toast_compression: toast_compression_sql(&schema_lit, &owner_lit),
         future_partitions: partitions_sql(&schema_lit, &owner_lit, 1, 3),
+        brin_autosummarize: brin_autosummarize_sql(&schema_lit, &owner_lit),
         role_cleanup: role_grant_cleanup_sql(&owner_q, "auditstream._granted_self"),
     }
 }
@@ -975,6 +982,132 @@ END"
     ))
 }
 
+/// Ensures `autosummarize = on` on leaf BRIN indexes of `{schema}.changes_occurred_at_brin_idx`
+/// for `changes_default` and current/future monthly partitions (`changes_YYYY_MM >= current UTC
+/// month`, plus any attached non-foreign sub-partitions underneath them).
+///
+/// Fresh installations inherit `autosummarize = on` automatically from the partitioned parent
+/// index created with `WITH (autosummarize = on)`, so this block is a lock-free no-op on fresh
+/// installs and clean reruns. On upgraded pre-existing installations (where PostgreSQL does not
+/// support `ALTER INDEX ... SET (...)` on partitioned parent indexes), it updates only active and
+/// future leaf BRIN indexes under `auditstream_owner`, locking parent `changes` first to preserve
+/// `audited_table -> changes -> child_brin_idx` lock ordering while leaving historical partitions
+/// (`< current UTC month`) untouched.
+#[allow(clippy::too_many_lines)]
+fn brin_autosummarize_sql(schema_lit: &str, owner_lit: &str) -> String {
+    do_block(&format!(
+        "DECLARE
+  prev_role name := current_user;
+  switched_role boolean := false;
+  parent_locked boolean := false;
+  current_part text := 'changes_' || pg_catalog.to_char(
+    pg_catalog.date_trunc('month', pg_catalog.now() AT TIME ZONE 'UTC'),
+    'YYYY_MM'
+  );
+  idx_schema name;
+  idx_name name;
+BEGIN
+  FOR idx_schema, idx_name IN
+    WITH RECURSIVE parent AS (
+      SELECT c.oid, c.relnamespace
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = {schema_lit}
+         AND c.relname = 'changes'
+         AND c.relkind IN ('r', 'p')
+    ),
+    child_tree(relid, sort_group, depth) AS (
+      SELECT
+        child.oid,
+        CASE WHEN child.relname = 'changes_default' THEN 1 ELSE 2 END,
+        1
+        FROM parent p
+        JOIN pg_catalog.pg_inherits i ON i.inhparent = p.oid
+        JOIN pg_catalog.pg_class child ON child.oid = i.inhrelid
+        JOIN pg_catalog.pg_namespace cn ON cn.oid = child.relnamespace
+       WHERE cn.nspname = {schema_lit}
+         AND child.relispartition
+         AND child.relkind IN ('r', 'p')
+         AND (
+           child.relname = 'changes_default'
+           OR (
+             pg_catalog.regexp_like(
+               child.relname::text COLLATE pg_catalog.\"C\",
+               '^changes_[0-9]{{4}}_(0[1-9]|1[0-2])$'
+             )
+             AND child.relname::text COLLATE pg_catalog.\"C\" >= current_part COLLATE pg_catalog.\"C\"
+           )
+         )
+      UNION ALL
+      SELECT sub.oid, ct.sort_group, ct.depth + 1
+        FROM child_tree ct
+        JOIN pg_catalog.pg_inherits i ON i.inhparent = ct.relid
+        JOIN pg_catalog.pg_class sub ON sub.oid = i.inhrelid
+       WHERE sub.relispartition
+         AND sub.relkind IN ('r', 'p')
+    ),
+    target_tables AS (
+      SELECT p.oid AS relid, 0 AS sort_group, 0 AS depth
+        FROM parent p
+      UNION ALL
+      SELECT ct.relid, ct.sort_group, ct.depth
+        FROM child_tree ct
+    ),
+    idx_tree(idx_oid) AS (
+      SELECT ic.oid
+        FROM parent p
+        JOIN pg_catalog.pg_index ix ON ix.indrelid = p.oid
+        JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid
+        JOIN pg_catalog.pg_am am ON am.oid = ic.relam
+       WHERE ic.relnamespace = p.relnamespace
+         AND ic.relname = 'changes_occurred_at_brin_idx'
+         AND am.amname = 'brin'
+      UNION ALL
+      SELECT i.inhrelid
+        FROM idx_tree it
+        JOIN pg_catalog.pg_inherits i ON i.inhparent = it.idx_oid
+    )
+    SELECT idx_ns.nspname, idx_c.relname
+      FROM idx_tree it
+      JOIN pg_catalog.pg_class idx_c ON idx_c.oid = it.idx_oid
+      JOIN pg_catalog.pg_namespace idx_ns ON idx_ns.oid = idx_c.relnamespace
+      JOIN pg_catalog.pg_am am ON am.oid = idx_c.relam
+      JOIN pg_catalog.pg_index ix ON ix.indexrelid = idx_c.oid
+      JOIN target_tables tt ON tt.relid = ix.indrelid
+     WHERE idx_c.relkind = 'i'
+       AND am.amname = 'brin'
+       AND NOT EXISTS (
+         SELECT 1
+           FROM pg_catalog.pg_options_to_table(idx_c.reloptions) AS opt
+          WHERE CASE
+                  WHEN opt.option_name COLLATE pg_catalog.\"C\" = 'autosummarize' COLLATE pg_catalog.\"C\"
+                  THEN opt.option_value::pg_catalog.bool
+                  ELSE false
+                END
+       )
+     ORDER BY tt.sort_group ASC, tt.depth ASC, idx_ns.nspname, idx_c.relname
+  LOOP
+    IF NOT switched_role AND prev_role <> {owner_lit} THEN
+      EXECUTE pg_catalog.format('SET LOCAL ROLE %I', {owner_lit});
+      switched_role := true;
+    END IF;
+    IF NOT parent_locked THEN
+      EXECUTE pg_catalog.format('LOCK TABLE ONLY %I.changes IN ACCESS EXCLUSIVE MODE', {schema_lit});
+      parent_locked := true;
+    END IF;
+    EXECUTE pg_catalog.format('ALTER INDEX %I.%I SET (autosummarize = on)', idx_schema, idx_name);
+  END LOOP;
+
+  IF switched_role THEN
+    SET LOCAL ROLE NONE;
+    IF prev_role <> current_user THEN
+      EXECUTE pg_catalog.format('SET LOCAL ROLE %I', prev_role);
+    END IF;
+  END IF;
+END"
+    ))
+}
+
 /// Sanitizes schema `{schema}`, parent `{schema}.changes`, and `{schema}.log_event()` ACLs under
 /// `auditstream_owner` without taking locks on clean refreshes, and applies explicit grants for
 /// `app_roles` when configured.
@@ -1394,6 +1527,17 @@ mod tests {
             "expected dynamic tag on toast_compression_sql, got: {toast_stmt}"
         );
         assert_eq!(toast_stmt.matches("$auditstream_do_1$").count(), 2);
+
+        let brin_stmt = evil_schema_stmts
+            .iter()
+            .find(|s| s.contains("SET (autosummarize = on)"))
+            .expect("brin_autosummarize_sql emitted");
+        assert!(
+            brin_stmt.starts_with("DO $auditstream_do_1$\n")
+                && brin_stmt.ends_with("\n$auditstream_do_1$"),
+            "expected dynamic tag on brin_autosummarize_sql, got: {brin_stmt}"
+        );
+        assert_eq!(brin_stmt.matches("$auditstream_do_1$").count(), 2);
     }
 
     #[test]

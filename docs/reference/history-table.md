@@ -37,7 +37,7 @@ The primary key is `(id, occurred_at)` to satisfy PostgreSQL range partitioning.
 - Setup and `auditstream verify --fix` maintain monthly partitions three months ahead of the current UTC month.
 - If rows land in `changes_default`, PostgreSQL blocks attaching overlapping monthly partitions until those rows move.
 - `auditstream verify` exits `1` whenever `changes_default` holds any row.
-- A `BRIN` index on `(occurred_at)` always exists on `auditstream.changes`.
+- A `BRIN` index on `(occurred_at)` (`changes_occurred_at_brin_idx`) always exists on `auditstream.changes`. On fresh installations, it is created with `autosummarize = on` (inherited by all future partitions) so PostgreSQL autovacuum summarizes newly filled 128-page ranges incrementally on each `autovacuum_naptime` tick without waiting for a table `VACUUM`. Because PostgreSQL does not support `ALTER INDEX ... SET (...)` on partitioned parent indexes, upgrades from earlier releases leave the partitioned parent index unchanged and enable `autosummarize = on` on `changes_default` and current/future monthly leaf partition indexes (`changes_YYYY_MM` from the current UTC month onward, plus partitions later created by migrations or `auditstream verify --fix`), leaving historical partitions older than the current UTC month untouched.
 
 ### TOAST compression
 
