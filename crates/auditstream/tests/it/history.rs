@@ -827,7 +827,7 @@ async fn history_applies_configured_redaction_supports_unredacted_and_omit_paylo
     )
     .expect("write auditstream.toml");
 
-    let secrets = [
+    let redacted_values = [
         "111-11-1111",
         "222-22-2222",
         "333-33-3333",
@@ -857,8 +857,11 @@ async fn history_applies_configured_redaction_supports_unredacted_and_omit_paylo
     );
     let json_stdout = String::from_utf8(json_out.stdout.clone()).expect("utf8 stdout");
     let json_stderr = String::from_utf8(json_out.stderr).expect("utf8 stderr");
-    for secret in secrets {
-        assert!(!json_stdout.contains(secret), "json stdout leaked {secret}");
+    for (idx, value) in redacted_values.iter().enumerate() {
+        assert!(
+            !json_stdout.contains(value),
+            "json stdout leaked redacted fixture #{idx}"
+        );
     }
     assert!(
         !json_stdout.contains("tax_id"),
@@ -953,8 +956,11 @@ async fn history_applies_configured_redaction_supports_unredacted_and_omit_paylo
     assert!(diff_out.status.success());
     let diff_stdout = String::from_utf8(diff_out.stdout).expect("utf8 diff stdout");
     let diff_stderr = String::from_utf8(diff_out.stderr).expect("utf8 diff stderr");
-    for secret in secrets {
-        assert!(!diff_stdout.contains(secret), "diff stdout leaked {secret}");
+    for (idx, value) in redacted_values.iter().enumerate() {
+        assert!(
+            !diff_stdout.contains(value),
+            "diff stdout leaked redacted fixture #{idx}"
+        );
     }
     assert!(
         !diff_stdout.contains("tax_id"),
@@ -1015,10 +1021,10 @@ async fn history_applies_configured_redaction_supports_unredacted_and_omit_paylo
     assert!(unredacted_json.status.success());
     assert_eq!(String::from_utf8_lossy(&unredacted_json.stderr), "");
     let raw_json_stdout = String::from_utf8(unredacted_json.stdout).expect("utf8");
-    for secret in secrets {
+    for (idx, value) in redacted_values.iter().enumerate() {
         assert!(
-            raw_json_stdout.contains(secret),
-            "expected --unredacted to include {secret}"
+            raw_json_stdout.contains(value),
+            "expected --unredacted to include fixture #{idx}"
         );
     }
 
@@ -1048,10 +1054,10 @@ async fn history_applies_configured_redaction_supports_unredacted_and_omit_paylo
         assert!(omit_json.status.success());
         let omit_stdout = String::from_utf8(omit_json.stdout.clone()).expect("utf8");
         let omit_stderr = String::from_utf8(omit_json.stderr).expect("utf8");
-        for secret in secrets {
+        for (idx, value) in redacted_values.iter().enumerate() {
             assert!(
-                !omit_stdout.contains(secret),
-                "omit-payload leaked {secret}"
+                !omit_stdout.contains(value),
+                "omit-payload leaked redacted fixture #{idx}"
             );
         }
         assert!(
@@ -1118,10 +1124,10 @@ async fn history_applies_configured_redaction_supports_unredacted_and_omit_paylo
     assert!(omit_no_rules.status.success());
     assert_eq!(String::from_utf8_lossy(&omit_no_rules.stderr), "");
     let omit_no_rules_stdout = String::from_utf8(omit_no_rules.stdout.clone()).expect("utf8");
-    for secret in secrets {
+    for (idx, value) in redacted_values.iter().enumerate() {
         assert!(
-            !omit_no_rules_stdout.contains(secret),
-            "omit-payload without rules leaked {secret}"
+            !omit_no_rules_stdout.contains(value),
+            "omit-payload without rules leaked redacted fixture #{idx}"
         );
     }
     let omit_no_rules_events = parse_json_lines(&omit_no_rules.stdout);
